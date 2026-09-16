@@ -18,8 +18,9 @@ pub use correlator::Correlator;
 use worker::*;
 
 /// Real `WebPush` ciphertext is small; anything past this is treated as
-/// abuse rather than buffered and forwarded.
-const MAX_BODY_BYTES: usize = 65_536;
+/// abuse rather than buffered and forwarded. 16KB covers real Telegram
+/// notifications with headroom; anything larger is likely garbage.
+const MAX_BODY_BYTES: usize = 16_384;
 
 /// Bootstrap Telegram CIDR list, embedded at build time from
 /// data/telegram-cidrs.txt. Fetch fresh list on schedule; if that fails, fall
