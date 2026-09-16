@@ -1,0 +1,15 @@
+name = "mg-edge-relay"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-09-01"
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"
+
+[durable_objects]
+bindings = [
+  { name = "CORRELATOR", class_name = "Correlator" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["Correlator"]

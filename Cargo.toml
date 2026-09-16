@@ -1,0 +1,20 @@
+[package]
+name = "mg-edge-relay"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Cloudflare Worker relay: Telegram legacy WebPush (aesgcm Draft-04) -> UnifiedPush, for Mercurygram."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+worker = "0.8"
+url = "2"
+serde = { version = "1", features = ["derive"] }
+console_error_panic_hook = "0.1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

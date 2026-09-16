@@ -1,0 +1,45 @@
+mg-edge-relay
+Copyright 2026 Francis
+
+This software reimplements, for the Cloudflare Workers platform, the
+`/aesgcm` and PUT relay routes of:
+
+    Mercurygram/aesgcm-proxy
+    <https://github.com/Mercurygram/aesgcm-proxy>
+    Copyright 2026 Timothy Redaelli <timothy.redaelli@gmail.com>
+    Licensed under MIT OR Apache-2.0
+
+Specifically ported or directly derived from that project's src/main.rs:
+
+  - The WebPush header-folding body format ("aesgcm\nEncryption: ...\n
+    Crypto-Key: ...\n<ciphertext>"), in src/lib.rs::fold_aesgcm_body,
+    ported from aesgcm-proxy's `make_aesgcm_body`.
+
+  - The endpoint validation rules (http/https only, no embedded
+    credentials, reject non-public literal IPs), in
+    src/lib.rs::validate_endpoint and is_ip_safe, ported from
+    aesgcm-proxy's `validate_endpoint` and `is_ip_safe`. Note: this port
+    does not replicate aesgcm-proxy's `SafeResolver` (a DNS resolver that
+    re-validates resolved IPs at connect time); Workers' `fetch()` gives
+    no hook to enforce that the same way, so domain names resolving to
+    non-public IPs are not currently caught here.
+
+  - The PUT/POST wake-up correlation behaviour (suppressing a Simple
+    Push wake-up when the same endpoint's encrypted content already
+    arrived within a short window, otherwise forwarding it as a
+    synthetic wake-up after waiting), in src/correlator.rs, ported from
+    aesgcm-proxy's `recent_posts` cache, `simple_push`, and
+    `post_and_record`. Re-architected as a Durable Object (one instance
+    per endpoint) rather than a process-wide `Mutex<HashMap>`, since a
+    Worker has no equivalent shared, long-lived process.
+
+  - The 2xx -> 201 Created response normalization with a Location
+    header, in src/correlator.rs::forward, ported from aesgcm-proxy's
+    `post_and_record`.
+
+Not ported: aesgcm-proxy's `/fcm/<token>` route and VAPID signing
+(src/fcm.rs) — this relay targets UnifiedPush distributors directly and
+has no FCM leg.
+
+This NOTICE file is provided for informational purposes and does not
+modify the license terms in LICENSE-MIT / LICENSE-APACHE.

@@ -1,0 +1,15 @@
+{
+  "name": "mg-edge-relay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Worker relay: Telegram legacy WebPush (aesgcm Draft-04) -> UnifiedPush, for Mercurygram.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "check-cidr": "bash scripts/check-cidr.sh",
+    "predeploy": "npm run check-cidr",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.90.0"
+  }
+}
