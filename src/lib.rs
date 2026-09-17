@@ -116,7 +116,7 @@ async fn get_telegram_cidr_list(kv: &KvStore) -> Result<String> {
         return Ok(cached);
     }
 
-    // Last resort: bootstrap (pre-validated at build time)
+    // Last resort: bootstrap (checked by test_telegram_cidr_bootstrap_is_valid)
     Ok(TELEGRAM_CIDR_BOOTSTRAP.to_string())
 }
 
@@ -380,6 +380,11 @@ mod tests {
     fn test_parse_cidr_list_empty() {
         assert!(parse_cidr_list("").is_none());
         assert!(parse_cidr_list("\n\n").is_none());
+    }
+
+    #[test]
+    fn test_telegram_cidr_bootstrap_is_valid() {
+        assert!(parse_cidr_list(TELEGRAM_CIDR_BOOTSTRAP).is_some(), "data/telegram-cidrs.txt must parse cleanly");
     }
 
     #[test]
