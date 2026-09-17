@@ -15,6 +15,7 @@
 // binary rather than failing to build.
 #![cfg(unix)]
 
+use std::io::Read;
 use std::net::TcpListener;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
@@ -97,6 +98,27 @@ fn pick_free_port() -> u16 {
 struct WranglerDev {
     child: Child,
     port: u16,
+    /// Captured stdout+stderr, printed only if the test panics (see Drop) --
+    /// `cargo test`'s own output capturing doesn't reach a child process's
+    /// inherited file descriptors, only the test's own print!/println!
+    /// calls, so quiet-on-success has to be done ourselves.
+    output: Arc<Mutex<Vec<u8>>>,
+}
+
+/// Drains `pipe` into `output` on a background thread until it hits EOF
+/// (the child closing that fd, normally on exit). Reading continuously
+/// rather than only at the end avoids the child blocking because nothing's
+/// draining a full OS pipe buffer.
+fn spawn_output_reader(mut pipe: impl Read + Send + 'static, output: Arc<Mutex<Vec<u8>>>) {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => output.lock().unwrap().extend_from_slice(&buf[..n]),
+            }
+        }
+    });
 }
 
 impl WranglerDev {
@@ -117,11 +139,11 @@ impl WranglerDev {
         assert!(status.success(), "worker-build failed");
 
         let port = pick_free_port();
-        let child = Command::new("npx")
+        let mut child = Command::new("npx")
             .args(["wrangler", "dev", "--port", &port.to_string()])
             .current_dir(PROJECT_DIR)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             // Its own process group, so the whole tree (node, workerd,
             // esbuild -- which land on their own ports, e.g. an inspector
             // port) can be killed together on Drop instead of leaving
@@ -132,7 +154,11 @@ impl WranglerDev {
         // process_group(0) makes the child's PGID equal its own PID.
         WRANGLER_PGID.store(child.id(), Ordering::SeqCst);
 
-        let mut dev = Self { child, port };
+        let output = Arc::new(Mutex::new(Vec::new()));
+        spawn_output_reader(child.stdout.take().expect("child spawned with piped stdout"), Arc::clone(&output));
+        spawn_output_reader(child.stderr.take().expect("child spawned with piped stderr"), Arc::clone(&output));
+
+        let mut dev = Self { child, port, output };
         dev.wait_until_ready();
         dev
     }
@@ -180,6 +206,14 @@ impl Drop for WranglerDev {
                 break;
             }
             std::thread::sleep(REAP_POLL_INTERVAL);
+        }
+
+        // Only shown on failure: quiet on the happy path, but the whole
+        // point of capturing this was to have it on hand exactly when
+        // something -- ours or wrangler's own -- went wrong.
+        if std::thread::panicking() {
+            let output = self.output.lock().unwrap();
+            eprintln!("--- wrangler dev output ---\n{}", String::from_utf8_lossy(&output));
         }
     }
 }
@@ -268,7 +302,7 @@ fn integration_test() {
     let dev = WranglerDev::start();
     let port = dev.port;
 
-    rejects_missing_cf_connecting_ip(port);
+    rejects_absent_cf_connecting_ip(port);
     rejects_non_telegram_ip(port);
     rejects_literal_private_ip_target(port);
     forwards_put_to_valid_target(port);
@@ -276,11 +310,21 @@ fn integration_test() {
     post_suppresses_following_put(port);
 }
 
-fn rejects_missing_cf_connecting_ip(port: u16) {
+/// Doesn't set `CF-Connecting-IP` at all -- but this can't actually verify
+/// `get_client_ip` returning `None` (the genuinely-absent-header path), since
+/// under `wrangler dev` the header gets set anyway: `CF-Connecting-IP`'s
+/// purpose is reflecting the real connecting peer, and Miniflare does that
+/// faithfully even locally, where the peer is genuinely 127.0.0.1 over a real
+/// loopback connection. So this exercises the same "IP not in Telegram's
+/// range" rejection as `rejects_non_telegram_ip`, just via a different IP --
+/// kept as a separate test because the two have distinct intent even though
+/// they collapse to the same code path here (no way to actually omit what
+/// Miniflare will reflect from a real, unspoofed local test client).
+fn rejects_absent_cf_connecting_ip(port: u16) {
     let resp = ureq::put(&worker_url(port, &format!("/{}", encode("http://example.com/"))))
         .timeout(REQUEST_TIMEOUT)
         .send_string("body");
-    assert_eq!(status_of(resp), 403, "PUT with no CF-Connecting-IP should be rejected");
+    assert_eq!(status_of(resp), 403, "PUT with no explicit CF-Connecting-IP should be rejected");
 }
 
 fn rejects_non_telegram_ip(port: u16) {
