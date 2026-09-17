@@ -64,10 +64,22 @@ discussion this project came out of).
 
 ## Local development
 
+Run unit tests:
+
+```sh
+cargo test --lib
+```
+
+Start the dev server:
+
 ```sh
 npm install
 npx wrangler dev
 ```
+
+Tests cover CIDR validation, IP matching, endpoint validation, and header
+folding. Integration testing (routes, KV, Durable Objects) requires deployment
+to Cloudflare Workers.
 
 ## Security notes
 
