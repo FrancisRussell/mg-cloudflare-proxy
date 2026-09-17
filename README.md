@@ -72,26 +72,43 @@ Run unit tests:
 cargo test --lib
 ```
 
-Start the dev server:
+These cover CIDR validation, IP matching, endpoint validation, and header
+folding — pure Rust logic with no `worker::*` types involved.
+
+Run the integration test suite (builds the Worker, runs it under `wrangler
+dev` with KV and Durable Objects fully emulated locally, and drives it with
+real HTTP requests against a mock distributor):
 
 ```sh
 npm install
+cargo install worker-build
+cargo test --test integration -- --ignored
+```
+
+This covers what the unit tests structurally can't reach — routing, header
+reading, KV, Durable Object correlation, and real outbound `fetch()`s — and
+is what actually caught the redirect-forwarding bug noted under Security
+notes below. Ignored by default since it needs Node/wrangler/`worker-build`
+installed.
+
+Start the dev server for manual testing:
+
+```sh
 npx wrangler dev
 ```
 
-Tests cover CIDR validation, IP matching, endpoint validation, and header
-folding. Integration testing (routes, KV, Durable Objects) requires deployment
-to Cloudflare Workers.
-
 ## Security notes
 
-Reviewed under an adversarial threat model before first deploy; two real
+Reviewed under an adversarial threat model before first deploy; three real
 bugs were found and fixed (an IPv6-literal bypass of the private-IP filter
-in `is_ip_safe`, and a panic-on-attacker-input DoS in the path
-percent-decoder), plus a body-size cap and Telegram IP filtering were
-added. The relay validates all inbound requests against Telegram's published
-CIDR ranges (refreshed on a schedule); requests from non-Telegram IPs are
-rejected at the edge.
+in `is_ip_safe`, a panic-on-attacker-input DoS in the path percent-decoder,
+and — found via the integration test suite, not the review — a distributor
+redirecting the forward request bypassing the SSRF check done on the
+original URL, fixed by forwarding with `redirect: manual` and rejecting any
+3xx response outright instead of following it), plus a body-size cap and
+Telegram IP filtering were added. The relay validates all inbound requests
+against Telegram's published CIDR ranges (refreshed on a schedule); requests
+from non-Telegram IPs are rejected at the edge.
 
 Known residual gaps, accepted rather than fixed:
 
