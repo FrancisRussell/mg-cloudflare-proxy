@@ -125,60 +125,62 @@ fn get_client_ip(req: &Request) -> Option<String> {
     req.headers().get("cf-connecting-ip").ok().flatten().or_else(|| req.headers().get("x-forwarded-for").ok().flatten())
 }
 
-/// SSRF-prevention ranges (non-public/routable addresses).
-const UNSAFE_V4_STRS: &[&str] = &[
-    "0.0.0.0/8",          // This host
-    "10.0.0.0/8",         // Private
-    "100.64.0.0/10",      // Shared address space (CGNAT)
-    "127.0.0.0/8",        // Loopback
-    "169.254.0.0/16",     // Link-local
-    "172.16.0.0/12",      // Private
-    "192.0.2.0/24",       // Documentation (TEST-NET-1)
-    "192.168.0.0/16",     // Private
-    "198.18.0.0/15",      // Benchmarking
-    "198.51.100.0/24",    // Documentation (TEST-NET-2)
-    "203.0.113.0/24",     // Documentation (TEST-NET-3)
-    "224.0.0.0/4",        // Multicast
-    "255.255.255.255/32", // Broadcast
+/// SSRF-prevention ranges not covered by Rust's built-in methods.
+const EXTRA_UNSAFE_V4_STRS: &[&str] = &[
+    "0.0.0.0/8",     // This host
+    "100.64.0.0/10", // Shared address space (CGNAT)
+    "198.18.0.0/15", // Benchmarking
 ];
 
-const UNSAFE_V6_STRS: &[&str] = &[
-    "::1/128",        // Loopback
-    "::/128",         // Unspecified
+const EXTRA_UNSAFE_V6_STRS: &[&str] = &[
     "::/96",          // IPv4-compatible
     "::ffff:0:0/96",  // IPv4-mapped
     "64:ff9b::/96",   // NAT64
     "64:ff9b:1::/48", // NAT64/Well-known prefix
     "fc00::/7",       // Unique local (ULA)
     "fe80::/10",      // Link-local
-    "ff00::/8",       // Multicast
 ];
 
-/// True if `ip` is a public, routable address. Rejects loopback, private,
-/// link-local, CGNAT, documentation, and other non-routable ranges.
+/// True if `ip` is a public, routable address. Uses Rust's built-in methods
+/// for standard ranges (loopback, private, link-local, multicast,
+/// documentation, broadcast, unspecified) plus ipnetwork for ranges Rust
+/// doesn't cover.
 fn is_ip_safe(ip: std::net::IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(_) => {
-            !UNSAFE_V4_STRS.iter().any(
-                |cidr| {
-                    if let Ok(net) = cidr.parse::<IpNetwork>() {
-                        net.contains(ip)
-                    } else {
-                        false
-                    }
-                },
-            )
+        std::net::IpAddr::V4(v4) => {
+            // Use Rust's built-in methods for standard ranges
+            if v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+            {
+                return false;
+            }
+            // Check ranges Rust doesn't cover
+            !EXTRA_UNSAFE_V4_STRS.iter().any(|cidr| {
+                if let Ok(net) = cidr.parse::<IpNetwork>() {
+                    net.contains(ip)
+                } else {
+                    false
+                }
+            })
         }
-        std::net::IpAddr::V6(_) => {
-            !UNSAFE_V6_STRS.iter().any(
-                |cidr| {
-                    if let Ok(net) = cidr.parse::<IpNetwork>() {
-                        net.contains(ip)
-                    } else {
-                        false
-                    }
-                },
-            )
+        std::net::IpAddr::V6(v6) => {
+            // Use Rust's built-in methods for standard ranges
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return false;
+            }
+            // Check ranges Rust doesn't cover
+            !EXTRA_UNSAFE_V6_STRS.iter().any(|cidr| {
+                if let Ok(net) = cidr.parse::<IpNetwork>() {
+                    net.contains(ip)
+                } else {
+                    false
+                }
+            })
         }
     }
 }
