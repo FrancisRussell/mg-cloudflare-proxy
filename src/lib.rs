@@ -15,6 +15,7 @@
 mod correlator;
 
 pub use correlator::Correlator;
+use http::StatusCode;
 use ipnetwork::IpNetwork;
 use worker::*;
 
@@ -100,7 +101,7 @@ async fn get_telegram_cidr_list(kv: &KvStore) -> Result<String> {
 
     // Try fetching fresh and parsing
     if let Ok(mut resp) = Fetch::Url(FETCH_URL.parse().map_err(|_| Error::RustError("bad url".into()))?).send().await {
-        if (200..300).contains(&resp.status_code()) {
+        if StatusCode::from_u16(resp.status_code()).is_ok_and(|s| s.is_success()) {
             if let Ok(body) = resp.text().await {
                 if let Some(parsed) = parse_cidr_list(&body) {
                     let _ = kv.put(KV_KEY, &parsed);
@@ -123,6 +124,13 @@ async fn get_telegram_cidr_list(kv: &KvStore) -> Result<String> {
 /// sets on every routed request. Unlike `X-Forwarded-For`, a client cannot
 /// set this header itself, which is what the Telegram IP allowlist relies on.
 fn get_client_ip(req: &Request) -> Option<String> { req.headers().get("cf-connecting-ip").ok().flatten() }
+
+/// `Response::error` using `status`'s own canonical reason phrase (e.g.
+/// "Forbidden" for 403) as the message, for error paths that carry no
+/// extra diagnostic detail beyond the status itself.
+pub(crate) fn error_response(status: StatusCode) -> Result<Response> {
+    Response::error(status.canonical_reason().expect("standard status code has a canonical reason"), status.as_u16())
+}
 
 /// Cached SSRF-prevention ranges not covered by Rust's built-in methods.
 mod unsafe_ranges {
@@ -230,32 +238,32 @@ async fn call_correlator(env: &Env, endpoint: &url::Url, method: Method, body: V
 /// POST /aesgcm?e=<url-encoded-endpoint>
 async fn handle_aesgcm(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let Some(client_ip_str) = get_client_ip(&req) else {
-        return Response::error("Forbidden", 403);
+        return error_response(StatusCode::FORBIDDEN);
     };
     let Ok(client_ip) = client_ip_str.parse::<std::net::IpAddr>() else {
-        return Response::error("Forbidden", 403);
+        return error_response(StatusCode::FORBIDDEN);
     };
 
     let kv = ctx.env.kv("CIDR_CACHE")?;
     let cidr_list = get_telegram_cidr_list(&kv).await?;
     if !is_telegram_ip_with_list(client_ip, &cidr_list) {
-        return Response::error("Forbidden", 403);
+        return error_response(StatusCode::FORBIDDEN);
     }
 
     let url = req.url()?;
     let endpoint_raw = match url.query_pairs().find(|(k, _)| k == "e") {
         Some((_, v)) => v.into_owned(),
-        None => return Response::error("missing ?e= parameter", 400),
+        None => return Response::error("missing ?e= parameter", StatusCode::BAD_REQUEST.as_u16()),
     };
     let Ok(endpoint) = validate_endpoint(&endpoint_raw) else {
-        return Response::error("Forbidden", 403);
+        return error_response(StatusCode::FORBIDDEN);
     };
 
     let encryption = req.headers().get("encryption")?.unwrap_or_default();
     let crypto_key = req.headers().get("crypto-key")?.unwrap_or_default();
     let body = req.bytes().await?;
     if body.len() > MAX_BODY_BYTES {
-        return Response::error("Payload Too Large", 413);
+        return error_response(StatusCode::PAYLOAD_TOO_LARGE);
     }
     let folded = fold_aesgcm_body(&encryption, &crypto_key, &body);
 
@@ -265,16 +273,16 @@ async fn handle_aesgcm(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
 /// PUT /<url-encoded-endpoint> — Simple Push (`token_type=4`) leg.
 async fn handle_put(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let Some(client_ip_str) = get_client_ip(&req) else {
-        return Response::error("Forbidden", 403);
+        return error_response(StatusCode::FORBIDDEN);
     };
     let Ok(client_ip) = client_ip_str.parse::<std::net::IpAddr>() else {
-        return Response::error("Forbidden", 403);
+        return error_response(StatusCode::FORBIDDEN);
     };
 
     let kv = ctx.env.kv("CIDR_CACHE")?;
     let cidr_list = get_telegram_cidr_list(&kv).await?;
     if !is_telegram_ip_with_list(client_ip, &cidr_list) {
-        return Response::error("Forbidden", 403);
+        return error_response(StatusCode::FORBIDDEN);
     }
 
     let path = req.path();
@@ -282,12 +290,12 @@ async fn handle_put(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     let decoded = percent_decode(encoded);
 
     let Ok(endpoint) = validate_endpoint(&decoded) else {
-        return Response::error("Forbidden", 403);
+        return error_response(StatusCode::FORBIDDEN);
     };
 
     let body = req.bytes().await?;
     if body.len() > MAX_BODY_BYTES {
-        return Response::error("Payload Too Large", 413);
+        return error_response(StatusCode::PAYLOAD_TOO_LARGE);
     }
     call_correlator(&ctx.env, &endpoint, Method::Put, body).await
 }

@@ -15,6 +15,7 @@
 use std::cell::Cell;
 use std::time::Duration;
 
+use http::StatusCode;
 use worker::*;
 
 /// How long a successful POST's timestamp counts as "recent" when a PUT for
@@ -49,7 +50,7 @@ impl DurableObject for Correlator {
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
         let Some(target) = req.headers().get("X-Relay-Target")? else {
-            return Response::error("missing X-Relay-Target", 400);
+            return Response::error("missing X-Relay-Target", StatusCode::BAD_REQUEST.as_u16());
         };
         let target_url = url::Url::parse(&target).map_err(|e| Error::RustError(format!("bad target: {e}")))?;
         let body = req.bytes().await?;
@@ -57,7 +58,7 @@ impl DurableObject for Correlator {
         match req.method() {
             Method::Post => self.handle_post(&target_url, body).await,
             Method::Put => self.handle_put(&target_url, body).await,
-            _ => Response::error("method not allowed", 405),
+            _ => crate::error_response(StatusCode::METHOD_NOT_ALLOWED),
         }
     }
 }
@@ -68,7 +69,7 @@ impl Correlator {
     /// arriving shortly after knows to suppress its wake-up.
     async fn handle_post(&self, target: &url::Url, body: Vec<u8>) -> Result<Response> {
         let resp = forward(target, body).await?;
-        if (200..300).contains(&resp.status_code()) {
+        if StatusCode::from_u16(resp.status_code()).is_ok_and(|s| s.is_success()) {
             // millis-since-epoch fits exactly in f64 until the year 287396.
             #[allow(clippy::cast_precision_loss)]
             self.last_post.set(Some(Date::now().as_millis() as f64));
@@ -154,10 +155,10 @@ async fn forward(target: &url::Url, body: Vec<u8>) -> Result<Response> {
 /// `201 Created` + `Location` shape. `None` means pass the response through
 /// unchanged (a non-2xx status).
 fn wake_up_response_shape(status: u16, location: Option<&str>, target: &str) -> Option<(u16, String)> {
-    if !(200..300).contains(&status) {
+    if !StatusCode::from_u16(status).is_ok_and(|s| s.is_success()) {
         return None;
     }
-    Some((201, location.map_or_else(|| target.to_string(), String::from)))
+    Some((StatusCode::CREATED.as_u16(), location.map_or_else(|| target.to_string(), String::from)))
 }
 
 #[cfg(test)]
@@ -183,19 +184,25 @@ mod tests {
 
     #[test]
     fn test_wake_up_response_shape_non_2xx_passes_through() {
-        assert_eq!(wake_up_response_shape(500, Some("https://example.com/x"), "https://target.example"), None);
-        assert_eq!(wake_up_response_shape(404, None, "https://target.example"), None);
+        let internal_error = StatusCode::INTERNAL_SERVER_ERROR.as_u16();
+        let not_found = StatusCode::NOT_FOUND.as_u16();
+        assert_eq!(
+            wake_up_response_shape(internal_error, Some("https://example.com/x"), "https://target.example"),
+            None
+        );
+        assert_eq!(wake_up_response_shape(not_found, None, "https://target.example"), None);
     }
 
     #[test]
     fn test_wake_up_response_shape_2xx_preserves_location() {
-        let result = wake_up_response_shape(200, Some("https://example.com/x"), "https://target.example");
-        assert_eq!(result, Some((201, "https://example.com/x".to_string())));
+        let result =
+            wake_up_response_shape(StatusCode::OK.as_u16(), Some("https://example.com/x"), "https://target.example");
+        assert_eq!(result, Some((StatusCode::CREATED.as_u16(), "https://example.com/x".to_string())));
     }
 
     #[test]
     fn test_wake_up_response_shape_2xx_falls_back_to_target() {
-        let result = wake_up_response_shape(204, None, "https://target.example");
-        assert_eq!(result, Some((201, "https://target.example".to_string())));
+        let result = wake_up_response_shape(StatusCode::NO_CONTENT.as_u16(), None, "https://target.example");
+        assert_eq!(result, Some((StatusCode::CREATED.as_u16(), "https://target.example".to_string())));
     }
 }
