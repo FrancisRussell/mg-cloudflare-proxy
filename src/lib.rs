@@ -340,52 +340,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_validate_cidr_line_ipv4_block() {
-        assert!(validate_cidr_line("91.108.56.0/22"));
-        assert!(validate_cidr_line("0.0.0.0/0"));
-        assert!(validate_cidr_line("192.168.1.0/24"));
-    }
-
-    #[test]
-    fn test_validate_cidr_line_ipv6_block() {
-        assert!(validate_cidr_line("2001:b28:f23d::/48"));
-        assert!(validate_cidr_line("::/0"));
-        assert!(validate_cidr_line("fe80::/10"));
-    }
-
-    #[test]
-    fn test_validate_cidr_line_plain_ip() {
-        assert!(validate_cidr_line("1.2.3.4"));
-        assert!(validate_cidr_line("2001:db8::1"));
-    }
-
-    #[test]
-    fn test_validate_cidr_line_invalid() {
-        assert!(!validate_cidr_line(""));
-        assert!(!validate_cidr_line("not-an-ip"));
-        assert!(!validate_cidr_line("1.2.3.4/33")); // IPv4 prefix too large
-        assert!(!validate_cidr_line("2001:db8::/129")); // IPv6 prefix too large
-        assert!(!validate_cidr_line("1.2.3.4/abc")); // Invalid prefix
+    fn test_validate_cidr_line() {
+        let cases = [
+            ("91.108.56.0/22", true),
+            ("0.0.0.0/0", true),
+            ("192.168.1.0/24", true),
+            ("2001:b28:f23d::/48", true),
+            ("::/0", true),
+            ("fe80::/10", true),
+            ("1.2.3.4", true),     // plain IPv4
+            ("2001:db8::1", true), // plain IPv6
+            ("", false),
+            ("not-an-ip", false),
+            ("1.2.3.4/33", false),     // IPv4 prefix too large
+            ("2001:db8::/129", false), // IPv6 prefix too large
+            ("1.2.3.4/abc", false),    // invalid prefix
+        ];
+        for (input, expected) in cases {
+            assert_eq!(validate_cidr_line(input), expected, "input: {input}");
+        }
     }
 
     #[test]
     fn test_parse_cidr_list_valid() {
-        let list = "91.108.56.0/22\n91.108.4.0/22\n1.2.3.4";
-        let result = parse_cidr_list(list);
-        assert!(result.is_some());
-        let parsed = result.unwrap();
-        assert!(parsed.contains("91.108.56.0/22"));
-        assert!(parsed.contains("1.2.3.4"));
-    }
-
-    #[test]
-    fn test_parse_cidr_list_skips_empty_lines() {
-        let list = "91.108.56.0/22\n\n91.108.4.0/22";
-        let result = parse_cidr_list(list);
-        assert!(result.is_some());
-        let parsed = result.unwrap();
-        // Should have exactly 2 entries (empty line skipped)
-        assert_eq!(parsed.lines().count(), 2);
+        let list = "91.108.56.0/22\n\n91.108.4.0/22\n1.2.3.4";
+        let result = parse_cidr_list(list).unwrap();
+        assert!(result.contains("91.108.56.0/22"));
+        assert!(result.contains("1.2.3.4"));
+        assert_eq!(result.lines().count(), 3, "empty line should be skipped");
     }
 
     #[test]
@@ -401,46 +383,20 @@ mod tests {
     }
 
     #[test]
-    fn test_is_telegram_ip_with_list_ipv4() {
-        let cidr_list = "91.108.56.0/22\n91.108.4.0/22\n149.154.160.0/20";
-        let ip: std::net::IpAddr = "91.108.56.100".parse().unwrap();
-        assert!(is_telegram_ip_with_list(ip, cidr_list));
-
-        let ip: std::net::IpAddr = "1.2.3.4".parse().unwrap();
-        assert!(!is_telegram_ip_with_list(ip, cidr_list));
-    }
-
-    #[test]
-    fn test_is_telegram_ip_with_list_ipv6() {
-        let cidr_list = "2001:b28:f23d::/48\n2001:67c:4e8::/48";
-        let ip: std::net::IpAddr = "2001:b28:f23d::1".parse().unwrap();
-        assert!(is_telegram_ip_with_list(ip, cidr_list));
-
-        let ip: std::net::IpAddr = "2001:db8::1".parse().unwrap();
-        assert!(!is_telegram_ip_with_list(ip, cidr_list));
-    }
-
-    #[test]
-    fn test_is_telegram_ip_with_list_plain_ip() {
-        let cidr_list = "1.2.3.4\n5.6.7.8/32";
-        let ip: std::net::IpAddr = "1.2.3.4".parse().unwrap();
-        assert!(is_telegram_ip_with_list(ip, cidr_list));
-
-        let ip: std::net::IpAddr = "1.2.3.5".parse().unwrap();
-        assert!(!is_telegram_ip_with_list(ip, cidr_list));
-    }
-
-    #[test]
-    fn test_is_telegram_ip_with_list_mixed() {
+    fn test_is_telegram_ip_with_list() {
         let cidr_list = "91.108.56.0/22\n1.2.3.4\n2001:b28:f23d::/48";
-        let ip: std::net::IpAddr = "91.108.56.100".parse().unwrap();
-        assert!(is_telegram_ip_with_list(ip, cidr_list));
-
-        let ip: std::net::IpAddr = "1.2.3.4".parse().unwrap();
-        assert!(is_telegram_ip_with_list(ip, cidr_list));
-
-        let ip: std::net::IpAddr = "2001:b28:f23d::1".parse().unwrap();
-        assert!(is_telegram_ip_with_list(ip, cidr_list));
+        let cases = [
+            ("91.108.56.100", true),    // in IPv4 CIDR block
+            ("1.2.3.4", true),          // exact plain-IP match
+            ("1.2.3.5", false),         // near miss on plain IP
+            ("2001:b28:f23d::1", true), // in IPv6 CIDR block
+            ("2001:db8::1", false),     // not in any range
+            ("9.9.9.9", false),         // not in any range
+        ];
+        for (ip_str, expected) in cases {
+            let ip: std::net::IpAddr = ip_str.parse().unwrap();
+            assert_eq!(is_telegram_ip_with_list(ip, cidr_list), expected, "ip: {ip_str}");
+        }
     }
 
     #[test]
@@ -482,24 +438,20 @@ mod tests {
     }
 
     #[test]
-    fn test_percent_decode_basic() {
-        assert_eq!(percent_decode("hello"), "hello");
-        assert_eq!(percent_decode("hello%20world"), "hello world");
+    fn test_percent_decode() {
+        let cases = [
+            ("hello", "hello"),
+            ("hello%20world", "hello world"),
+            ("https%3A%2F%2Fexample.com", "https://example.com"),
+            ("%2B%3D%26", "+=&"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(percent_decode(input), expected, "input: {input}");
+        }
     }
 
     #[test]
-    fn test_percent_decode_url() {
-        assert_eq!(percent_decode("https%3A%2F%2Fexample.com"), "https://example.com");
-    }
-
-    #[test]
-    fn test_percent_decode_special_chars() {
-        assert_eq!(percent_decode("%2B%3D%26"), "+=&");
-    }
-
-    #[test]
-    fn test_percent_decode_invalid_hex() {
-        // Invalid hex codes should pass through as-is
+    fn test_percent_decode_invalid_hex_passes_through() {
         assert_eq!(percent_decode("%XY"), "%XY");
         assert_eq!(percent_decode("%1G"), "%1G");
     }
