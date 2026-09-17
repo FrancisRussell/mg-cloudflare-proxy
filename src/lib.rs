@@ -140,12 +140,10 @@ mod unsafe_ranges {
 
     pub static UNSAFE_V6: LazyLock<Vec<IpNetwork>> = LazyLock::new(|| {
         vec![
-            "::/96".parse().expect("hardcoded CIDR literal must be valid"), // IPv4-compatible
-            "::ffff:0:0/96".parse().expect("hardcoded CIDR literal must be valid"), // IPv4-mapped
             "64:ff9b::/96".parse().expect("hardcoded CIDR literal must be valid"), // NAT64
             "64:ff9b:1::/48".parse().expect("hardcoded CIDR literal must be valid"), // NAT64 well-known prefix
             "2001:db8::/32".parse().expect("hardcoded CIDR literal must be valid"), // Documentation
-            "3fff::/20".parse().expect("hardcoded CIDR literal must be valid"), // Documentation
+            "3fff::/20".parse().expect("hardcoded CIDR literal must be valid"),    // Documentation
         ]
     });
 }
@@ -172,12 +170,16 @@ fn is_ip_safe(ip: std::net::IpAddr) -> bool {
             !unsafe_ranges::UNSAFE_V4.iter().any(|net| net.contains(ip))
         }
         std::net::IpAddr::V6(v6) => {
-            // Use Rust's built-in methods for standard ranges
+            // Use Rust's built-in methods for standard ranges. to_ipv4()
+            // matches both IPv4-compatible (::/96) and IPv4-mapped
+            // (::ffff:0:0/96) addresses; it also matches ::1, but
+            // is_loopback() above already rejects that case first.
             if v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 || v6.is_unique_local()
                 || v6.is_unicast_link_local()
+                || v6.to_ipv4().is_some()
             {
                 return false;
             }
