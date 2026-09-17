@@ -3,8 +3,6 @@
 // buys nothing. This isn't a published library, so a per-fn `# Errors` section
 // would be noise.
 #![allow(clippy::wildcard_imports, clippy::missing_errors_doc)]
-// SPDX-FileCopyrightText: 2026 Francis
-// SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // Web Push relay for a UnifiedPush distributor (e.g. Sunup, ntfy): folds the
 // `Encryption`/`Crypto-Key` headers Telegram sends into the body, since

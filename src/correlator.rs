@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: 2026 Francis
-// SPDX-License-Identifier: MIT OR Apache-2.0
-//
 // Telegram sends two requests per message: a content-bearing POST and a
 // bare PUT wake-up (used when there's no content to send, e.g. secret
 // chats). One instance of this Durable Object exists per endpoint URL (see

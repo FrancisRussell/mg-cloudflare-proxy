@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: 2026 Francis
-// SPDX-License-Identifier: MIT OR Apache-2.0
-//
 // Exercises the real worker::* code paths unit tests can't reach: header
 // reading, KV, Durable Object correlation, and real outbound fetch()es.
 // Runs the actual compiled Worker under `wrangler dev` (Miniflare, with KV
