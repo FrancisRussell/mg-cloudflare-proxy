@@ -33,13 +33,10 @@ mod header_names {
     /// Internal header carrying the validated forwarding target from the
     /// Worker to the Correlator Durable Object (see src/correlator.rs).
     pub(crate) const X_RELAY_TARGET: HeaderName = HeaderName::from_static("x-relay-target");
-    /// Sent on the outbound CIDR-list fetch, echoing back the `Last-Modified`
-    /// value from the last successful fetch, so an unchanged list costs
-    /// Telegram's server a 304 rather than a full body.
+    /// Sent on the outbound CIDR-list fetch, echoing back the last fetch
+    /// attempt's own timestamp, so an unchanged list costs Telegram's
+    /// server a 304 rather than a full body.
     pub const IF_MODIFIED_SINCE: HeaderName = HeaderName::from_static("if-modified-since");
-    /// Read from the CIDR-list fetch response and cached, to send back as
-    /// `IF_MODIFIED_SINCE` next time.
-    pub const LAST_MODIFIED: HeaderName = HeaderName::from_static("last-modified");
 }
 
 /// Real `WebPush` ciphertext is small; anything past this is treated as
@@ -117,9 +114,6 @@ fn parse_cidr_list(content: &str) -> Option<String> {
 
 const CIDR_LIST_KV_KEY: &str = "telegram_cidrs";
 const CIDR_LIST_FETCHED_AT_KV_KEY: &str = "telegram_cidrs_fetched_at";
-/// Telegram's own `Last-Modified` for the cached list, echoed back as
-/// `If-Modified-Since` on the next fetch.
-const CIDR_LIST_LAST_MODIFIED_KV_KEY: &str = "telegram_cidrs_last_modified";
 /// How long a cached CIDR list is trusted before an unrecognized IP is
 /// allowed to trigger a re-fetch.
 const CIDR_LIST_MAX_AGE_MS: f64 = 24.0 * 60.0 * 60.0 * 1000.0;
@@ -176,9 +170,12 @@ fn is_cidr_list_fresh(now_ms: f64, fetched_at_ms: f64, max_age_ms: f64) -> bool 
 }
 
 /// Attempts to fetch, validate, and cache a fresh CIDR list from Telegram.
-/// Sends the last successful fetch's `Last-Modified` back as
-/// `If-Modified-Since`, so an unchanged list (the common case) costs
-/// Telegram's server a bodyless 304 instead of the full list every time.
+/// Sends the last fetch attempt's own timestamp back as `If-Modified-Since`
+/// -- HTTP servers compare that against their own resource's modification
+/// time regardless of who set it, so this doesn't need Telegram's actual
+/// `Last-Modified` echoed back verbatim, just some past point we're asking
+/// "has it changed since here". An unchanged list (the common case) then
+/// costs Telegram's server a bodyless 304 instead of the full list.
 ///
 /// The fetched-at timestamp is updated on any definitive answer from the
 /// endpoint (a 304, a success, or a bad-but-reachable response like an
@@ -191,8 +188,10 @@ fn is_cidr_list_fresh(now_ms: f64, fetched_at_ms: f64, max_age_ms: f64) -> bool 
 /// carries no body to re-derive it from.
 async fn fetch_fresh_cidr_list(kv: &KvStore, fetch_url: &str, current_list: &str) -> Option<String> {
     let headers = Headers::new();
-    if let Ok(Some(last_modified)) = kv.get(CIDR_LIST_LAST_MODIFIED_KV_KEY).text().await {
-        let _ = headers.set(header_names::IF_MODIFIED_SINCE.as_str(), &last_modified);
+    if let Ok(Some(fetched_at)) = kv.get(CIDR_LIST_FETCHED_AT_KV_KEY).text().await {
+        if let Some(http_date) = http_date_from_millis_str(&fetched_at) {
+            let _ = headers.set(header_names::IF_MODIFIED_SINCE.as_str(), &http_date);
+        }
     }
     let mut init = RequestInit::new();
     init.with_headers(headers);
@@ -215,9 +214,6 @@ async fn fetch_fresh_cidr_list(kv: &KvStore, fetch_url: &str, current_list: &str
                                 parsed.lines().count()
                             );
                             kv_put_best_effort(kv, CIDR_LIST_KV_KEY, &parsed).await;
-                            if let Ok(Some(last_modified)) = resp.headers().get(header_names::LAST_MODIFIED.as_str()) {
-                                kv_put_best_effort(kv, CIDR_LIST_LAST_MODIFIED_KV_KEY, &last_modified).await;
-                            }
                             mark_cidr_list_fetched(kv).await;
                             return Some(parsed);
                         }
@@ -250,6 +246,17 @@ async fn mark_cidr_list_fetched(kv: &KvStore) {
     #[allow(clippy::cast_precision_loss)] // millis-since-epoch fits exactly in f64 until the year 287396
     let now_ms = Date::now().as_millis() as f64;
     kv_put_best_effort(kv, CIDR_LIST_FETCHED_AT_KV_KEY, &now_ms.to_string()).await;
+}
+
+/// Converts a millis-since-epoch string (as stored under
+/// `CIDR_LIST_FETCHED_AT_KV_KEY`) into an HTTP-date string suitable for the
+/// `If-Modified-Since` request header.
+fn http_date_from_millis_str(millis_str: &str) -> Option<String> {
+    let millis: f64 = millis_str.parse().ok()?;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    // stored as a non-negative millis-since-epoch value
+    let js_date: js_sys::Date = Date::new(DateInit::Millis(millis as u64)).into();
+    Some(js_date.to_utc_string().into())
 }
 
 /// `KvStore::put` only constructs a builder -- the write itself doesn't

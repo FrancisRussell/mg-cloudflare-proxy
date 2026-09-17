@@ -313,9 +313,16 @@ impl MockDistributor {
 }
 
 /// A minimal HTTP server standing in for Telegram's CIDR list endpoint,
-/// always serving the same fixed body and counting how many times it was
-/// hit -- used to verify the relay only fetches when it actually needs to
-/// (see the doc comment on `is_telegram_ip` in src/lib.rs).
+/// always serving the same fixed body and recording how many times it was
+/// hit and the `If-Modified-Since` (if any) each request carried -- used to
+/// verify the relay only fetches when it actually needs to, and does so
+/// conditionally (see the doc comment on `is_telegram_ip` in src/lib.rs).
+///
+/// Realistic tests of the actual conditional-refetch/304 path would need to
+/// force the 24h staleness window, which isn't practical to simulate here
+/// (no way to fast-forward the Worker's own clock) -- what's checked
+/// instead is that the very first-ever fetch, with nothing cached yet,
+/// sends no conditional header at all.
 ///
 /// Same leaked-background-thread caveat as `MockDistributor` above: fine for
 /// this file's single `#[test] fn`, but would need explicit teardown if a
@@ -323,6 +330,7 @@ impl MockDistributor {
 struct MockCidrServer {
     port: u16,
     request_count: Arc<AtomicUsize>,
+    last_if_modified_since: Arc<Mutex<Option<String>>>,
 }
 
 impl MockCidrServer {
@@ -330,16 +338,25 @@ impl MockCidrServer {
         let port = pick_free_port();
         let server = tiny_http::Server::http(("127.0.0.1", port)).expect("failed to start mock CIDR server");
         let request_count = Arc::new(AtomicUsize::new(0));
+        let last_if_modified_since = Arc::new(Mutex::new(None));
 
         let count = Arc::clone(&request_count);
+        let if_modified_since_store = Arc::clone(&last_if_modified_since);
         std::thread::spawn(move || {
             for request in server.incoming_requests() {
                 count.fetch_add(1, Ordering::SeqCst);
+                let seen = request
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("if-modified-since"))
+                    .map(|h| h.value.as_str().to_string());
+                *if_modified_since_store.lock().unwrap() = seen;
+
                 let _ = request.respond(Response::from_string(body.clone()));
             }
         });
 
-        Self { port, request_count }
+        Self { port, request_count, last_if_modified_since }
     }
 
     /// A hostname, not a literal IP, for the same reason as
@@ -347,6 +364,8 @@ impl MockCidrServer {
     fn url(&self) -> String { format!("http://localhost:{}/cidr.txt", self.port) }
 
     fn request_count(&self) -> usize { self.request_count.load(Ordering::SeqCst) }
+
+    fn last_if_modified_since(&self) -> Option<String> { self.last_if_modified_since.lock().unwrap().clone() }
 }
 
 fn worker_url(port: u16, path: &str) -> String { format!("http://127.0.0.1:{port}{path}") }
@@ -414,6 +433,11 @@ fn fetches_cidr_list_only_for_unrecognized_ip(port: u16, cidr_server: &MockCidrS
         .send_string("body");
     assert_eq!(status_of(resp), 201, "an IP in the freshly-fetched list should be accepted");
     assert_eq!(cidr_server.request_count(), 1, "an unrecognized IP with no prior fetch should trigger exactly one");
+    assert_eq!(
+        cidr_server.last_if_modified_since(),
+        None,
+        "the very first-ever fetch has nothing cached yet, so it shouldn't send If-Modified-Since"
+    );
 
     let resp = ureq::put(&worker_url(port, &format!("/{target}")))
         .set("CF-Connecting-IP", MOCK_CIDR_IP_B)
