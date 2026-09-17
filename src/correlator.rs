@@ -164,7 +164,7 @@ async fn forward(target: &url::Url, body: Vec<u8>) -> Result<Response> {
 
     // A distributor that redirects is rejected outright rather than relayed:
     // the SSRF check on `target` never saw wherever the Location points.
-    if is_redirect_status(resp.status_code()) {
+    if StatusCode::from_u16(resp.status_code()).is_ok_and(|s| s.is_redirection()) {
         return crate::error_response(StatusCode::BAD_GATEWAY);
     }
 
@@ -182,9 +182,6 @@ async fn forward(target: &url::Url, body: Vec<u8>) -> Result<Response> {
     }
 }
 
-/// True if `status` is an HTTP redirect (3xx).
-fn is_redirect_status(status: u16) -> bool { (300..400).contains(&status) }
-
 /// The `(status, location)` `forward` should respond with for a POST that
 /// got back `status`/`location` from `target`, per RFC 8030 §5's
 /// `201 Created` + `Location` shape. `None` means pass the response through
@@ -199,16 +196,6 @@ fn wake_up_response_shape(status: u16, location: Option<&str>, target: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_is_redirect_status() {
-        for status in [300, 301, 302, 303, 307, 308, 399] {
-            assert!(is_redirect_status(status), "status: {status}");
-        }
-        for status in [200, 201, 204, 299, 400, 404, 500] {
-            assert!(!is_redirect_status(status), "status: {status}");
-        }
-    }
 
     #[test]
     fn test_is_post_recent_within_window() {
