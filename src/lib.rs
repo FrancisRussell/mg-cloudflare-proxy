@@ -125,25 +125,42 @@ fn get_client_ip(req: &Request) -> Option<String> {
     req.headers().get("cf-connecting-ip").ok().flatten().or_else(|| req.headers().get("x-forwarded-for").ok().flatten())
 }
 
-/// SSRF-prevention ranges not covered by Rust's built-in methods.
-const EXTRA_UNSAFE_V4_STRS: &[&str] = &[
-    "0.0.0.0/8",     // This host
-    "100.64.0.0/10", // Shared address space (CGNAT)
-    "198.18.0.0/15", // Benchmarking
-];
+/// Cached SSRF-prevention ranges not covered by Rust's built-in methods.
+mod unsafe_ranges {
+    use std::sync::OnceLock;
 
-const EXTRA_UNSAFE_V6_STRS: &[&str] = &[
-    "::/96",          // IPv4-compatible
-    "::ffff:0:0/96",  // IPv4-mapped
-    "64:ff9b::/96",   // NAT64
-    "64:ff9b:1::/48", // NAT64/Well-known prefix
-    "fc00::/7",       // Unique local (ULA)
-    "fe80::/10",      // Link-local
-];
+    use ipnetwork::IpNetwork;
+
+    static UNSAFE_V4: OnceLock<Vec<IpNetwork>> = OnceLock::new();
+    static UNSAFE_V6: OnceLock<Vec<IpNetwork>> = OnceLock::new();
+
+    pub fn v4() -> &'static Vec<IpNetwork> {
+        UNSAFE_V4.get_or_init(|| {
+            vec![
+                "0.0.0.0/8".parse().unwrap(),     // This host
+                "100.64.0.0/10".parse().unwrap(), // Shared address space (CGNAT)
+                "198.18.0.0/15".parse().unwrap(), // Benchmarking
+            ]
+        })
+    }
+
+    pub fn v6() -> &'static Vec<IpNetwork> {
+        UNSAFE_V6.get_or_init(|| {
+            vec![
+                "::/96".parse().unwrap(),          // IPv4-compatible
+                "::ffff:0:0/96".parse().unwrap(),  // IPv4-mapped
+                "64:ff9b::/96".parse().unwrap(),   // NAT64
+                "64:ff9b:1::/48".parse().unwrap(), // NAT64/Well-known prefix
+                "fc00::/7".parse().unwrap(),       // Unique local (ULA)
+                "fe80::/10".parse().unwrap(),      // Link-local
+            ]
+        })
+    }
+}
 
 /// True if `ip` is a public, routable address. Uses Rust's built-in methods
 /// for standard ranges (loopback, private, link-local, multicast,
-/// documentation, broadcast, unspecified) plus ipnetwork for ranges Rust
+/// documentation, broadcast, unspecified) plus cached ipnetwork ranges Rust
 /// doesn't cover.
 fn is_ip_safe(ip: std::net::IpAddr) -> bool {
     match ip {
@@ -159,28 +176,16 @@ fn is_ip_safe(ip: std::net::IpAddr) -> bool {
             {
                 return false;
             }
-            // Check ranges Rust doesn't cover
-            !EXTRA_UNSAFE_V4_STRS.iter().any(|cidr| {
-                if let Ok(net) = cidr.parse::<IpNetwork>() {
-                    net.contains(ip)
-                } else {
-                    false
-                }
-            })
+            // Check cached ranges Rust doesn't cover
+            !unsafe_ranges::v4().iter().any(|net| net.contains(ip))
         }
         std::net::IpAddr::V6(v6) => {
             // Use Rust's built-in methods for standard ranges
             if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
                 return false;
             }
-            // Check ranges Rust doesn't cover
-            !EXTRA_UNSAFE_V6_STRS.iter().any(|cidr| {
-                if let Ok(net) = cidr.parse::<IpNetwork>() {
-                    net.contains(ip)
-                } else {
-                    false
-                }
-            })
+            // Check cached ranges Rust doesn't cover
+            !unsafe_ranges::v6().iter().any(|net| net.contains(ip))
         }
     }
 }
