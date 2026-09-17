@@ -63,10 +63,8 @@ fn validate_cidr_line(line: &str) -> bool {
     line.parse::<IpNetwork>().is_ok()
 }
 
-/// True if `ip_str` is in the given CIDR list.
-fn is_telegram_ip_with_list(ip_str: &str, cidr_list: &str) -> bool {
-    let Ok(ip) = ip_str.parse::<std::net::IpAddr>() else { return false };
-
+/// True if `ip` is in the given CIDR list.
+fn is_telegram_ip_with_list(ip: std::net::IpAddr, cidr_list: &str) -> bool {
     cidr_list.lines().any(|net_str| if let Ok(net) = net_str.parse::<IpNetwork>() { net.contains(ip) } else { false })
 }
 
@@ -205,13 +203,16 @@ async fn call_correlator(env: &Env, endpoint: &url::Url, method: Method, body: V
 
 /// POST /aesgcm?e=<url-encoded-endpoint>
 async fn handle_aesgcm(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let Some(client_ip) = get_client_ip(&req) else {
+    let Some(client_ip_str) = get_client_ip(&req) else {
+        return Response::error("Forbidden", 403);
+    };
+    let Ok(client_ip) = client_ip_str.parse::<std::net::IpAddr>() else {
         return Response::error("Forbidden", 403);
     };
 
     let kv = ctx.env.kv("CIDR_CACHE")?;
     let cidr_list = get_telegram_cidr_list(&kv).await?;
-    if !is_telegram_ip_with_list(&client_ip, &cidr_list) {
+    if !is_telegram_ip_with_list(client_ip, &cidr_list) {
         return Response::error("Forbidden", 403);
     }
 
@@ -237,13 +238,16 @@ async fn handle_aesgcm(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
 
 /// PUT /<url-encoded-endpoint> — Simple Push (`token_type=4`) leg.
 async fn handle_put(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let Some(client_ip) = get_client_ip(&req) else {
+    let Some(client_ip_str) = get_client_ip(&req) else {
+        return Response::error("Forbidden", 403);
+    };
+    let Ok(client_ip) = client_ip_str.parse::<std::net::IpAddr>() else {
         return Response::error("Forbidden", 403);
     };
 
     let kv = ctx.env.kv("CIDR_CACHE")?;
     let cidr_list = get_telegram_cidr_list(&kv).await?;
-    if !is_telegram_ip_with_list(&client_ip, &cidr_list) {
+    if !is_telegram_ip_with_list(client_ip, &cidr_list) {
         return Response::error("Forbidden", 403);
     }
 
