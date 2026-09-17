@@ -111,7 +111,9 @@ redirecting the forward request bypassing the SSRF check done on the
 original URL, fixed by forwarding with `redirect: manual` and rejecting any
 3xx response outright instead of following it), plus a body-size cap and
 Telegram IP filtering were added. The relay validates all inbound requests
-against Telegram's published CIDR ranges (refreshed on a schedule); requests
+against Telegram's published CIDR ranges (a recognized IP never triggers a
+fetch; an unrecognized one triggers at most one re-fetch attempt per day);
+requests
 from non-Telegram IPs are rejected at the edge.
 
 Known residual gaps, accepted rather than fixed:

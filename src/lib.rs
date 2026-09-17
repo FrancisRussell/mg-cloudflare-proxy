@@ -108,49 +108,127 @@ fn parse_cidr_list(content: &str) -> Option<String> {
     Some(entries.join("\n"))
 }
 
-/// Fetch fresh Telegram CIDR list from remote, or return cached version.
-/// Parses and validates all entries before caching. Falls back to bootstrap if
-/// both fail.
-async fn get_telegram_cidr_list(kv: &KvStore) -> Result<String> {
-    const KV_KEY: &str = "telegram_cidrs";
-    const FETCH_URL: &str = "https://core.telegram.org/resources/cidr.txt";
+const CIDR_LIST_KV_KEY: &str = "telegram_cidrs";
+const CIDR_LIST_FETCHED_AT_KV_KEY: &str = "telegram_cidrs_fetched_at";
+/// How long a cached CIDR list is trusted before an unrecognized IP is
+/// allowed to trigger a re-fetch.
+const CIDR_LIST_MAX_AGE_MS: f64 = 24.0 * 60.0 * 60.0 * 1000.0;
+/// Where to fetch the Telegram CIDR list from. Overridable via the
+/// `CIDR_LIST_URL` wrangler var (see wrangler.toml) so the integration test
+/// can point this at a local mock server instead of Telegram's real endpoint.
+const TELEGRAM_CIDR_URL: &str = "https://core.telegram.org/resources/cidr.txt";
+const CIDR_LIST_URL_VAR: &str = "CIDR_LIST_URL";
 
-    match Fetch::Url(FETCH_URL.parse().map_err(|_| Error::RustError("bad url".into()))?).send().await {
+/// True if `ip` is a Telegram IP. Checks the cached (or bootstrap, if never
+/// successfully fetched) list first -- a recognized IP never triggers a
+/// fetch. Only an unrecognized IP, combined with the cached list being
+/// missing or more than a day old, triggers a fetch attempt: real Telegram
+/// traffic is the overwhelmingly common case and shouldn't pay for an
+/// outbound round-trip to Telegram on every single request, and a flood of
+/// unrecognized IPs (a scan, an attack) shouldn't be able to force more than
+/// one fetch per day either.
+async fn is_telegram_ip(kv: &KvStore, ip: std::net::IpAddr, fetch_url: &str) -> bool {
+    let (list, is_fresh) = current_cidr_list(kv).await;
+    if is_telegram_ip_with_list(ip, &list) {
+        return true;
+    }
+    if is_fresh {
+        return false;
+    }
+
+    match fetch_fresh_cidr_list(kv, fetch_url).await {
+        Some(fresh) => is_telegram_ip_with_list(ip, &fresh),
+        None => false,
+    }
+}
+
+/// The CIDR list currently on hand (cached, or the compiled-in bootstrap if
+/// nothing has ever been cached), and whether it's fresh enough (fetched
+/// within `CIDR_LIST_MAX_AGE_MS`) to skip trying Telegram's endpoint again.
+async fn current_cidr_list(kv: &KvStore) -> (String, bool) {
+    let list = match kv.get(CIDR_LIST_KV_KEY).text().await {
+        Ok(Some(cached)) => cached,
+        _ => TELEGRAM_CIDR_BOOTSTRAP.to_string(),
+    };
+
+    #[allow(clippy::cast_precision_loss)] // millis-since-epoch fits exactly in f64 until the year 287396
+    let now_ms = Date::now().as_millis() as f64;
+    let is_fresh = matches!(kv.get(CIDR_LIST_FETCHED_AT_KV_KEY).text().await, Ok(Some(fetched_at))
+        if fetched_at.parse::<f64>().is_ok_and(|fetched_at_ms| is_cidr_list_fresh(now_ms, fetched_at_ms, CIDR_LIST_MAX_AGE_MS)));
+
+    (list, is_fresh)
+}
+
+/// True if `fetched_at_ms` (millis since epoch) is within `max_age_ms` of
+/// `now_ms` -- i.e. recent enough to skip re-fetching.
+fn is_cidr_list_fresh(now_ms: f64, fetched_at_ms: f64, max_age_ms: f64) -> bool {
+    (now_ms - fetched_at_ms) < max_age_ms
+}
+
+/// Attempts to fetch, validate, and cache a fresh CIDR list from Telegram.
+/// The fetched-at timestamp is updated on any definitive answer from the
+/// endpoint (even a bad one, like an unparseable body) so a broken-but-
+/// reachable endpoint doesn't get hit on every subsequent unrecognized-IP
+/// request either -- only a network-level failure (couldn't reach it at
+/// all) leaves the timestamp untouched, since that's the one case worth
+/// retrying sooner than the usual day.
+async fn fetch_fresh_cidr_list(kv: &KvStore, fetch_url: &str) -> Option<String> {
+    let Ok(url) = fetch_url.parse() else { return None };
+    match Fetch::Url(url).send().await {
         Ok(mut resp) => {
             let status = resp.status_code();
             if StatusCode::from_u16(status).is_ok_and(|s| s.is_success()) {
                 match resp.text().await {
-                    Ok(body) => match parse_cidr_list(&body) {
-                        Some(parsed) => {
+                    Ok(body) => {
+                        if let Some(parsed) = parse_cidr_list(&body) {
                             console_log!(
                                 "cidr_fetch: outcome=success entries={} status={status}",
                                 parsed.lines().count()
                             );
-                            let _ = kv.put(KV_KEY, &parsed);
-                            return Ok(parsed);
+                            kv_put_best_effort(kv, CIDR_LIST_KV_KEY, &parsed).await;
+                            mark_cidr_list_fetched(kv).await;
+                            return Some(parsed);
                         }
-                        None => console_error!("cidr_fetch: outcome=failed reason=unparseable status={status}"),
-                    },
+                        console_error!("cidr_fetch: outcome=failed reason=unparseable status={status}");
+                        mark_cidr_list_fetched(kv).await;
+                    }
                     Err(e) => {
-                        console_error!("cidr_fetch: outcome=failed reason=body_read_error status={status} error={e}")
+                        console_error!("cidr_fetch: outcome=failed reason=body_read_error status={status} error={e}");
+                        mark_cidr_list_fetched(kv).await;
                     }
                 }
             } else {
                 console_error!("cidr_fetch: outcome=failed reason=bad_status status={status}");
+                mark_cidr_list_fetched(kv).await;
             }
         }
         Err(e) => console_error!("cidr_fetch: outcome=failed reason=network_error error={e}"),
     }
+    None
+}
 
-    // Fetch failed, try cache (already validated at storage time)
-    if let Ok(Some(cached)) = kv.get(KV_KEY).text().await {
-        console_log!("cidr_fetch: outcome=using_cache entries={}", cached.lines().count());
-        return Ok(cached);
+/// The `CIDR_LIST_URL` var if set (always true when deployed via
+/// wrangler.toml's own `[vars]` default), falling back to the hardcoded
+/// Telegram URL otherwise.
+fn cidr_list_url(env: &Env) -> String {
+    env.var(CIDR_LIST_URL_VAR).map_or_else(|_| TELEGRAM_CIDR_URL.to_string(), |v| v.to_string())
+}
+
+async fn mark_cidr_list_fetched(kv: &KvStore) {
+    #[allow(clippy::cast_precision_loss)] // millis-since-epoch fits exactly in f64 until the year 287396
+    let now_ms = Date::now().as_millis() as f64;
+    kv_put_best_effort(kv, CIDR_LIST_FETCHED_AT_KV_KEY, &now_ms.to_string()).await;
+}
+
+/// `KvStore::put` only constructs a builder -- the write itself doesn't
+/// happen until `.execute().await`, easy to miss since the outer call isn't
+/// itself async. Failures are swallowed here: every caller already has a
+/// fallback for a cache miss (the bootstrap list, or just re-fetching),
+/// so a write failing is never worth failing an otherwise-valid request over.
+async fn kv_put_best_effort(kv: &KvStore, key: &str, value: &str) {
+    if let Ok(builder) = kv.put(key, value) {
+        let _ = builder.execute().await;
     }
-
-    // Last resort: bootstrap (checked by test_telegram_cidr_bootstrap_is_valid)
-    console_log!("cidr_fetch: outcome=using_bootstrap entries={}", TELEGRAM_CIDR_BOOTSTRAP.lines().count());
-    Ok(TELEGRAM_CIDR_BOOTSTRAP.to_string())
 }
 
 /// Extract client IP from the `CF-Connecting-IP` header Cloudflare's edge
@@ -282,8 +360,7 @@ async fn handle_aesgcm(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
     };
 
     let kv = ctx.env.kv("CIDR_CACHE")?;
-    let cidr_list = get_telegram_cidr_list(&kv).await?;
-    if !is_telegram_ip_with_list(client_ip, &cidr_list) {
+    if !is_telegram_ip(&kv, client_ip, &cidr_list_url(&ctx.env)).await {
         console_log!("rejected: leg=aesgcm reason=ip_not_in_telegram_range ip={client_ip}");
         return error_response(StatusCode::FORBIDDEN);
     }
@@ -327,8 +404,7 @@ async fn handle_put(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     };
 
     let kv = ctx.env.kv("CIDR_CACHE")?;
-    let cidr_list = get_telegram_cidr_list(&kv).await?;
-    if !is_telegram_ip_with_list(client_ip, &cidr_list) {
+    if !is_telegram_ip(&kv, client_ip, &cidr_list_url(&ctx.env)).await {
         console_log!("rejected: leg=put reason=ip_not_in_telegram_range ip={client_ip}");
         return error_response(StatusCode::FORBIDDEN);
     }
@@ -426,6 +502,18 @@ mod tests {
     #[test]
     fn test_telegram_cidr_bootstrap_is_valid() {
         assert!(parse_cidr_list(TELEGRAM_CIDR_BOOTSTRAP).is_some(), "data/telegram-cidrs.txt must parse cleanly");
+    }
+
+    #[test]
+    fn test_is_cidr_list_fresh_within_max_age() {
+        assert!(is_cidr_list_fresh(1_000.0, 500.0, CIDR_LIST_MAX_AGE_MS));
+    }
+
+    #[test]
+    fn test_is_cidr_list_fresh_outside_max_age() {
+        let fetched_at = 1_000.0;
+        let now = fetched_at + CIDR_LIST_MAX_AGE_MS + 1.0;
+        assert!(!is_cidr_list_fresh(now, fetched_at, CIDR_LIST_MAX_AGE_MS));
     }
 
     #[test]

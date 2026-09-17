@@ -10,6 +10,11 @@ binding = "CIDR_CACHE"
 id = "YOUR_KV_NAMESPACE_ID_HERE"
 preview_id = "YOUR_PREVIEW_KV_NAMESPACE_ID_HERE"
 
+[vars]
+# Overridden in the integration test (--var) to point at a local mock server
+# instead of Telegram's real endpoint.
+CIDR_LIST_URL = "https://core.telegram.org/resources/cidr.txt"
+
 [durable_objects]
 bindings = [
   { name = "CORRELATOR", class_name = "Correlator" }
