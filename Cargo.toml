@@ -9,17 +9,28 @@ description = "Cloudflare Worker relay: Telegram legacy WebPush (aesgcm Draft-04
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-worker = "0.8"
-url = "2"
-serde = { version = "1", features = ["derive"] }
 console_error_panic_hook = "0.1"
-ipnetwork = "0.20"
 http = "1"
+ipnetwork = "0.20"
 percent-encoding = "2"
+serde = { version = "1", features = ["derive"] }
+url = "2"
+worker = "0.8"
 
 [dev-dependencies]
-ureq = "2"
+ctrlc = "3.5.2"
+nix = { version = "0.31.3", features = ["signal"] }
 tiny_http = "0.12"
+ureq = "2"
+
+[features]
+# Gates tests/integration.rs -- see that file's header comment.
+integration-tests = []
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+required-features = ["integration-tests"]
 
 [profile.release]
 opt-level = "s"

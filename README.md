@@ -81,7 +81,7 @@ real HTTP requests against a mock distributor):
 
 ```sh
 npm install
-cargo test --test integration -- --ignored
+cargo test --features integration-tests --test integration
 ```
 
 (`worker-build` is installed automatically as part of the test, matching
@@ -90,7 +90,10 @@ cargo test --test integration -- --ignored
 This covers what the unit tests structurally can't reach — routing, header
 reading, KV, Durable Object correlation, and real outbound `fetch()`s — and
 is what actually caught the redirect-forwarding bug noted under Security
-notes below. Ignored by default since it needs Node/npm installed.
+notes below. Gated behind the `integration-tests` feature since it needs
+Node/npm installed — a plain `cargo test` doesn't build or run it at all.
+Unix-only (process groups aren't portable); compiles to an empty, harmless
+test binary on other platforms.
 
 Start the dev server for manual testing:
 
