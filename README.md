@@ -52,7 +52,7 @@ npx wrangler deploy
 
 The pre-deploy script (`npm run check-cidr`) keeps `data/telegram-cidrs.txt`
 in sync with Telegram's published list: it skips the check entirely if run
-within the last 7 days, otherwise does a conditional fetch and updates the
+within the last day, otherwise does a conditional fetch and updates the
 file in place if the list has changed. No manual steps needed — the change
 is picked up on the next build via `include_str!`.
 

@@ -20,7 +20,7 @@ CIDR_FILE="$REPO_ROOT/data/telegram-cidrs.txt"
 TIMESTAMP_FILE="$REPO_ROOT/data/telegram-cidrs.txt.last-checked"
 NEW_FILE="$CIDR_FILE.new"
 FETCH_URL="https://core.telegram.org/resources/cidr.txt"
-MAX_AGE_DAYS=7
+MAX_AGE_DAYS=1
 
 # curl's --time-cond only recognizes a handful of date formats (see
 # curl_getdate(3)); anything else is silently treated as a filename, and a
