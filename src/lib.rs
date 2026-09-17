@@ -19,6 +19,24 @@ use http::StatusCode;
 use ipnetwork::IpNetwork;
 use worker::*;
 
+/// Header names this crate reads or writes. `HeaderName::from_static` is
+/// `const fn`, so these are checked and built at compile time;
+/// `worker::Headers` itself only takes `&str`, so callers pass `NAME.as_str()`.
+mod header_names {
+    use http::HeaderName;
+
+    /// Client IP set by Cloudflare's edge; see `get_client_ip`'s docs for why
+    /// this is trusted over `X-Forwarded-For`.
+    pub const CF_CONNECTING_IP: HeaderName = HeaderName::from_static("cf-connecting-ip");
+    /// Telegram's aesgcm Draft-04 encryption parameters.
+    pub const ENCRYPTION: HeaderName = HeaderName::from_static("encryption");
+    /// Telegram's aesgcm Draft-04 key.
+    pub const CRYPTO_KEY: HeaderName = HeaderName::from_static("crypto-key");
+    /// Internal header carrying the validated forwarding target from the
+    /// Worker to the Correlator Durable Object (see src/correlator.rs).
+    pub(crate) const X_RELAY_TARGET: HeaderName = HeaderName::from_static("x-relay-target");
+}
+
 /// Real `WebPush` ciphertext is small; anything past this is treated as
 /// abuse rather than buffered and forwarded. 16KB covers real Telegram
 /// notifications with headroom; anything larger is likely garbage.
@@ -123,7 +141,9 @@ async fn get_telegram_cidr_list(kv: &KvStore) -> Result<String> {
 /// Extract client IP from the `CF-Connecting-IP` header Cloudflare's edge
 /// sets on every routed request. Unlike `X-Forwarded-For`, a client cannot
 /// set this header itself, which is what the Telegram IP allowlist relies on.
-fn get_client_ip(req: &Request) -> Option<String> { req.headers().get("cf-connecting-ip").ok().flatten() }
+fn get_client_ip(req: &Request) -> Option<String> {
+    req.headers().get(header_names::CF_CONNECTING_IP.as_str()).ok().flatten()
+}
 
 /// `Response::error` using `status`'s own canonical reason phrase (e.g.
 /// "Forbidden" for 403) as the message, for error paths that carry no
@@ -226,7 +246,7 @@ async fn call_correlator(env: &Env, endpoint: &url::Url, method: Method, body: V
     let stub = namespace.id_from_name(endpoint.as_str())?.get_stub()?;
 
     let headers = Headers::new();
-    headers.set("X-Relay-Target", endpoint.as_str())?;
+    headers.set(header_names::X_RELAY_TARGET.as_str(), endpoint.as_str())?;
 
     let mut init = RequestInit::new();
     init.with_method(method).with_headers(headers).with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into()));
@@ -259,8 +279,8 @@ async fn handle_aesgcm(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
         return error_response(StatusCode::FORBIDDEN);
     };
 
-    let encryption = req.headers().get("encryption")?.unwrap_or_default();
-    let crypto_key = req.headers().get("crypto-key")?.unwrap_or_default();
+    let encryption = req.headers().get(header_names::ENCRYPTION.as_str())?.unwrap_or_default();
+    let crypto_key = req.headers().get(header_names::CRYPTO_KEY.as_str())?.unwrap_or_default();
     let body = req.bytes().await?;
     if body.len() > MAX_BODY_BYTES {
         return error_response(StatusCode::PAYLOAD_TOO_LARGE);

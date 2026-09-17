@@ -2,3 +2,6 @@
 /build
 /node_modules
 .wrangler
+tags
+tags.lock
+tags.temp

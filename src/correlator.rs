@@ -18,6 +18,24 @@ use std::time::Duration;
 use http::StatusCode;
 use worker::*;
 
+/// Header names used when forwarding to the distributor.
+/// `HeaderName::from_static` is `const fn`, so these are checked and built at
+/// compile time; `worker::Headers` itself only takes `&str`, so callers pass
+/// `NAME.as_str()`.
+mod header_names {
+    use http::HeaderName;
+
+    /// RFC 8030 §5.2 message lifetime, in seconds.
+    pub const TTL: HeaderName = HeaderName::from_static("ttl");
+    /// RFC 8030 §5.3 delivery priority hint.
+    pub const URGENCY: HeaderName = HeaderName::from_static("urgency");
+    /// The `WebPush` payload encoding of the forwarded body.
+    pub const CONTENT_ENCODING: HeaderName = HeaderName::from_static("content-encoding");
+    /// RFC 8030 §5 resource URL for the created push message, on both the
+    /// distributor's response and our own normalized one.
+    pub const LOCATION: HeaderName = HeaderName::from_static("location");
+}
+
 /// How long a successful POST's timestamp counts as "recent" when a PUT for
 /// the same endpoint checks in.
 const RECENT_POST_WINDOW_MS: f64 = 2_000.0;
@@ -49,7 +67,7 @@ impl DurableObject for Correlator {
     fn new(_state: State, _env: Env) -> Self { Self { last_post: Cell::new(None), put_in_flight: Cell::new(false) } }
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
-        let Some(target) = req.headers().get("X-Relay-Target")? else {
+        let Some(target) = req.headers().get(crate::header_names::X_RELAY_TARGET.as_str())? else {
             return Response::error("missing X-Relay-Target", StatusCode::BAD_REQUEST.as_u16());
         };
         let target_url = url::Url::parse(&target).map_err(|e| Error::RustError(format!("bad target: {e}")))?;
@@ -124,9 +142,9 @@ fn is_post_recent(now: f64, last_post: Option<f64>, window_ms: f64) -> bool {
 /// back off on other 2xx codes, so any 2xx is normalized to that shape.
 async fn forward(target: &url::Url, body: Vec<u8>) -> Result<Response> {
     let headers = Headers::new();
-    headers.set("ttl", "2592000")?;
-    headers.set("urgency", "high")?;
-    headers.set("content-encoding", "aes128gcm")?;
+    headers.set(header_names::TTL.as_str(), "2592000")?;
+    headers.set(header_names::URGENCY.as_str(), "high")?;
+    headers.set(header_names::CONTENT_ENCODING.as_str(), "aes128gcm")?;
 
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
@@ -136,14 +154,14 @@ async fn forward(target: &url::Url, body: Vec<u8>) -> Result<Response> {
 
     let req = Request::new_with_init(target.as_str(), &init)?;
     let resp = Fetch::Request(req).send().await?;
-    let location = resp.headers().get("location")?;
+    let location = resp.headers().get(header_names::LOCATION.as_str())?;
 
     match wake_up_response_shape(resp.status_code(), location.as_deref(), target.as_str()) {
         None => Ok(resp),
         Some((status, location)) => Response::empty().map(|r| {
             r.with_status(status).with_headers({
                 let h = Headers::new();
-                let _ = h.set("location", &location);
+                let _ = h.set(header_names::LOCATION.as_str(), &location);
                 h
             })
         }),
