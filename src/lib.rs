@@ -53,6 +53,40 @@ fn validate_endpoint(raw: &str) -> Result<url::Url> {
     Ok(parsed)
 }
 
+/// Validate a CIDR block or plain IP string. Returns true if parseable,
+/// false if malformed. Plain IPs (no "/") are valid; CIDR blocks must have
+/// valid address and prefix length (0-32 for IPv4, 0-128 for IPv6).
+fn validate_cidr_line(line: &str) -> bool {
+    if line.is_empty() {
+        return false;
+    }
+
+    if let Some((addr, prefix_str)) = line.split_once('/') {
+        // CIDR block: validate address and prefix
+        let prefix_len: u8 = match prefix_str.parse() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+
+        if addr.contains(':') {
+            // IPv6 CIDR
+            if addr.parse::<std::net::Ipv6Addr>().is_err() {
+                return false;
+            }
+            prefix_len <= 128
+        } else {
+            // IPv4 CIDR
+            if addr.parse::<std::net::Ipv4Addr>().is_err() {
+                return false;
+            }
+            prefix_len <= 32
+        }
+    } else {
+        // Plain IP: just validate it parses
+        line.parse::<std::net::Ipv4Addr>().is_ok() || line.parse::<std::net::Ipv6Addr>().is_ok()
+    }
+}
+
 /// Check if `ip_str` (as dotted quad or colon-separated) is in the given CIDR
 /// block or matches a plain IP. Returns `None` if either string is malformed.
 /// Plain IPs (no "/") are treated as /32 (IPv4) or /128 (IPv6).
@@ -95,19 +129,21 @@ fn is_telegram_ip_with_list(ip_str: &str, cidr_list: &str) -> bool {
     cidr_list.lines().any(|cidr| ip_in_cidr(ip_str, cidr).unwrap_or(false))
 }
 
-/// Validate CIDR list: must have at least one line that's either a CIDR block
-/// (contains "/") or a plain IP address (valid IPv4/IPv6).
+/// Validate CIDR list by parsing all non-empty lines as the validation
+/// operation. Each line must be either a valid CIDR block or a plain IP
+/// address. Returns false if any line is malformed or if the list is empty.
 fn is_valid_cidr_list(content: &str) -> bool {
-    content.lines().any(|line| {
+    let mut has_valid = false;
+    for line in content.lines() {
         if line.is_empty() {
+            continue;
+        }
+        if !validate_cidr_line(line) {
             return false;
         }
-        if line.contains('/') {
-            return true;
-        }
-        // Accept plain IPs: try parsing as IPv4 or IPv6
-        line.parse::<std::net::Ipv4Addr>().is_ok() || line.parse::<std::net::Ipv6Addr>().is_ok()
-    })
+        has_valid = true;
+    }
+    has_valid
 }
 
 /// Fetch fresh Telegram CIDR list from remote, or return cached version.
