@@ -33,6 +33,17 @@ mod header_names {
     pub const LOCATION: HeaderName = HeaderName::from_static("location");
 }
 
+/// RFC 8030 §5.2 message lifetime sent on the forwarded push, in seconds --
+/// the maximum, so the distributor retries delivery for as long as it's
+/// willing to rather than giving up early.
+const TTL_SECONDS: u32 = 30 * 24 * 60 * 60;
+/// RFC 8030 §5.3 delivery priority sent on the forwarded push -- Telegram
+/// notifications are time-sensitive, so always the highest priority.
+const URGENCY_HIGH: &str = "high";
+/// The `WebPush` payload encoding of the forwarded body -- aesgcm Draft-04's
+/// only supported encoding.
+const CONTENT_ENCODING_AES128GCM: &str = "aes128gcm";
+
 /// How long a successful POST's timestamp counts as "recent" when a PUT for
 /// the same endpoint checks in.
 const RECENT_POST_WINDOW_MS: f64 = 2_000.0;
@@ -146,9 +157,9 @@ fn is_post_recent(now: f64, last_post: Option<f64>, window_ms: f64) -> bool {
 /// real status and `Location` rather than an opaque response.
 async fn forward(target: &url::Url, body: Vec<u8>) -> Result<Response> {
     let headers = Headers::new();
-    headers.set(header_names::TTL.as_str(), "2592000")?;
-    headers.set(header_names::URGENCY.as_str(), "high")?;
-    headers.set(header_names::CONTENT_ENCODING.as_str(), "aes128gcm")?;
+    headers.set(header_names::TTL.as_str(), &TTL_SECONDS.to_string())?;
+    headers.set(header_names::URGENCY.as_str(), URGENCY_HIGH)?;
+    headers.set(header_names::CONTENT_ENCODING.as_str(), CONTENT_ENCODING_AES128GCM)?;
 
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
