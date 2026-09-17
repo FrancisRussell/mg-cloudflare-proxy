@@ -81,15 +81,16 @@ real HTTP requests against a mock distributor):
 
 ```sh
 npm install
-cargo install worker-build
 cargo test --test integration -- --ignored
 ```
+
+(`worker-build` is installed automatically as part of the test, matching
+`wrangler.toml`'s own `[build]` command — no separate step needed.)
 
 This covers what the unit tests structurally can't reach — routing, header
 reading, KV, Durable Object correlation, and real outbound `fetch()`s — and
 is what actually caught the redirect-forwarding bug noted under Security
-notes below. Ignored by default since it needs Node/wrangler/`worker-build`
-installed.
+notes below. Ignored by default since it needs Node/npm installed.
 
 Start the dev server for manual testing:
 

@@ -7,8 +7,9 @@
 // and Durable Objects fully emulated locally) and drives it with real HTTP
 // requests against a mock UnifiedPush distributor.
 //
-// Requires Node/npm, wrangler, and worker-build to be installed -- ignored
-// by default. Run with: cargo test --test integration -- --ignored
+// Requires Node/npm (for `npx wrangler`) and cargo (to install worker-build,
+// done automatically below) -- ignored by default.
+// Run with: cargo test --test integration -- --ignored
 
 use std::net::TcpListener;
 use std::os::unix::process::CommandExt;
@@ -41,11 +42,19 @@ impl WranglerDev {
     fn start() -> Self {
         free_port(WORKER_PORT);
 
+        // Matches wrangler.toml's own [build] command: install (a no-op if
+        // already present) rather than requiring a separate manual step.
+        let status = Command::new("cargo")
+            .args(["install", "-q", "worker-build"])
+            .status()
+            .expect("failed to run `cargo install worker-build` (is cargo installed?)");
+        assert!(status.success(), "cargo install worker-build failed");
+
         let status = Command::new("worker-build")
             .arg("--release")
             .current_dir(PROJECT_DIR)
             .status()
-            .expect("failed to run worker-build (cargo install worker-build)");
+            .expect("failed to run worker-build");
         assert!(status.success(), "worker-build failed");
 
         let child = Command::new("npx")
@@ -190,7 +199,7 @@ fn status_of(result: Result<ureq::Response, ureq::Error>) -> u16 {
 }
 
 #[test]
-#[ignore = "requires Node/wrangler/worker-build; run with `cargo test --test integration -- --ignored`"]
+#[ignore = "requires Node/npm; run with `cargo test --test integration -- --ignored`"]
 fn integration_test() {
     let _dev = WranglerDev::start();
 
