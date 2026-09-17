@@ -300,3 +300,220 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
     Router::new().post_async("/aesgcm", handle_aesgcm).put_async("/*path", handle_put).run(req, env).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_cidr_line_ipv4_block() {
+        assert!(validate_cidr_line("91.108.56.0/22"));
+        assert!(validate_cidr_line("0.0.0.0/0"));
+        assert!(validate_cidr_line("192.168.1.0/24"));
+    }
+
+    #[test]
+    fn test_validate_cidr_line_ipv6_block() {
+        assert!(validate_cidr_line("2001:b28:f23d::/48"));
+        assert!(validate_cidr_line("::/0"));
+        assert!(validate_cidr_line("fe80::/10"));
+    }
+
+    #[test]
+    fn test_validate_cidr_line_plain_ip() {
+        assert!(validate_cidr_line("1.2.3.4"));
+        assert!(validate_cidr_line("2001:db8::1"));
+    }
+
+    #[test]
+    fn test_validate_cidr_line_invalid() {
+        assert!(!validate_cidr_line(""));
+        assert!(!validate_cidr_line("not-an-ip"));
+        assert!(!validate_cidr_line("1.2.3.4/33")); // IPv4 prefix too large
+        assert!(!validate_cidr_line("2001:db8::/129")); // IPv6 prefix too large
+        assert!(!validate_cidr_line("1.2.3.4/abc")); // Invalid prefix
+    }
+
+    #[test]
+    fn test_parse_cidr_list_valid() {
+        let list = "91.108.56.0/22\n91.108.4.0/22\n1.2.3.4";
+        let result = parse_cidr_list(list);
+        assert!(result.is_some());
+        let parsed = result.unwrap();
+        assert!(parsed.contains("91.108.56.0/22"));
+        assert!(parsed.contains("1.2.3.4"));
+    }
+
+    #[test]
+    fn test_parse_cidr_list_skips_empty_lines() {
+        let list = "91.108.56.0/22\n\n91.108.4.0/22";
+        let result = parse_cidr_list(list);
+        assert!(result.is_some());
+        let parsed = result.unwrap();
+        // Should have exactly 2 entries (empty line skipped)
+        assert_eq!(parsed.lines().count(), 2);
+    }
+
+    #[test]
+    fn test_parse_cidr_list_rejects_malformed() {
+        let list = "91.108.56.0/22\ninvalid-cidr\n91.108.4.0/22";
+        assert!(parse_cidr_list(list).is_none());
+    }
+
+    #[test]
+    fn test_parse_cidr_list_empty() {
+        assert!(parse_cidr_list("").is_none());
+        assert!(parse_cidr_list("\n\n").is_none());
+    }
+
+    #[test]
+    fn test_is_telegram_ip_with_list_ipv4() {
+        let cidr_list = "91.108.56.0/22\n91.108.4.0/22\n149.154.160.0/20";
+        let ip: std::net::IpAddr = "91.108.56.100".parse().unwrap();
+        assert!(is_telegram_ip_with_list(ip, cidr_list));
+
+        let ip: std::net::IpAddr = "1.2.3.4".parse().unwrap();
+        assert!(!is_telegram_ip_with_list(ip, cidr_list));
+    }
+
+    #[test]
+    fn test_is_telegram_ip_with_list_ipv6() {
+        let cidr_list = "2001:b28:f23d::/48\n2001:67c:4e8::/48";
+        let ip: std::net::IpAddr = "2001:b28:f23d::1".parse().unwrap();
+        assert!(is_telegram_ip_with_list(ip, cidr_list));
+
+        let ip: std::net::IpAddr = "2001:db8::1".parse().unwrap();
+        assert!(!is_telegram_ip_with_list(ip, cidr_list));
+    }
+
+    #[test]
+    fn test_is_telegram_ip_with_list_plain_ip() {
+        let cidr_list = "1.2.3.4\n5.6.7.8/32";
+        let ip: std::net::IpAddr = "1.2.3.4".parse().unwrap();
+        assert!(is_telegram_ip_with_list(ip, cidr_list));
+
+        let ip: std::net::IpAddr = "1.2.3.5".parse().unwrap();
+        assert!(!is_telegram_ip_with_list(ip, cidr_list));
+    }
+
+    #[test]
+    fn test_is_telegram_ip_with_list_mixed() {
+        let cidr_list = "91.108.56.0/22\n1.2.3.4\n2001:b28:f23d::/48";
+        let ip: std::net::IpAddr = "91.108.56.100".parse().unwrap();
+        assert!(is_telegram_ip_with_list(ip, cidr_list));
+
+        let ip: std::net::IpAddr = "1.2.3.4".parse().unwrap();
+        assert!(is_telegram_ip_with_list(ip, cidr_list));
+
+        let ip: std::net::IpAddr = "2001:b28:f23d::1".parse().unwrap();
+        assert!(is_telegram_ip_with_list(ip, cidr_list));
+    }
+
+    #[test]
+    fn test_is_ip_safe_public_ipv4() {
+        let ip: std::net::IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(is_ip_safe(ip));
+
+        let ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+        assert!(is_ip_safe(ip));
+    }
+
+    #[test]
+    fn test_is_ip_safe_private_ipv4() {
+        assert!(!is_ip_safe("127.0.0.1".parse().unwrap())); // loopback
+        assert!(!is_ip_safe("192.168.1.1".parse().unwrap())); // private
+        assert!(!is_ip_safe("10.0.0.1".parse().unwrap())); // private
+        assert!(!is_ip_safe("172.16.0.1".parse().unwrap())); // private
+        assert!(!is_ip_safe("100.64.0.1".parse().unwrap())); // CGNAT
+        assert!(!is_ip_safe("192.0.2.1".parse().unwrap())); // TEST-NET
+        assert!(!is_ip_safe("198.51.100.1".parse().unwrap())); // TEST-NET-2
+        assert!(!is_ip_safe("203.0.113.1".parse().unwrap())); // TEST-NET-3
+    }
+
+    #[test]
+    fn test_is_ip_safe_public_ipv6() {
+        let ip: std::net::IpAddr = "2001:4860:4860::8888".parse().unwrap();
+        assert!(is_ip_safe(ip));
+    }
+
+    #[test]
+    fn test_is_ip_safe_private_ipv6() {
+        assert!(!is_ip_safe("::1".parse().unwrap())); // loopback
+        assert!(!is_ip_safe("fe80::1".parse().unwrap())); // link-local
+        assert!(!is_ip_safe("fc00::1".parse().unwrap())); // ULA
+        assert!(!is_ip_safe("::ffff:127.0.0.1".parse().unwrap())); // IPv4-mapped loopback
+        assert!(!is_ip_safe("64:ff9b::1".parse().unwrap())); // NAT64
+    }
+
+    #[test]
+    fn test_percent_decode_basic() {
+        assert_eq!(percent_decode("hello"), "hello");
+        assert_eq!(percent_decode("hello%20world"), "hello world");
+    }
+
+    #[test]
+    fn test_percent_decode_url() {
+        assert_eq!(percent_decode("https%3A%2F%2Fexample.com"), "https://example.com");
+    }
+
+    #[test]
+    fn test_percent_decode_special_chars() {
+        assert_eq!(percent_decode("%2B%3D%26"), "+=&");
+    }
+
+    #[test]
+    fn test_percent_decode_invalid_hex() {
+        // Invalid hex codes should pass through as-is
+        assert_eq!(percent_decode("%XY"), "%XY");
+        assert_eq!(percent_decode("%1G"), "%1G");
+    }
+
+    #[test]
+    fn test_fold_aesgcm_body_format() {
+        let encryption = "salt=abc";
+        let crypto_key = "dh=xyz";
+        let body = b"ciphertext";
+
+        let result = fold_aesgcm_body(encryption, crypto_key, body);
+        let s = String::from_utf8_lossy(&result);
+
+        assert!(s.starts_with("aesgcm\n"));
+        assert!(s.contains("Encryption: salt=abc\n"));
+        assert!(s.contains("Crypto-Key: dh=xyz\n"));
+        assert!(s.ends_with("ciphertext"));
+    }
+
+    #[test]
+    fn test_validate_endpoint_valid_http() {
+        assert!(validate_endpoint("http://example.com").is_ok());
+        assert!(validate_endpoint("https://example.com:8080").is_ok());
+    }
+
+    #[test]
+    fn test_validate_endpoint_invalid_scheme() {
+        assert!(validate_endpoint("ftp://example.com").is_err());
+        assert!(validate_endpoint("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_validate_endpoint_credentials() {
+        assert!(validate_endpoint("http://user:pass@example.com").is_err());
+    }
+
+    #[test]
+    fn test_validate_endpoint_literal_public_ip() {
+        assert!(validate_endpoint("http://8.8.8.8").is_ok());
+    }
+
+    #[test]
+    fn test_validate_endpoint_literal_private_ip() {
+        assert!(validate_endpoint("http://127.0.0.1").is_err());
+        assert!(validate_endpoint("http://192.168.1.1").is_err());
+        assert!(validate_endpoint("http://10.0.0.1").is_err());
+    }
+
+    #[test]
+    fn test_validate_endpoint_no_host() {
+        assert!(validate_endpoint("http://").is_err());
+    }
+}
