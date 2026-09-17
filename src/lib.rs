@@ -119,11 +119,10 @@ async fn get_telegram_cidr_list(kv: &KvStore) -> Result<String> {
     Ok(TELEGRAM_CIDR_BOOTSTRAP.to_string())
 }
 
-/// Extract client IP from request, preferring CF-Connecting-IP header
-/// (set by Cloudflare's edge) over other sources.
-fn get_client_ip(req: &Request) -> Option<String> {
-    req.headers().get("cf-connecting-ip").ok().flatten().or_else(|| req.headers().get("x-forwarded-for").ok().flatten())
-}
+/// Extract client IP from the `CF-Connecting-IP` header Cloudflare's edge
+/// sets on every routed request. Unlike `X-Forwarded-For`, a client cannot
+/// set this header itself, which is what the Telegram IP allowlist relies on.
+fn get_client_ip(req: &Request) -> Option<String> { req.headers().get("cf-connecting-ip").ok().flatten() }
 
 /// Cached SSRF-prevention ranges not covered by Rust's built-in methods.
 mod unsafe_ranges {
@@ -133,28 +132,28 @@ mod unsafe_ranges {
 
     pub static UNSAFE_V4: LazyLock<Vec<IpNetwork>> = LazyLock::new(|| {
         vec![
-            "0.0.0.0/8".parse().unwrap(),     // This host
-            "100.64.0.0/10".parse().unwrap(), // Shared address space (CGNAT)
-            "198.18.0.0/15".parse().unwrap(), // Benchmarking
+            "0.0.0.0/8".parse().expect("hardcoded CIDR literal must be valid"), // This host
+            "100.64.0.0/10".parse().expect("hardcoded CIDR literal must be valid"), // CGNAT
+            "198.18.0.0/15".parse().expect("hardcoded CIDR literal must be valid"), // Benchmarking
         ]
     });
 
     pub static UNSAFE_V6: LazyLock<Vec<IpNetwork>> = LazyLock::new(|| {
         vec![
-            "::/96".parse().unwrap(),          // IPv4-compatible
-            "::ffff:0:0/96".parse().unwrap(),  // IPv4-mapped
-            "64:ff9b::/96".parse().unwrap(),   // NAT64
-            "64:ff9b:1::/48".parse().unwrap(), // NAT64/Well-known prefix
-            "fc00::/7".parse().unwrap(),       // Unique local (ULA)
-            "fe80::/10".parse().unwrap(),      // Link-local
+            "::/96".parse().expect("hardcoded CIDR literal must be valid"), // IPv4-compatible
+            "::ffff:0:0/96".parse().expect("hardcoded CIDR literal must be valid"), // IPv4-mapped
+            "64:ff9b::/96".parse().expect("hardcoded CIDR literal must be valid"), // NAT64
+            "64:ff9b:1::/48".parse().expect("hardcoded CIDR literal must be valid"), // NAT64 well-known prefix
+            "2001:db8::/32".parse().expect("hardcoded CIDR literal must be valid"), // Documentation
+            "3fff::/20".parse().expect("hardcoded CIDR literal must be valid"), // Documentation
         ]
     });
 }
 
 /// True if `ip` is a public, routable address. Uses Rust's built-in methods
 /// for standard ranges (loopback, private, link-local, multicast,
-/// documentation, broadcast, unspecified) plus cached ipnetwork ranges Rust
-/// doesn't cover.
+/// documentation, broadcast, unspecified, unique-local) plus cached ipnetwork
+/// ranges Rust doesn't cover.
 fn is_ip_safe(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
@@ -174,7 +173,12 @@ fn is_ip_safe(ip: std::net::IpAddr) -> bool {
         }
         std::net::IpAddr::V6(v6) => {
             // Use Rust's built-in methods for standard ranges
-            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+            if v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+            {
                 return false;
             }
             // Check cached ranges Rust doesn't cover
@@ -463,6 +467,8 @@ mod tests {
         assert!(!is_ip_safe("fc00::1".parse().unwrap())); // ULA
         assert!(!is_ip_safe("::ffff:127.0.0.1".parse().unwrap())); // IPv4-mapped loopback
         assert!(!is_ip_safe("64:ff9b::1".parse().unwrap())); // NAT64
+        assert!(!is_ip_safe("2001:db8::1".parse().unwrap())); // documentation
+        assert!(!is_ip_safe("3fff::1".parse().unwrap())); // documentation
     }
 
     #[test]
