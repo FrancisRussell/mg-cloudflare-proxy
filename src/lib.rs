@@ -45,8 +45,8 @@ mod header_names {
 const MAX_BODY_BYTES: usize = 16_384;
 
 /// Bootstrap Telegram CIDR list, embedded at build time from
-/// data/telegram-cidrs.txt. Fetch fresh list on schedule; if that fails, fall
-/// back to this.
+/// data/telegram-cidrs.txt. Used until the runtime cache (see
+/// `is_telegram_ip`) has ever successfully fetched a fresher one.
 const TELEGRAM_CIDR_BOOTSTRAP: &str = include_str!("../data/telegram-cidrs.txt");
 
 /// Rejects anything that isn't a plain http(s) URL with a host and no
@@ -117,26 +117,65 @@ const CIDR_LIST_FETCHED_AT_KV_KEY: &str = "telegram_cidrs_fetched_at";
 /// How long a cached CIDR list is trusted before an unrecognized IP is
 /// allowed to trigger a re-fetch.
 const CIDR_LIST_MAX_AGE_MS: f64 = 24.0 * 60.0 * 60.0 * 1000.0;
+/// Beyond this age, force a background re-fetch even for a *recognized* IP
+/// -- otherwise a Telegram range that gets dropped and later reassigned
+/// (e.g. after a registry reclaim) would stay trusted forever, since a
+/// recognized IP normally never triggers a fetch at all (see
+/// `is_telegram_ip`) and nothing else would prompt one if only
+/// already-recognized IPs ever show up. IPv4 quarantine periods for
+/// reclaimed address space run 3 months (ARIN) to 6 months (RIPE) before
+/// reassignment, so a month of margin is comfortably conservative without
+/// adding needless fetch traffic.
+const CIDR_LIST_FORCE_REFETCH_MAX_AGE_MS: f64 = 30.0 * 24.0 * 60.0 * 60.0 * 1000.0;
 /// Where to fetch the Telegram CIDR list from. Overridable via the
 /// `CIDR_LIST_URL` wrangler var (see wrangler.toml) so the integration test
 /// can point this at a local mock server instead of Telegram's real endpoint.
 const TELEGRAM_CIDR_URL: &str = "https://core.telegram.org/resources/cidr.txt";
 const CIDR_LIST_URL_VAR: &str = "CIDR_LIST_URL";
+/// wrangler.toml `[[kv_namespaces]]` binding name for the CIDR list cache.
+const CIDR_CACHE_KV_BINDING: &str = "CIDR_CACHE";
+/// wrangler.toml `[durable_objects]` binding name for the Correlator.
+const CORRELATOR_BINDING: &str = "CORRELATOR";
+
+/// How trustworthy the cached CIDR list currently is, oldest-tolerated-use
+/// first. See `CIDR_LIST_MAX_AGE_MS` and `CIDR_LIST_FORCE_REFETCH_MAX_AGE_MS`.
+enum CidrListFreshness {
+    /// Recent enough that even an unrecognized IP shouldn't trigger a fetch.
+    Fresh,
+    /// Old enough that an unrecognized IP may trigger a fetch, but a
+    /// recognized one still won't.
+    Stale,
+    /// Old enough (or never successfully fetched) that even a recognized IP
+    /// should prompt a background re-fetch.
+    VeryStale,
+}
 
 /// True if `ip` is a Telegram IP. Checks the cached (or bootstrap, if never
 /// successfully fetched) list first -- a recognized IP never triggers a
-/// fetch. Only an unrecognized IP, combined with the cached list being
-/// missing or more than a day old, triggers a fetch attempt: real Telegram
-/// traffic is the overwhelmingly common case and shouldn't pay for an
-/// outbound round-trip to Telegram on every single request, and a flood of
-/// unrecognized IPs (a scan, an attack) shouldn't be able to force more than
-/// one fetch per day either.
-async fn is_telegram_ip(kv: &KvStore, ip: std::net::IpAddr, fetch_url: &str) -> bool {
-    let (list, is_fresh) = current_cidr_list(kv).await;
+/// *blocking* fetch. Only an unrecognized IP, combined with the cached list
+/// being missing or older than `CIDR_LIST_MAX_AGE_MS`, triggers a fetch
+/// attempt before answering: real Telegram traffic is the overwhelmingly
+/// common case and shouldn't pay for an outbound round-trip to Telegram on
+/// every single request, and a flood of unrecognized IPs (a scan, an
+/// attack) shouldn't be able to force more than one fetch per
+/// `CIDR_LIST_MAX_AGE_MS` window either.
+///
+/// A recognized IP against a *very* stale list still kicks off a re-fetch,
+/// but in the background via `ctx.wait_until` -- it doesn't delay the
+/// response, since the IP was already validated against the list on hand.
+async fn is_telegram_ip(kv: &KvStore, ip: std::net::IpAddr, fetch_url: &str, ctx: &Context) -> bool {
+    let (list, freshness) = current_cidr_list(kv).await;
     if is_telegram_ip_with_list(ip, &list) {
+        if matches!(freshness, CidrListFreshness::VeryStale) {
+            let kv = kv.clone();
+            let fetch_url = fetch_url.to_string();
+            ctx.wait_until(async move {
+                fetch_fresh_cidr_list(&kv, &fetch_url, &list).await;
+            });
+        }
         return true;
     }
-    if is_fresh {
+    if matches!(freshness, CidrListFreshness::Fresh) {
         return false;
     }
 
@@ -147,9 +186,8 @@ async fn is_telegram_ip(kv: &KvStore, ip: std::net::IpAddr, fetch_url: &str) -> 
 }
 
 /// The CIDR list currently on hand (cached, or the compiled-in bootstrap if
-/// nothing has ever been cached), and whether it's fresh enough (fetched
-/// within `CIDR_LIST_MAX_AGE_MS`) to skip trying Telegram's endpoint again.
-async fn current_cidr_list(kv: &KvStore) -> (String, bool) {
+/// nothing has ever been cached), and how fresh it is.
+async fn current_cidr_list(kv: &KvStore) -> (String, CidrListFreshness) {
     let list = match kv.get(CIDR_LIST_KV_KEY).text().await {
         Ok(Some(cached)) => cached,
         _ => TELEGRAM_CIDR_BOOTSTRAP.to_string(),
@@ -157,10 +195,20 @@ async fn current_cidr_list(kv: &KvStore) -> (String, bool) {
 
     #[allow(clippy::cast_precision_loss)] // millis-since-epoch fits exactly in f64 until the year 287396
     let now_ms = Date::now().as_millis() as f64;
-    let is_fresh = matches!(kv.get(CIDR_LIST_FETCHED_AT_KV_KEY).text().await, Ok(Some(fetched_at))
-        if fetched_at.parse::<f64>().is_ok_and(|fetched_at_ms| is_cidr_list_fresh(now_ms, fetched_at_ms, CIDR_LIST_MAX_AGE_MS)));
+    let freshness = match kv.get(CIDR_LIST_FETCHED_AT_KV_KEY).text().await {
+        Ok(Some(fetched_at)) => match fetched_at.parse::<f64>() {
+            Ok(fetched_at_ms) if is_cidr_list_fresh(now_ms, fetched_at_ms, CIDR_LIST_MAX_AGE_MS) => {
+                CidrListFreshness::Fresh
+            }
+            Ok(fetched_at_ms) if is_cidr_list_fresh(now_ms, fetched_at_ms, CIDR_LIST_FORCE_REFETCH_MAX_AGE_MS) => {
+                CidrListFreshness::Stale
+            }
+            _ => CidrListFreshness::VeryStale,
+        },
+        _ => CidrListFreshness::VeryStale,
+    };
 
-    (list, is_fresh)
+    (list, freshness)
 }
 
 /// True if `fetched_at_ms` (millis since epoch) is within `max_age_ms` of
@@ -182,7 +230,7 @@ fn is_cidr_list_fresh(now_ms: f64, fetched_at_ms: f64, max_age_ms: f64) -> bool 
 /// unparseable body) so a broken-but-reachable endpoint doesn't get hit on
 /// every subsequent unrecognized-IP request either -- only a network-level
 /// failure (couldn't reach it at all) leaves the timestamp untouched, since
-/// that's the one case worth retrying sooner than the usual day.
+/// that's the one case worth retrying sooner than `CIDR_LIST_MAX_AGE_MS`.
 ///
 /// `current_list` is returned unchanged on a 304, since that response
 /// carries no body to re-derive it from.
@@ -374,7 +422,7 @@ fn fold_aesgcm_body(encryption: &str, crypto_key: &str, body: &[u8]) -> Vec<u8> 
 /// the method (POST/PUT) tells the Durable Object which branch to run,
 /// and the body is whatever that branch should forward if it decides to.
 async fn call_correlator(env: &Env, endpoint: &url::Url, method: Method, body: Vec<u8>) -> Result<Response> {
-    let namespace = env.durable_object("CORRELATOR")?;
+    let namespace = env.durable_object(CORRELATOR_BINDING)?;
     let stub = namespace.id_from_name(endpoint.as_str())?.get_stub()?;
 
     let headers = Headers::new();
@@ -388,7 +436,16 @@ async fn call_correlator(env: &Env, endpoint: &url::Url, method: Method, body: V
 }
 
 /// POST /aesgcm?e=<url-encoded-endpoint>
-async fn handle_aesgcm(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
+///
+/// Structural validation (the `?e=` param, the target endpoint, body size)
+/// runs before the Telegram-IP check: those are free, local, in-process
+/// checks, and there's no reason a malformed request -- e.g. a random
+/// scanner missing `?e=` entirely, which was never going to be forwarded
+/// either way -- should get to spend a CIDR-list fetch attempt just because
+/// it happens to come from an unrecognized IP. Only a request that's
+/// otherwise well-formed enough to actually forward reaches the one check
+/// that can trigger outbound traffic to Telegram.
+async fn handle_aesgcm(mut req: Request, ctx: RouteContext<Context>) -> Result<Response> {
     let Some(client_ip_str) = get_client_ip(&req) else {
         console_log!("rejected: leg=aesgcm reason=missing_cf_connecting_ip");
         return error_response(StatusCode::FORBIDDEN);
@@ -397,12 +454,6 @@ async fn handle_aesgcm(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
         console_log!("rejected: leg=aesgcm reason=unparseable_cf_connecting_ip ip={client_ip_str}");
         return error_response(StatusCode::FORBIDDEN);
     };
-
-    let kv = ctx.env.kv("CIDR_CACHE")?;
-    if !is_telegram_ip(&kv, client_ip, &cidr_list_url(&ctx.env)).await {
-        console_log!("rejected: leg=aesgcm reason=ip_not_in_telegram_range ip={client_ip}");
-        return error_response(StatusCode::FORBIDDEN);
-    }
 
     let url = req.url()?;
     let Some((_, endpoint_raw)) = url.query_pairs().find(|(k, _)| k == "e") else {
@@ -426,13 +477,23 @@ async fn handle_aesgcm(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
         );
         return error_response(StatusCode::PAYLOAD_TOO_LARGE);
     }
+
+    let kv = ctx.env.kv(CIDR_CACHE_KV_BINDING)?;
+    if !is_telegram_ip(&kv, client_ip, &cidr_list_url(&ctx.env), &ctx.data).await {
+        console_log!("rejected: leg=aesgcm reason=ip_not_in_telegram_range ip={client_ip}");
+        return error_response(StatusCode::FORBIDDEN);
+    }
+
     let folded = fold_aesgcm_body(&encryption, &crypto_key, &body);
 
     call_correlator(&ctx.env, &endpoint, Method::Post, folded).await
 }
 
 /// PUT /<url-encoded-endpoint> — Simple Push (`token_type=4`) leg.
-async fn handle_put(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
+///
+/// Same ordering rationale as `handle_aesgcm`: structural validation before
+/// the one check that can trigger outbound traffic to Telegram.
+async fn handle_put(mut req: Request, ctx: RouteContext<Context>) -> Result<Response> {
     let Some(client_ip_str) = get_client_ip(&req) else {
         console_log!("rejected: leg=put reason=missing_cf_connecting_ip");
         return error_response(StatusCode::FORBIDDEN);
@@ -441,12 +502,6 @@ async fn handle_put(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         console_log!("rejected: leg=put reason=unparseable_cf_connecting_ip ip={client_ip_str}");
         return error_response(StatusCode::FORBIDDEN);
     };
-
-    let kv = ctx.env.kv("CIDR_CACHE")?;
-    if !is_telegram_ip(&kv, client_ip, &cidr_list_url(&ctx.env)).await {
-        console_log!("rejected: leg=put reason=ip_not_in_telegram_range ip={client_ip}");
-        return error_response(StatusCode::FORBIDDEN);
-    }
 
     let path = req.path();
     let encoded = path.strip_prefix('/').unwrap_or(&path);
@@ -469,6 +524,13 @@ async fn handle_put(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         );
         return error_response(StatusCode::PAYLOAD_TOO_LARGE);
     }
+
+    let kv = ctx.env.kv(CIDR_CACHE_KV_BINDING)?;
+    if !is_telegram_ip(&kv, client_ip, &cidr_list_url(&ctx.env), &ctx.data).await {
+        console_log!("rejected: leg=put reason=ip_not_in_telegram_range ip={client_ip}");
+        return error_response(StatusCode::FORBIDDEN);
+    }
+
     call_correlator(&ctx.env, &endpoint, Method::Put, body).await
 }
 
@@ -485,10 +547,14 @@ fn percent_decode(s: &str) -> Result<String> {
 }
 
 #[event(fetch)]
-pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
     console_error_panic_hook::set_once();
 
-    Router::new().post_async("/aesgcm", handle_aesgcm).put_async("/*path", handle_put).run(req, env).await
+    // `ctx` rides as the router's per-request data (`RouteContext::data`) so
+    // handlers can reach `ctx.wait_until` for the background CIDR re-fetch
+    // backstop -- the router itself has no notion of the fetch event's
+    // Context otherwise.
+    Router::with_data(ctx).post_async("/aesgcm", handle_aesgcm).put_async("/*path", handle_put).run(req, env).await
 }
 
 #[cfg(test)]
@@ -553,6 +619,18 @@ mod tests {
         let fetched_at = 1_000.0;
         let now = fetched_at + CIDR_LIST_MAX_AGE_MS + 1.0;
         assert!(!is_cidr_list_fresh(now, fetched_at, CIDR_LIST_MAX_AGE_MS));
+    }
+
+    #[test]
+    fn test_is_cidr_list_fresh_within_force_refetch_max_age() {
+        assert!(is_cidr_list_fresh(1_000.0, 500.0, CIDR_LIST_FORCE_REFETCH_MAX_AGE_MS));
+    }
+
+    #[test]
+    fn test_is_cidr_list_fresh_outside_force_refetch_max_age() {
+        let fetched_at = 1_000.0;
+        let now = fetched_at + CIDR_LIST_FORCE_REFETCH_MAX_AGE_MS + 1.0;
+        assert!(!is_cidr_list_fresh(now, fetched_at, CIDR_LIST_FORCE_REFETCH_MAX_AGE_MS));
     }
 
     #[test]
