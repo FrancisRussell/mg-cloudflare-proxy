@@ -31,13 +31,21 @@ const CORRELATION_WAIT_MS: u64 = 200;
 #[derive(Debug)]
 pub struct Correlator {
     last_post: Cell<Option<f64>>,
+    // A Durable Object's `fetch` takes `&self`, so the runtime can dispatch
+    // concurrent requests to the same instance, interleaved at `.await`
+    // points. Without this flag, two PUTs arriving close together could
+    // both pass the "no recent POST" check, both wait out
+    // `CORRELATION_WAIT_MS`, and both forward — a duplicate wake-up. Whichever
+    // PUT claims this flag first is the sole decision-maker; a second
+    // concurrent PUT defers to it instead of racing to its own forward.
+    put_in_flight: Cell<bool>,
 }
 
 impl DurableObject for Correlator {
     // Neither `State` nor `Env` is needed: correlation state lives purely in
-    // `last_post` (see module doc — deliberately not `state.storage()`), and
-    // forwarding needs no bindings.
-    fn new(_state: State, _env: Env) -> Self { Self { last_post: Cell::new(None) } }
+    // `last_post`/`put_in_flight` (see module doc — deliberately not
+    // `state.storage()`), and forwarding needs no bindings.
+    fn new(_state: State, _env: Env) -> Self { Self { last_post: Cell::new(None), put_in_flight: Cell::new(false) } }
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
         let Some(target) = req.headers().get("X-Relay-Target")? else {
@@ -71,28 +79,42 @@ impl Correlator {
     /// PUT leg: if a POST for this same endpoint already landed (or lands
     /// within the wait window), this event was already delivered as real
     /// content — drop the redundant wake-up. Otherwise forward the original
-    /// Simple Push body as a synthetic wake-up.
+    /// Simple Push body as a synthetic wake-up. A concurrent PUT for the
+    /// same endpoint defers to whichever one got here first (see
+    /// `put_in_flight`'s doc comment).
     async fn handle_put(&self, target: &url::Url, body: Vec<u8>) -> Result<Response> {
         if self.recent_post() {
+            return Response::ok("");
+        }
+        if self.put_in_flight.replace(true) {
             return Response::ok("");
         }
 
         Delay::from(Duration::from_millis(CORRELATION_WAIT_MS)).await;
 
-        if self.recent_post() {
-            return Response::ok("");
-        }
+        let should_forward = !self.recent_post();
+        self.put_in_flight.set(false);
 
-        forward(target, body).await
+        if should_forward {
+            forward(target, body).await
+        } else {
+            Response::ok("")
+        }
     }
 
-    // millis-since-epoch fits exactly in f64 until the year 287396.
-    #[allow(clippy::cast_precision_loss)]
     fn recent_post(&self) -> bool {
-        match self.last_post.get() {
-            Some(t) => (Date::now().as_millis() as f64 - t) < RECENT_POST_WINDOW_MS,
-            None => false,
-        }
+        // millis-since-epoch fits exactly in f64 until the year 287396.
+        #[allow(clippy::cast_precision_loss)]
+        let now = Date::now().as_millis() as f64;
+        is_post_recent(now, self.last_post.get(), RECENT_POST_WINDOW_MS)
+    }
+}
+
+/// True if `last_post` (millis since epoch) is within `window_ms` of `now`.
+fn is_post_recent(now: f64, last_post: Option<f64>, window_ms: f64) -> bool {
+    match last_post {
+        Some(t) => (now - t) < window_ms,
+        None => false,
     }
 }
 
@@ -113,18 +135,67 @@ async fn forward(target: &url::Url, body: Vec<u8>) -> Result<Response> {
 
     let req = Request::new_with_init(target.as_str(), &init)?;
     let resp = Fetch::Request(req).send().await?;
+    let location = resp.headers().get("location")?;
 
-    if !(200..300).contains(&resp.status_code()) {
-        return Ok(resp);
+    match wake_up_response_shape(resp.status_code(), location.as_deref(), target.as_str()) {
+        None => Ok(resp),
+        Some((status, location)) => Response::empty().map(|r| {
+            r.with_status(status).with_headers({
+                let h = Headers::new();
+                let _ = h.set("location", &location);
+                h
+            })
+        }),
+    }
+}
+
+/// The `(status, location)` `forward` should respond with for a POST that
+/// got back `status`/`location` from `target`, per RFC 8030 §5's
+/// `201 Created` + `Location` shape. `None` means pass the response through
+/// unchanged (a non-2xx status).
+fn wake_up_response_shape(status: u16, location: Option<&str>, target: &str) -> Option<(u16, String)> {
+    if !(200..300).contains(&status) {
+        return None;
+    }
+    Some((201, location.map_or_else(|| target.to_string(), String::from)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_post_recent_within_window() {
+        assert!(is_post_recent(1_000.0, Some(500.0), RECENT_POST_WINDOW_MS));
     }
 
-    let location = resp.headers().get("location")?.unwrap_or_else(|| target.to_string());
+    #[test]
+    fn test_is_post_recent_outside_window() {
+        let last_post = 1_000.0;
+        let now = last_post + RECENT_POST_WINDOW_MS + 1.0;
+        assert!(!is_post_recent(now, Some(last_post), RECENT_POST_WINDOW_MS));
+    }
 
-    Response::empty().map(|r| {
-        r.with_status(201).with_headers({
-            let h = Headers::new();
-            let _ = h.set("location", &location);
-            h
-        })
-    })
+    #[test]
+    fn test_is_post_recent_no_prior_post() {
+        assert!(!is_post_recent(1_000.0, None, RECENT_POST_WINDOW_MS));
+    }
+
+    #[test]
+    fn test_wake_up_response_shape_non_2xx_passes_through() {
+        assert_eq!(wake_up_response_shape(500, Some("https://example.com/x"), "https://target.example"), None);
+        assert_eq!(wake_up_response_shape(404, None, "https://target.example"), None);
+    }
+
+    #[test]
+    fn test_wake_up_response_shape_2xx_preserves_location() {
+        let result = wake_up_response_shape(200, Some("https://example.com/x"), "https://target.example");
+        assert_eq!(result, Some((201, "https://example.com/x".to_string())));
+    }
+
+    #[test]
+    fn test_wake_up_response_shape_2xx_falls_back_to_target() {
+        let result = wake_up_response_shape(204, None, "https://target.example");
+        assert_eq!(result, Some((201, "https://target.example".to_string())));
+    }
 }
