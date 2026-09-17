@@ -25,24 +25,42 @@ See the doc comment at the top of `src/correlator.rs`.
 
 ## Setup
 
-1. Point Mercurygram (Settings → Mercurygram → Notifications →
-   UnifiedPush) at your chosen distributor.
-2. Deploy this Worker to your own Cloudflare account:
+### 1. Create a KV namespace
 
-   ```sh
-   npm install
-   npx wrangler login
-   npx wrangler deploy
-   ```
+Log in to your Cloudflare dashboard and create a new KV namespace (Workers &
+AI → KV → Create namespace). Choose a name like `mg-edge-relay-cidrs` and note
+the namespace ID and preview ID.
 
-   The pre-deploy script (`npm run check-cidr`) automatically verifies that
-   Telegram's CIDR list is current. If the list has changed (> 7 days old
-   and updated), you'll need to update `data/telegram-cidrs.txt` and
-   re-deploy.
-3. In Mercurygram's notification settings, set the gateway URL to your
-   deployed Worker's `*.workers.dev` URL (or a custom domain, at the cost
-   of that domain being visible to Telegram's servers directly — see the
-   gateway-vs-distributor discussion this project came out of).
+### 2. Configure wrangler and deploy
+
+Update `wrangler.toml` with your KV namespace IDs:
+
+```toml
+[[kv_namespaces]]
+binding = "CIDR_CACHE"
+id = "your-namespace-id-here"
+preview_id = "your-preview-namespace-id-here"
+```
+
+Then deploy:
+
+```sh
+npm install
+npx wrangler login
+npx wrangler deploy
+```
+
+The pre-deploy script (`npm run check-cidr`) automatically verifies that
+Telegram's CIDR list is current. If the list has changed (> 7 days old and
+updated), you'll need to update `data/telegram-cidrs.txt` and re-deploy.
+
+### 3. Configure Mercurygram
+
+Point Mercurygram (Settings → Mercurygram → Notifications → UnifiedPush) at
+your chosen distributor, then set the gateway URL to your deployed Worker's
+`*.workers.dev` URL (or a custom domain, at the cost of that domain being
+visible to Telegram's servers directly — see the gateway-vs-distributor
+discussion this project came out of).
 
 ## Local development
 
