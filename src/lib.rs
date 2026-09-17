@@ -129,49 +129,54 @@ fn is_telegram_ip_with_list(ip_str: &str, cidr_list: &str) -> bool {
     cidr_list.lines().any(|cidr| ip_in_cidr(ip_str, cidr).unwrap_or(false))
 }
 
-/// Validate CIDR list by parsing all non-empty lines as the validation
-/// operation. Each line must be either a valid CIDR block or a plain IP
-/// address. Returns false if any line is malformed or if the list is empty.
-fn is_valid_cidr_list(content: &str) -> bool {
-    let mut has_valid = false;
+/// Parse and validate CIDR list, returning only the validated entries.
+/// Skips empty lines; returns None if any non-empty line is malformed or if
+/// list is empty.
+fn parse_cidr_list(content: &str) -> Option<String> {
+    let mut entries = Vec::new();
     for line in content.lines() {
-        if line.is_empty() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        if !validate_cidr_line(line) {
-            return false;
+        if !validate_cidr_line(trimmed) {
+            return None; // Any malformed line rejects entire list
         }
-        has_valid = true;
+        entries.push(trimmed);
     }
-    has_valid
+
+    if entries.is_empty() {
+        return None;
+    }
+
+    Some(entries.join("\n"))
 }
 
 /// Fetch fresh Telegram CIDR list from remote, or return cached version.
-/// Falls back to bootstrap if both fail.
+/// Parses and validates all entries before caching. Falls back to bootstrap if
+/// both fail.
 async fn get_telegram_cidr_list(kv: &KvStore) -> Result<String> {
     const KV_KEY: &str = "telegram_cidrs";
     const FETCH_URL: &str = "https://core.telegram.org/resources/cidr.txt";
 
-    // Try fetching fresh
+    // Try fetching fresh and parsing
     if let Ok(mut resp) = Fetch::Url(FETCH_URL.parse().map_err(|_| Error::RustError("bad url".into()))?).send().await {
         if (200..300).contains(&resp.status_code()) {
             if let Ok(body) = resp.text().await {
-                if is_valid_cidr_list(&body) {
-                    let _ = kv.put(KV_KEY, &body);
-                    return Ok(body);
+                if let Some(parsed) = parse_cidr_list(&body) {
+                    let _ = kv.put(KV_KEY, &parsed);
+                    return Ok(parsed);
                 }
             }
         }
     }
 
-    // Fetch failed, try cache
+    // Fetch failed, try cache (already validated at storage time)
     if let Ok(Some(cached)) = kv.get(KV_KEY).text().await {
-        if is_valid_cidr_list(&cached) {
-            return Ok(cached);
-        }
+        return Ok(cached);
     }
 
-    // Last resort: bootstrap
+    // Last resort: bootstrap (pre-validated at build time)
     Ok(TELEGRAM_CIDR_BOOTSTRAP.to_string())
 }
 
