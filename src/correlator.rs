@@ -140,6 +140,13 @@ fn is_post_recent(now: f64, last_post: Option<f64>, window_ms: f64) -> bool {
 /// Forwards `body` to `target` as a WebPush-shaped POST. RFC 8030 §5 expects
 /// a `201 Created` with a `Location` header on success, and some senders
 /// back off on other 2xx codes, so any 2xx is normalized to that shape.
+///
+/// Uses `redirect: manual` rather than `redirect: error`: both stop a
+/// redirect from being followed, but `error` throws on construction under
+/// the local Miniflare/workerd runtime for reasons that didn't reproduce
+/// under `follow`/`manual` in isolation testing, while `manual` also has the
+/// advantage (server-side, unlike a browser) of surfacing the redirect's
+/// real status and `Location` rather than an opaque response.
 async fn forward(target: &url::Url, body: Vec<u8>) -> Result<Response> {
     let headers = Headers::new();
     headers.set(header_names::TTL.as_str(), "2592000")?;
@@ -149,11 +156,18 @@ async fn forward(target: &url::Url, body: Vec<u8>) -> Result<Response> {
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
         .with_headers(headers)
-        .with_redirect(RequestRedirect::Error)
+        .with_redirect(RequestRedirect::Manual)
         .with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into()));
 
     let req = Request::new_with_init(target.as_str(), &init)?;
     let resp = Fetch::Request(req).send().await?;
+
+    // A distributor that redirects is rejected outright rather than relayed:
+    // the SSRF check on `target` never saw wherever the Location points.
+    if is_redirect_status(resp.status_code()) {
+        return crate::error_response(StatusCode::BAD_GATEWAY);
+    }
+
     let location = resp.headers().get(header_names::LOCATION.as_str())?;
 
     match wake_up_response_shape(resp.status_code(), location.as_deref(), target.as_str()) {
@@ -167,6 +181,9 @@ async fn forward(target: &url::Url, body: Vec<u8>) -> Result<Response> {
         }),
     }
 }
+
+/// True if `status` is an HTTP redirect (3xx).
+fn is_redirect_status(status: u16) -> bool { (300..400).contains(&status) }
 
 /// The `(status, location)` `forward` should respond with for a POST that
 /// got back `status`/`location` from `target`, per RFC 8030 §5's
@@ -182,6 +199,16 @@ fn wake_up_response_shape(status: u16, location: Option<&str>, target: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_redirect_status() {
+        for status in [300, 301, 302, 303, 307, 308, 399] {
+            assert!(is_redirect_status(status), "status: {status}");
+        }
+        for status in [200, 201, 204, 299, 400, 404, 500] {
+            assert!(!is_redirect_status(status), "status: {status}");
+        }
+    }
 
     #[test]
     fn test_is_post_recent_within_window() {
