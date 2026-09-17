@@ -33,6 +33,13 @@ mod header_names {
     /// Internal header carrying the validated forwarding target from the
     /// Worker to the Correlator Durable Object (see src/correlator.rs).
     pub(crate) const X_RELAY_TARGET: HeaderName = HeaderName::from_static("x-relay-target");
+    /// Sent on the outbound CIDR-list fetch, echoing back the `Last-Modified`
+    /// value from the last successful fetch, so an unchanged list costs
+    /// Telegram's server a 304 rather than a full body.
+    pub const IF_MODIFIED_SINCE: HeaderName = HeaderName::from_static("if-modified-since");
+    /// Read from the CIDR-list fetch response and cached, to send back as
+    /// `IF_MODIFIED_SINCE` next time.
+    pub const LAST_MODIFIED: HeaderName = HeaderName::from_static("last-modified");
 }
 
 /// Real `WebPush` ciphertext is small; anything past this is treated as
@@ -110,6 +117,9 @@ fn parse_cidr_list(content: &str) -> Option<String> {
 
 const CIDR_LIST_KV_KEY: &str = "telegram_cidrs";
 const CIDR_LIST_FETCHED_AT_KV_KEY: &str = "telegram_cidrs_fetched_at";
+/// Telegram's own `Last-Modified` for the cached list, echoed back as
+/// `If-Modified-Since` on the next fetch.
+const CIDR_LIST_LAST_MODIFIED_KV_KEY: &str = "telegram_cidrs_last_modified";
 /// How long a cached CIDR list is trusted before an unrecognized IP is
 /// allowed to trigger a re-fetch.
 const CIDR_LIST_MAX_AGE_MS: f64 = 24.0 * 60.0 * 60.0 * 1000.0;
@@ -136,7 +146,7 @@ async fn is_telegram_ip(kv: &KvStore, ip: std::net::IpAddr, fetch_url: &str) -> 
         return false;
     }
 
-    match fetch_fresh_cidr_list(kv, fetch_url).await {
+    match fetch_fresh_cidr_list(kv, fetch_url, &list).await {
         Some(fresh) => is_telegram_ip_with_list(ip, &fresh),
         None => false,
     }
@@ -166,17 +176,36 @@ fn is_cidr_list_fresh(now_ms: f64, fetched_at_ms: f64, max_age_ms: f64) -> bool 
 }
 
 /// Attempts to fetch, validate, and cache a fresh CIDR list from Telegram.
+/// Sends the last successful fetch's `Last-Modified` back as
+/// `If-Modified-Since`, so an unchanged list (the common case) costs
+/// Telegram's server a bodyless 304 instead of the full list every time.
+///
 /// The fetched-at timestamp is updated on any definitive answer from the
-/// endpoint (even a bad one, like an unparseable body) so a broken-but-
-/// reachable endpoint doesn't get hit on every subsequent unrecognized-IP
-/// request either -- only a network-level failure (couldn't reach it at
-/// all) leaves the timestamp untouched, since that's the one case worth
-/// retrying sooner than the usual day.
-async fn fetch_fresh_cidr_list(kv: &KvStore, fetch_url: &str) -> Option<String> {
-    let Ok(url) = fetch_url.parse() else { return None };
-    match Fetch::Url(url).send().await {
+/// endpoint (a 304, a success, or a bad-but-reachable response like an
+/// unparseable body) so a broken-but-reachable endpoint doesn't get hit on
+/// every subsequent unrecognized-IP request either -- only a network-level
+/// failure (couldn't reach it at all) leaves the timestamp untouched, since
+/// that's the one case worth retrying sooner than the usual day.
+///
+/// `current_list` is returned unchanged on a 304, since that response
+/// carries no body to re-derive it from.
+async fn fetch_fresh_cidr_list(kv: &KvStore, fetch_url: &str, current_list: &str) -> Option<String> {
+    let headers = Headers::new();
+    if let Ok(Some(last_modified)) = kv.get(CIDR_LIST_LAST_MODIFIED_KV_KEY).text().await {
+        let _ = headers.set(header_names::IF_MODIFIED_SINCE.as_str(), &last_modified);
+    }
+    let mut init = RequestInit::new();
+    init.with_headers(headers);
+    let Ok(req) = Request::new_with_init(fetch_url, &init) else { return None };
+
+    match Fetch::Request(req).send().await {
         Ok(mut resp) => {
             let status = resp.status_code();
+            if status == StatusCode::NOT_MODIFIED.as_u16() {
+                console_log!("cidr_fetch: outcome=not_modified status={status}");
+                mark_cidr_list_fetched(kv).await;
+                return Some(current_list.to_string());
+            }
             if StatusCode::from_u16(status).is_ok_and(|s| s.is_success()) {
                 match resp.text().await {
                     Ok(body) => {
@@ -186,6 +215,9 @@ async fn fetch_fresh_cidr_list(kv: &KvStore, fetch_url: &str) -> Option<String> 
                                 parsed.lines().count()
                             );
                             kv_put_best_effort(kv, CIDR_LIST_KV_KEY, &parsed).await;
+                            if let Ok(Some(last_modified)) = resp.headers().get(header_names::LAST_MODIFIED.as_str()) {
+                                kv_put_best_effort(kv, CIDR_LIST_LAST_MODIFIED_KV_KEY, &last_modified).await;
+                            }
                             mark_cidr_list_fetched(kv).await;
                             return Some(parsed);
                         }
