@@ -15,6 +15,7 @@
 mod correlator;
 
 pub use correlator::Correlator;
+use ipnetwork::IpNetwork;
 use worker::*;
 
 /// Real `WebPush` ciphertext is small; anything past this is treated as
@@ -53,83 +54,20 @@ fn validate_endpoint(raw: &str) -> Result<url::Url> {
     Ok(parsed)
 }
 
-/// Validate a CIDR block or plain IP string. Returns true if parseable,
-/// false if malformed. Plain IPs (no "/") are valid; CIDR blocks must have
-/// valid address and prefix length (0-32 for IPv4, 0-128 for IPv6).
+/// Validate a CIDR block or plain IP string. Returns true if parseable.
+/// Plain IPs (no "/") are valid and treated as /32 (IPv4) or /128 (IPv6).
 fn validate_cidr_line(line: &str) -> bool {
     if line.is_empty() {
         return false;
     }
-
-    if let Some((addr, prefix_str)) = line.split_once('/') {
-        // CIDR block: validate address and prefix
-        let prefix_len: u8 = match prefix_str.parse() {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-
-        if addr.contains(':') {
-            // IPv6 CIDR
-            if addr.parse::<std::net::Ipv6Addr>().is_err() {
-                return false;
-            }
-            prefix_len <= 128
-        } else {
-            // IPv4 CIDR
-            if addr.parse::<std::net::Ipv4Addr>().is_err() {
-                return false;
-            }
-            prefix_len <= 32
-        }
-    } else {
-        // Plain IP: just validate it parses
-        line.parse::<std::net::Ipv4Addr>().is_ok() || line.parse::<std::net::Ipv6Addr>().is_ok()
-    }
-}
-
-/// Check if `ip_str` (as dotted quad or colon-separated) is in the given CIDR
-/// block or matches a plain IP. Returns `None` if either string is malformed,
-/// `Some(false)` if address families don't match. Plain IPs (no "/") are
-/// treated as /32 (IPv4) or /128 (IPv6).
-fn ip_in_cidr(ip_str: &str, cidr: &str) -> Option<bool> {
-    let ip_addr = ip_str.parse::<std::net::IpAddr>().ok()?;
-
-    let (cidr_addr, prefix_str) = match cidr.split_once('/') {
-        Some((addr, prefix)) => (addr, Some(prefix)),
-        None => (cidr, None),
-    };
-
-    let cidr_parsed = cidr_addr.parse::<std::net::IpAddr>().ok()?;
-
-    let prefix_len: u8 = match prefix_str {
-        Some(p) => p.parse().ok()?,
-        None => {
-            // Plain IP: exact match
-            return Some(ip_addr == cidr_parsed);
-        }
-    };
-
-    // Check address families match; if not, no match.
-    match (ip_addr, cidr_parsed) {
-        (std::net::IpAddr::V4(ip), std::net::IpAddr::V4(cidr_ip)) => {
-            let mask_shift = 32u32.saturating_sub(u32::from(prefix_len));
-            let ip_masked = u32::from(ip) >> mask_shift;
-            let cidr_masked = u32::from(cidr_ip) >> mask_shift;
-            Some(ip_masked == cidr_masked)
-        }
-        (std::net::IpAddr::V6(ip), std::net::IpAddr::V6(cidr_ip)) => {
-            let mask_shift = 128u32.saturating_sub(u32::from(prefix_len));
-            let ip_masked = u128::from(ip) >> mask_shift;
-            let cidr_masked = u128::from(cidr_ip) >> mask_shift;
-            Some(ip_masked == cidr_masked)
-        }
-        _ => Some(false), // Mismatched families (IPv4 vs IPv6)
-    }
+    line.parse::<IpNetwork>().is_ok()
 }
 
 /// True if `ip_str` is in the given CIDR list.
 fn is_telegram_ip_with_list(ip_str: &str, cidr_list: &str) -> bool {
-    cidr_list.lines().any(|cidr| ip_in_cidr(ip_str, cidr).unwrap_or(false))
+    let Ok(ip) = ip_str.parse::<std::net::IpAddr>() else { return false };
+
+    cidr_list.lines().any(|net_str| if let Ok(net) = net_str.parse::<IpNetwork>() { net.contains(ip) } else { false })
 }
 
 /// Parse and validate CIDR list, returning only the validated entries.

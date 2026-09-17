@@ -13,6 +13,7 @@ worker = "0.8"
 url = "2"
 serde = { version = "1", features = ["derive"] }
 console_error_panic_hook = "0.1"
+ipnetwork = "0.20"
 
 [profile.release]
 opt-level = "s"
