@@ -125,40 +125,60 @@ fn get_client_ip(req: &Request) -> Option<String> {
     req.headers().get("cf-connecting-ip").ok().flatten().or_else(|| req.headers().get("x-forwarded-for").ok().flatten())
 }
 
-/// True if `ip` is a public, routable address — excludes loopback, private,
-/// link-local, CGNAT, and other non-routable ranges.
-// Kept as a per-line `&& !condition` list, each annotated with its CIDR,
-// rather than clippy's De Morgan inversion, which would drop the comments.
-#[allow(clippy::nonminimal_bool)]
+/// SSRF-prevention ranges (non-public/routable addresses).
+const UNSAFE_V4_STRS: &[&str] = &[
+    "0.0.0.0/8",          // This host
+    "10.0.0.0/8",         // Private
+    "100.64.0.0/10",      // Shared address space (CGNAT)
+    "127.0.0.0/8",        // Loopback
+    "169.254.0.0/16",     // Link-local
+    "172.16.0.0/12",      // Private
+    "192.0.2.0/24",       // Documentation (TEST-NET-1)
+    "192.168.0.0/16",     // Private
+    "198.18.0.0/15",      // Benchmarking
+    "198.51.100.0/24",    // Documentation (TEST-NET-2)
+    "203.0.113.0/24",     // Documentation (TEST-NET-3)
+    "224.0.0.0/4",        // Multicast
+    "255.255.255.255/32", // Broadcast
+];
+
+const UNSAFE_V6_STRS: &[&str] = &[
+    "::1/128",        // Loopback
+    "::/128",         // Unspecified
+    "::/96",          // IPv4-compatible
+    "::ffff:0:0/96",  // IPv4-mapped
+    "64:ff9b::/96",   // NAT64
+    "64:ff9b:1::/48", // NAT64/Well-known prefix
+    "fc00::/7",       // Unique local (ULA)
+    "fe80::/10",      // Link-local
+    "ff00::/8",       // Multicast
+];
+
+/// True if `ip` is a public, routable address. Rejects loopback, private,
+/// link-local, CGNAT, documentation, and other non-routable ranges.
 fn is_ip_safe(ip: std::net::IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(v4) => {
-            let o = v4.octets();
-            !v4.is_loopback()
-                && !v4.is_private()
-                && !v4.is_link_local()
-                && !v4.is_broadcast()
-                && !v4.is_documentation()
-                && !v4.is_unspecified()
-                && !v4.is_multicast()
-                && o[0] != 0
-                && !(o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 (CGNAT)
-                && !(o[0] == 192 && o[1] == 0 && o[2] == 2) // 192.0.2.0/24 (TEST-NET)
-                && !(o[0] == 198 && o[1] == 51 && o[2] == 100) // 198.51.100.0/24 (TEST-NET-2)
-                && !(o[0] == 203 && o[1] == 0 && o[2] == 113) // 203.0.113.0/24
-                                                              // (TEST-NET-3)
+        std::net::IpAddr::V4(_) => {
+            !UNSAFE_V4_STRS.iter().any(
+                |cidr| {
+                    if let Ok(net) = cidr.parse::<IpNetwork>() {
+                        net.contains(ip)
+                    } else {
+                        false
+                    }
+                },
+            )
         }
-        std::net::IpAddr::V6(v6) => {
-            let o = v6.octets();
-            !v6.is_loopback()
-                && !v6.is_unspecified()
-                && !v6.is_multicast()
-                && (o[0] & 0xfe) != 0xfc // not ULA (fc00::/7)
-                && !(o[0] == 0xfe && (o[1] & 0xc0) == 0x80) // not link-local (fe80::/10)
-                && o[..12] != [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0] // not 64:ff9b::/96 (NAT64)
-                && !(o[0] == 0x00 && o[1] == 0x64 && o[2] == 0xff && o[3] == 0x9b && o[4] == 0x00 && o[5] == 0x01) // not 64:ff9b:1::/48
-                && o[..12] != [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] // not ::/96 (IPv4-compatible)
-                && o[..12] != [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff] // not ::ffff:0:0/96 (IPv4-mapped)
+        std::net::IpAddr::V6(_) => {
+            !UNSAFE_V6_STRS.iter().any(
+                |cidr| {
+                    if let Ok(net) = cidr.parse::<IpNetwork>() {
+                        net.contains(ip)
+                    } else {
+                        false
+                    }
+                },
+            )
         }
     }
 }
