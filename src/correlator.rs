@@ -156,18 +156,25 @@ async fn forward(target: &url::Url, body: Vec<u8>) -> Result<Response> {
         .with_redirect(RequestRedirect::Manual)
         .with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into()));
 
+    let body_size = body.len();
+    let host = target.host_str().unwrap_or("?");
+
     let req = Request::new_with_init(target.as_str(), &init)?;
     let resp = Fetch::Request(req).send().await?;
+    let distributor_status = resp.status_code();
 
     // A distributor that redirects is rejected outright rather than relayed:
     // the SSRF check on `target` never saw wherever the Location points.
-    if StatusCode::from_u16(resp.status_code()).is_ok_and(|s| s.is_redirection()) {
+    if StatusCode::from_u16(distributor_status).is_ok_and(|s| s.is_redirection()) {
+        console_error!(
+            "forward rejected: host={host} reason=distributor_redirected distributor_status={distributor_status}"
+        );
         return crate::error_response(StatusCode::BAD_GATEWAY);
     }
 
     let location = resp.headers().get(header_names::LOCATION.as_str())?;
 
-    match wake_up_response_shape(resp.status_code(), location.as_deref(), target.as_str()) {
+    let result = match wake_up_response_shape(distributor_status, location.as_deref(), target.as_str()) {
         None => Ok(resp),
         Some((status, location)) => Response::empty().map(|r| {
             r.with_status(status).with_headers({
@@ -176,7 +183,15 @@ async fn forward(target: &url::Url, body: Vec<u8>) -> Result<Response> {
                 h
             })
         }),
+    };
+
+    if let Ok(r) = &result {
+        console_log!(
+            "forwarded: host={host} body_size={body_size} distributor_status={distributor_status} our_status={}",
+            r.status_code()
+        );
     }
+    result
 }
 
 /// The `(status, location)` `forward` should respond with for a POST that

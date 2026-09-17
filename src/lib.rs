@@ -115,24 +115,41 @@ async fn get_telegram_cidr_list(kv: &KvStore) -> Result<String> {
     const KV_KEY: &str = "telegram_cidrs";
     const FETCH_URL: &str = "https://core.telegram.org/resources/cidr.txt";
 
-    // Try fetching fresh and parsing
-    if let Ok(mut resp) = Fetch::Url(FETCH_URL.parse().map_err(|_| Error::RustError("bad url".into()))?).send().await {
-        if StatusCode::from_u16(resp.status_code()).is_ok_and(|s| s.is_success()) {
-            if let Ok(body) = resp.text().await {
-                if let Some(parsed) = parse_cidr_list(&body) {
-                    let _ = kv.put(KV_KEY, &parsed);
-                    return Ok(parsed);
+    match Fetch::Url(FETCH_URL.parse().map_err(|_| Error::RustError("bad url".into()))?).send().await {
+        Ok(mut resp) => {
+            let status = resp.status_code();
+            if StatusCode::from_u16(status).is_ok_and(|s| s.is_success()) {
+                match resp.text().await {
+                    Ok(body) => match parse_cidr_list(&body) {
+                        Some(parsed) => {
+                            console_log!(
+                                "cidr_fetch: outcome=success entries={} status={status}",
+                                parsed.lines().count()
+                            );
+                            let _ = kv.put(KV_KEY, &parsed);
+                            return Ok(parsed);
+                        }
+                        None => console_error!("cidr_fetch: outcome=failed reason=unparseable status={status}"),
+                    },
+                    Err(e) => {
+                        console_error!("cidr_fetch: outcome=failed reason=body_read_error status={status} error={e}")
+                    }
                 }
+            } else {
+                console_error!("cidr_fetch: outcome=failed reason=bad_status status={status}");
             }
         }
+        Err(e) => console_error!("cidr_fetch: outcome=failed reason=network_error error={e}"),
     }
 
     // Fetch failed, try cache (already validated at storage time)
     if let Ok(Some(cached)) = kv.get(KV_KEY).text().await {
+        console_log!("cidr_fetch: outcome=using_cache entries={}", cached.lines().count());
         return Ok(cached);
     }
 
     // Last resort: bootstrap (checked by test_telegram_cidr_bootstrap_is_valid)
+    console_log!("cidr_fetch: outcome=using_bootstrap entries={}", TELEGRAM_CIDR_BOOTSTRAP.lines().count());
     Ok(TELEGRAM_CIDR_BOOTSTRAP.to_string())
 }
 
@@ -256,24 +273,29 @@ async fn call_correlator(env: &Env, endpoint: &url::Url, method: Method, body: V
 /// POST /aesgcm?e=<url-encoded-endpoint>
 async fn handle_aesgcm(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let Some(client_ip_str) = get_client_ip(&req) else {
+        console_log!("rejected: leg=aesgcm reason=missing_cf_connecting_ip");
         return error_response(StatusCode::FORBIDDEN);
     };
     let Ok(client_ip) = client_ip_str.parse::<std::net::IpAddr>() else {
+        console_log!("rejected: leg=aesgcm reason=unparseable_cf_connecting_ip ip={client_ip_str}");
         return error_response(StatusCode::FORBIDDEN);
     };
 
     let kv = ctx.env.kv("CIDR_CACHE")?;
     let cidr_list = get_telegram_cidr_list(&kv).await?;
     if !is_telegram_ip_with_list(client_ip, &cidr_list) {
+        console_log!("rejected: leg=aesgcm reason=ip_not_in_telegram_range ip={client_ip}");
         return error_response(StatusCode::FORBIDDEN);
     }
 
     let url = req.url()?;
-    let endpoint_raw = match url.query_pairs().find(|(k, _)| k == "e") {
-        Some((_, v)) => v.into_owned(),
-        None => return Response::error("missing ?e= parameter", StatusCode::BAD_REQUEST.as_u16()),
+    let Some((_, endpoint_raw)) = url.query_pairs().find(|(k, _)| k == "e") else {
+        console_log!("rejected: leg=aesgcm reason=missing_e_param ip={client_ip}");
+        return Response::error("missing ?e= parameter", StatusCode::BAD_REQUEST.as_u16());
     };
+    let endpoint_raw = endpoint_raw.into_owned();
     let Ok(endpoint) = validate_endpoint(&endpoint_raw) else {
+        console_log!("rejected: leg=aesgcm reason=invalid_endpoint ip={client_ip}");
         return error_response(StatusCode::FORBIDDEN);
     };
 
@@ -281,6 +303,11 @@ async fn handle_aesgcm(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
     let crypto_key = req.headers().get(header_names::CRYPTO_KEY.as_str())?.unwrap_or_default();
     let body = req.bytes().await?;
     if body.len() > MAX_BODY_BYTES {
+        console_log!(
+            "rejected: leg=aesgcm reason=payload_too_large ip={client_ip} host={} size={}",
+            endpoint.host_str().unwrap_or("?"),
+            body.len()
+        );
         return error_response(StatusCode::PAYLOAD_TOO_LARGE);
     }
     let folded = fold_aesgcm_body(&encryption, &crypto_key, &body);
@@ -291,30 +318,40 @@ async fn handle_aesgcm(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
 /// PUT /<url-encoded-endpoint> — Simple Push (`token_type=4`) leg.
 async fn handle_put(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let Some(client_ip_str) = get_client_ip(&req) else {
+        console_log!("rejected: leg=put reason=missing_cf_connecting_ip");
         return error_response(StatusCode::FORBIDDEN);
     };
     let Ok(client_ip) = client_ip_str.parse::<std::net::IpAddr>() else {
+        console_log!("rejected: leg=put reason=unparseable_cf_connecting_ip ip={client_ip_str}");
         return error_response(StatusCode::FORBIDDEN);
     };
 
     let kv = ctx.env.kv("CIDR_CACHE")?;
     let cidr_list = get_telegram_cidr_list(&kv).await?;
     if !is_telegram_ip_with_list(client_ip, &cidr_list) {
+        console_log!("rejected: leg=put reason=ip_not_in_telegram_range ip={client_ip}");
         return error_response(StatusCode::FORBIDDEN);
     }
 
     let path = req.path();
     let encoded = path.strip_prefix('/').unwrap_or(&path);
     let Ok(decoded) = percent_decode(encoded) else {
+        console_log!("rejected: leg=put reason=invalid_percent_encoding ip={client_ip}");
         return error_response(StatusCode::FORBIDDEN);
     };
 
     let Ok(endpoint) = validate_endpoint(&decoded) else {
+        console_log!("rejected: leg=put reason=invalid_endpoint ip={client_ip}");
         return error_response(StatusCode::FORBIDDEN);
     };
 
     let body = req.bytes().await?;
     if body.len() > MAX_BODY_BYTES {
+        console_log!(
+            "rejected: leg=put reason=payload_too_large ip={client_ip} host={} size={}",
+            endpoint.host_str().unwrap_or("?"),
+            body.len()
+        );
         return error_response(StatusCode::PAYLOAD_TOO_LARGE);
     }
     call_correlator(&ctx.env, &endpoint, Method::Put, body).await
