@@ -79,9 +79,41 @@ fn ip_in_cidr(ip_str: &str, cidr: &str) -> Option<bool> {
     }
 }
 
-/// True if `ip_str` is in Telegram's known CIDR ranges (bootstrap list).
-fn is_telegram_ip(ip_str: &str) -> bool {
-    TELEGRAM_CIDR_BOOTSTRAP.lines().any(|cidr| ip_in_cidr(ip_str, cidr).unwrap_or(false))
+/// True if `ip_str` is in the given CIDR list.
+fn is_telegram_ip_with_list(ip_str: &str, cidr_list: &str) -> bool {
+    cidr_list.lines().any(|cidr| ip_in_cidr(ip_str, cidr).unwrap_or(false))
+}
+
+/// Validate CIDR list: must have at least one line with CIDR notation.
+fn is_valid_cidr_list(content: &str) -> bool { content.lines().any(|line| line.contains('/') && !line.is_empty()) }
+
+/// Fetch fresh Telegram CIDR list from remote, or return cached version.
+/// Falls back to bootstrap if both fail.
+async fn get_telegram_cidr_list(kv: &KvStore) -> Result<String> {
+    const KV_KEY: &str = "telegram_cidrs";
+    const FETCH_URL: &str = "https://core.telegram.org/resources/cidr.txt";
+
+    // Try fetching fresh
+    if let Ok(mut resp) = Fetch::Url(FETCH_URL.parse().map_err(|_| Error::RustError("bad url".into()))?).send().await {
+        if (200..300).contains(&resp.status_code()) {
+            if let Ok(body) = resp.text().await {
+                if is_valid_cidr_list(&body) {
+                    let _ = kv.put(KV_KEY, &body);
+                    return Ok(body);
+                }
+            }
+        }
+    }
+
+    // Fetch failed, try cache
+    if let Ok(Some(cached)) = kv.get(KV_KEY).text().await {
+        if is_valid_cidr_list(&cached) {
+            return Ok(cached);
+        }
+    }
+
+    // Last resort: bootstrap
+    Ok(TELEGRAM_CIDR_BOOTSTRAP.to_string())
 }
 
 /// Extract client IP from request, preferring CF-Connecting-IP header
@@ -171,7 +203,10 @@ async fn handle_aesgcm(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
     let Some(client_ip) = get_client_ip(&req) else {
         return Response::error("Forbidden", 403);
     };
-    if !is_telegram_ip(&client_ip) {
+
+    let kv = ctx.env.kv("CIDR_CACHE")?;
+    let cidr_list = get_telegram_cidr_list(&kv).await?;
+    if !is_telegram_ip_with_list(&client_ip, &cidr_list) {
         return Response::error("Forbidden", 403);
     }
 
@@ -200,7 +235,10 @@ async fn handle_put(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     let Some(client_ip) = get_client_ip(&req) else {
         return Response::error("Forbidden", 403);
     };
-    if !is_telegram_ip(&client_ip) {
+
+    let kv = ctx.env.kv("CIDR_CACHE")?;
+    let cidr_list = get_telegram_cidr_list(&kv).await?;
+    if !is_telegram_ip_with_list(&client_ip, &cidr_list) {
         return Response::error("Forbidden", 403);
     }
 
