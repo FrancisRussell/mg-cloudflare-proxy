@@ -88,39 +88,42 @@ fn validate_cidr_line(line: &str) -> bool {
 }
 
 /// Check if `ip_str` (as dotted quad or colon-separated) is in the given CIDR
-/// block or matches a plain IP. Returns `None` if either string is malformed.
-/// Plain IPs (no "/") are treated as /32 (IPv4) or /128 (IPv6).
+/// block or matches a plain IP. Returns `None` if either string is malformed,
+/// `Some(false)` if address families don't match. Plain IPs (no "/") are
+/// treated as /32 (IPv4) or /128 (IPv6).
 fn ip_in_cidr(ip_str: &str, cidr: &str) -> Option<bool> {
+    let ip_addr = ip_str.parse::<std::net::IpAddr>().ok()?;
+
     let (cidr_addr, prefix_str) = match cidr.split_once('/') {
         Some((addr, prefix)) => (addr, Some(prefix)),
         None => (cidr, None),
     };
 
+    let cidr_parsed = cidr_addr.parse::<std::net::IpAddr>().ok()?;
+
     let prefix_len: u8 = match prefix_str {
         Some(p) => p.parse().ok()?,
         None => {
-            // Plain IP: treat as /32 or /128 by exact match
-            return Some(ip_str == cidr_addr);
+            // Plain IP: exact match
+            return Some(ip_addr == cidr_parsed);
         }
     };
 
-    // Handle both IPv4 and IPv6.
-    if cidr_addr.contains(':') {
-        // IPv6
-        let ip_addr: std::net::Ipv6Addr = ip_str.parse().ok()?;
-        let cidr_parsed: std::net::Ipv6Addr = cidr_addr.parse().ok()?;
-        let mask_shift = 128u32.saturating_sub(u32::from(prefix_len));
-        let ip_masked = u128::from(ip_addr) >> mask_shift;
-        let cidr_masked = u128::from(cidr_parsed) >> mask_shift;
-        Some(ip_masked == cidr_masked)
-    } else {
-        // IPv4
-        let ip_addr: std::net::Ipv4Addr = ip_str.parse().ok()?;
-        let cidr_parsed: std::net::Ipv4Addr = cidr_addr.parse().ok()?;
-        let mask_shift = 32u32.saturating_sub(u32::from(prefix_len));
-        let ip_masked = u32::from(ip_addr) >> mask_shift;
-        let cidr_masked = u32::from(cidr_parsed) >> mask_shift;
-        Some(ip_masked == cidr_masked)
+    // Check address families match; if not, no match.
+    match (ip_addr, cidr_parsed) {
+        (std::net::IpAddr::V4(ip), std::net::IpAddr::V4(cidr_ip)) => {
+            let mask_shift = 32u32.saturating_sub(u32::from(prefix_len));
+            let ip_masked = u32::from(ip) >> mask_shift;
+            let cidr_masked = u32::from(cidr_ip) >> mask_shift;
+            Some(ip_masked == cidr_masked)
+        }
+        (std::net::IpAddr::V6(ip), std::net::IpAddr::V6(cidr_ip)) => {
+            let mask_shift = 128u32.saturating_sub(u32::from(prefix_len));
+            let ip_masked = u128::from(ip) >> mask_shift;
+            let cidr_masked = u128::from(cidr_ip) >> mask_shift;
+            Some(ip_masked == cidr_masked)
+        }
+        _ => Some(false), // Mismatched families (IPv4 vs IPv6)
     }
 }
 
