@@ -46,6 +46,14 @@ const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 /// A Telegram IP from data/telegram-cidrs.txt's bootstrap list.
 const TELEGRAM_IP: &str = "91.108.56.1";
 
+/// The compiled-in bootstrap list, for building the mock CIDR server's
+/// response: it must be a superset of this (not just the two mock IPs
+/// appended below), since a successful fetch replaces whatever's cached
+/// entirely -- other scenarios in this same `wrangler dev` run still need
+/// `TELEGRAM_IP` to resolve after `fetches_cidr_list_only_for_unrecognized_ip`
+/// has already cached a fetched list.
+const TELEGRAM_CIDR_BOOTSTRAP: &str = include_str!("../data/telegram-cidrs.txt");
+
 /// PGID of the currently-running `wrangler dev` process group, or 0 if none.
 /// Shared with the SIGINT handler installed in `integration_test`: a signal
 /// terminates the process without unwinding, so `Drop for WranglerDev` never
@@ -103,6 +111,12 @@ struct WranglerDev {
     /// inherited file descriptors, only the test's own print!/println!
     /// calls, so quiet-on-success has to be done ourselves.
     output: Arc<Mutex<Vec<u8>>>,
+    /// Local KV/DO state directory (`--persist-to`), unique per run and
+    /// removed on drop -- wrangler otherwise defaults to `.wrangler/state`
+    /// in the project dir, which would carry KV entries over between
+    /// separate test runs (e.g. a previously-cached CIDR list) instead of
+    /// each run starting from a clean slate.
+    persist_dir: std::path::PathBuf,
 }
 
 /// Drains `pipe` into `output` on a background thread until it hits EOF
@@ -122,7 +136,10 @@ fn spawn_output_reader(mut pipe: impl Read + Send + 'static, output: Arc<Mutex<V
 }
 
 impl WranglerDev {
-    fn start() -> Self {
+    /// `cidr_list_url` overrides wrangler.toml's own `CIDR_LIST_URL` default
+    /// (Telegram's real endpoint) for the whole run, so the CIDR-fetch
+    /// scenario can point it at a local mock server instead.
+    fn start(cidr_list_url: &str) -> Self {
         // Matches wrangler.toml's own [build] command: install (a no-op if
         // already present) rather than requiring a separate manual step.
         let status = Command::new("cargo")
@@ -138,9 +155,21 @@ impl WranglerDev {
             .expect("failed to run worker-build");
         assert!(status.success(), "worker-build failed");
 
+        let persist_dir = std::env::temp_dir().join(format!("mg-edge-relay-test-{}", std::process::id()));
+        std::fs::create_dir_all(&persist_dir).expect("failed to create --persist-to directory");
+
         let port = pick_free_port();
         let mut child = Command::new("npx")
-            .args(["wrangler", "dev", "--port", &port.to_string()])
+            .args([
+                "wrangler",
+                "dev",
+                "--port",
+                &port.to_string(),
+                "--var",
+                &format!("CIDR_LIST_URL:{cidr_list_url}"),
+                "--persist-to",
+                persist_dir.to_str().expect("temp dir path must be valid UTF-8"),
+            ])
             .current_dir(PROJECT_DIR)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -158,7 +187,7 @@ impl WranglerDev {
         spawn_output_reader(child.stdout.take().expect("child spawned with piped stdout"), Arc::clone(&output));
         spawn_output_reader(child.stderr.take().expect("child spawned with piped stderr"), Arc::clone(&output));
 
-        let mut dev = Self { child, port, output };
+        let mut dev = Self { child, port, output, persist_dir };
         dev.wait_until_ready();
         dev
     }
@@ -215,6 +244,8 @@ impl Drop for WranglerDev {
             let output = self.output.lock().unwrap();
             eprintln!("--- wrangler dev output ---\n{}", String::from_utf8_lossy(&output));
         }
+
+        let _ = std::fs::remove_dir_all(&self.persist_dir);
     }
 }
 
@@ -281,6 +312,43 @@ impl MockDistributor {
     fn last_body(&self) -> Vec<u8> { self.last_body.lock().unwrap().clone().expect("distributor received no request") }
 }
 
+/// A minimal HTTP server standing in for Telegram's CIDR list endpoint,
+/// always serving the same fixed body and counting how many times it was
+/// hit -- used to verify the relay only fetches when it actually needs to
+/// (see the doc comment on `is_telegram_ip` in src/lib.rs).
+///
+/// Same leaked-background-thread caveat as `MockDistributor` above: fine for
+/// this file's single `#[test] fn`, but would need explicit teardown if a
+/// second one is ever added.
+struct MockCidrServer {
+    port: u16,
+    request_count: Arc<AtomicUsize>,
+}
+
+impl MockCidrServer {
+    fn start(body: String) -> Self {
+        let port = pick_free_port();
+        let server = tiny_http::Server::http(("127.0.0.1", port)).expect("failed to start mock CIDR server");
+        let request_count = Arc::new(AtomicUsize::new(0));
+
+        let count = Arc::clone(&request_count);
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                count.fetch_add(1, Ordering::SeqCst);
+                let _ = request.respond(Response::from_string(body.clone()));
+            }
+        });
+
+        Self { port, request_count }
+    }
+
+    /// A hostname, not a literal IP, for the same reason as
+    /// `MockDistributor::url` -- see its doc comment.
+    fn url(&self) -> String { format!("http://localhost:{}/cidr.txt", self.port) }
+
+    fn request_count(&self) -> usize { self.request_count.load(Ordering::SeqCst) }
+}
+
 fn worker_url(port: u16, path: &str) -> String { format!("http://127.0.0.1:{port}{path}") }
 
 fn encode(s: &str) -> String {
@@ -295,12 +363,27 @@ fn status_of(result: Result<ureq::Response, ureq::Error>) -> u16 {
     }
 }
 
+/// Two IPv4 addresses from the RFC 5737 documentation range -- guaranteed
+/// not to appear in Telegram's real bootstrap list, so they're reliably
+/// "unrecognized" until `fetches_cidr_list_only_for_unrecognized_ip` fetches
+/// the mock list containing them.
+const MOCK_CIDR_IP_A: &str = "192.0.2.5";
+const MOCK_CIDR_IP_B: &str = "192.0.2.10";
+
 #[test]
 fn integration_test() {
     install_sigint_cleanup();
 
-    let dev = WranglerDev::start();
+    // A superset of the real bootstrap list (see TELEGRAM_CIDR_BOOTSTRAP's
+    // doc comment) plus the two mock-only IPs above.
+    let mock_cidr_list = format!("{TELEGRAM_CIDR_BOOTSTRAP}\n{MOCK_CIDR_IP_A}\n{MOCK_CIDR_IP_B}");
+    let cidr_server = MockCidrServer::start(mock_cidr_list);
+    let dev = WranglerDev::start(&cidr_server.url());
     let port = dev.port;
+
+    // Must run before any other scenario: it depends on the CIDR cache
+    // still being empty (nothing fetched yet) at the start.
+    fetches_cidr_list_only_for_unrecognized_ip(port, &cidr_server);
 
     rejects_absent_cf_connecting_ip(port);
     rejects_non_telegram_ip(port);
@@ -308,6 +391,36 @@ fn integration_test() {
     forwards_put_to_valid_target(port);
     rejects_redirecting_distributor(port);
     post_suppresses_following_put(port);
+}
+
+/// A recognized IP (already in the bootstrap list) is let through with no
+/// CIDR fetch at all; an unrecognized IP triggers exactly one fetch; and a
+/// second, different unrecognized IP already covered by the now-cached list
+/// doesn't trigger another one. See `is_telegram_ip` in src/lib.rs.
+fn fetches_cidr_list_only_for_unrecognized_ip(port: u16, cidr_server: &MockCidrServer) {
+    let distributor = MockDistributor::start(None);
+    let target = encode(&distributor.url());
+
+    let resp = ureq::put(&worker_url(port, &format!("/{target}")))
+        .set("CF-Connecting-IP", TELEGRAM_IP)
+        .timeout(REQUEST_TIMEOUT)
+        .send_string("body");
+    assert_eq!(status_of(resp), 201, "a bootstrap-list IP should be accepted");
+    assert_eq!(cidr_server.request_count(), 0, "a recognized IP should never trigger a CIDR fetch");
+
+    let resp = ureq::put(&worker_url(port, &format!("/{target}")))
+        .set("CF-Connecting-IP", MOCK_CIDR_IP_A)
+        .timeout(REQUEST_TIMEOUT)
+        .send_string("body");
+    assert_eq!(status_of(resp), 201, "an IP in the freshly-fetched list should be accepted");
+    assert_eq!(cidr_server.request_count(), 1, "an unrecognized IP with no prior fetch should trigger exactly one");
+
+    let resp = ureq::put(&worker_url(port, &format!("/{target}")))
+        .set("CF-Connecting-IP", MOCK_CIDR_IP_B)
+        .timeout(REQUEST_TIMEOUT)
+        .send_string("body");
+    assert_eq!(status_of(resp), 201, "a different IP already in the now-cached list should be accepted");
+    assert_eq!(cidr_server.request_count(), 1, "a second unrecognized IP shouldn't trigger another fetch once cached");
 }
 
 /// Doesn't set `CF-Connecting-IP` at all -- but this can't actually verify
