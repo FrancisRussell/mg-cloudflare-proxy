@@ -382,12 +382,14 @@ fn status_of(result: Result<ureq::Response, ureq::Error>) -> u16 {
     }
 }
 
-/// Two IPv4 addresses from the RFC 5737 documentation range -- guaranteed
-/// not to appear in Telegram's real bootstrap list, so they're reliably
-/// "unrecognized" until `fetches_cidr_list_only_for_unrecognized_ip` fetches
-/// the mock list containing them.
+/// IPv4 addresses from the RFC 5737 documentation range -- guaranteed not to
+/// appear in Telegram's real bootstrap list. `_A`/`_B` are included in the
+/// mock CIDR server's list (see `integration_test`), so they become
+/// recognized once that's been fetched; `_UNKNOWN` never is, so it stays
+/// unrecognized even after a fetch.
 const MOCK_CIDR_IP_A: &str = "192.0.2.5";
 const MOCK_CIDR_IP_B: &str = "192.0.2.10";
+const MOCK_CIDR_IP_UNKNOWN: &str = "192.0.2.99";
 
 #[test]
 fn integration_test() {
@@ -412,26 +414,30 @@ fn integration_test() {
     post_suppresses_following_put(port);
 }
 
-/// A recognized IP (already in the bootstrap list) is let through with no
-/// CIDR fetch at all; an unrecognized IP triggers exactly one fetch; and a
-/// second, different unrecognized IP already covered by the now-cached list
-/// doesn't trigger another one. See `is_telegram_ip` in src/lib.rs.
+/// An unrecognized IP against a never-fetched cache triggers exactly one
+/// blocking fetch (and is still correctly rejected if it's genuinely not in
+/// the fetched list either); once that fetch has populated the cache,
+/// further requests -- whether from a bootstrap-only IP or one only the
+/// fetch itself revealed -- are all accepted without triggering another
+/// fetch. See `is_telegram_ip` in src/lib.rs.
+///
+/// Doesn't cover the separate `CidrListFreshness::VeryStale` background
+/// re-fetch (a recognized-but-never-confirmed IP still kicks off a
+/// `ctx.wait_until` refresh) -- there's no way to deterministically observe
+/// a `wait_until` task's completion from outside the Worker, and forcing the
+/// real trigger for it (the cache exceeding
+/// `CIDR_LIST_FORCE_REFETCH_MAX_AGE_MS`, 30 days) isn't practical here either.
+/// That threshold classification is covered at the unit level instead (see
+/// `test_is_cidr_list_fresh_*` in src/lib.rs).
 fn fetches_cidr_list_only_for_unrecognized_ip(port: u16, cidr_server: &MockCidrServer) {
     let distributor = MockDistributor::start(None);
     let target = encode(&distributor.url());
 
     let resp = ureq::put(&worker_url(port, &format!("/{target}")))
-        .set("CF-Connecting-IP", TELEGRAM_IP)
+        .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
         .timeout(REQUEST_TIMEOUT)
         .send_string("body");
-    assert_eq!(status_of(resp), 201, "a bootstrap-list IP should be accepted");
-    assert_eq!(cidr_server.request_count(), 0, "a recognized IP should never trigger a CIDR fetch");
-
-    let resp = ureq::put(&worker_url(port, &format!("/{target}")))
-        .set("CF-Connecting-IP", MOCK_CIDR_IP_A)
-        .timeout(REQUEST_TIMEOUT)
-        .send_string("body");
-    assert_eq!(status_of(resp), 201, "an IP in the freshly-fetched list should be accepted");
+    assert_eq!(status_of(resp), 403, "an IP absent from even the freshly-fetched list should stay rejected");
     assert_eq!(cidr_server.request_count(), 1, "an unrecognized IP with no prior fetch should trigger exactly one");
     assert_eq!(
         cidr_server.last_if_modified_since(),
@@ -440,11 +446,25 @@ fn fetches_cidr_list_only_for_unrecognized_ip(port: u16, cidr_server: &MockCidrS
     );
 
     let resp = ureq::put(&worker_url(port, &format!("/{target}")))
+        .set("CF-Connecting-IP", TELEGRAM_IP)
+        .timeout(REQUEST_TIMEOUT)
+        .send_string("body");
+    assert_eq!(status_of(resp), 201, "a bootstrap-list IP should be accepted");
+    assert_eq!(cidr_server.request_count(), 1, "a recognized IP against a now-fresh cache shouldn't trigger a fetch");
+
+    let resp = ureq::put(&worker_url(port, &format!("/{target}")))
+        .set("CF-Connecting-IP", MOCK_CIDR_IP_A)
+        .timeout(REQUEST_TIMEOUT)
+        .send_string("body");
+    assert_eq!(status_of(resp), 201, "an IP only the fetched list (not bootstrap) recognizes should be accepted");
+    assert_eq!(cidr_server.request_count(), 1, "still no further fetch");
+
+    let resp = ureq::put(&worker_url(port, &format!("/{target}")))
         .set("CF-Connecting-IP", MOCK_CIDR_IP_B)
         .timeout(REQUEST_TIMEOUT)
         .send_string("body");
     assert_eq!(status_of(resp), 201, "a different IP already in the now-cached list should be accepted");
-    assert_eq!(cidr_server.request_count(), 1, "a second unrecognized IP shouldn't trigger another fetch once cached");
+    assert_eq!(cidr_server.request_count(), 1, "still no further fetch");
 }
 
 /// Doesn't set `CF-Connecting-IP` at all -- but this can't actually verify
