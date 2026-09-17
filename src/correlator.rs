@@ -28,6 +28,7 @@ const RECENT_POST_WINDOW_MS: f64 = 2_000.0;
 const CORRELATION_WAIT_MS: u64 = 200;
 
 #[durable_object]
+#[derive(Debug)]
 pub struct Correlator {
     last_post: Cell<Option<f64>>,
 }
