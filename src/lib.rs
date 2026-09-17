@@ -307,7 +307,9 @@ async fn handle_put(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
 
     let path = req.path();
     let encoded = path.strip_prefix('/').unwrap_or(&path);
-    let decoded = percent_decode(encoded);
+    let Ok(decoded) = percent_decode(encoded) else {
+        return error_response(StatusCode::FORBIDDEN);
+    };
 
     let Ok(endpoint) = validate_endpoint(&decoded) else {
         return error_response(StatusCode::FORBIDDEN);
@@ -321,31 +323,15 @@ async fn handle_put(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
 }
 
 /// The target endpoint URL travels url-encoded in the PUT path, so it needs
-/// decoding before it's usable as a URL.
-fn percent_decode(s: &str) -> String {
-    // Slices `s[i+1..i+3]` by byte offset would panic if that range lands
-    // mid-character (e.g. `%` followed by a multibyte UTF-8 byte) — decode
-    // the two hex digits from raw bytes instead, which has no such boundary
-    // to violate.
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(hi), Some(lo)) = (hi, lo) {
-                // hi, lo are each 0..=15, so hi * 16 + lo is 0..=255.
-                #[allow(clippy::cast_possible_truncation)]
-                out.push((hi * 16 + lo) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
+/// decoding before it's usable as a URL. Percent-decoded bytes that aren't
+/// valid UTF-8 mean the path was malformed, not something to paper over —
+/// reject it rather than substituting replacement characters and feeding
+/// mangled input into URL parsing.
+fn percent_decode(s: &str) -> Result<String> {
+    percent_encoding::percent_decode_str(s)
+        .decode_utf8()
+        .map(std::borrow::Cow::into_owned)
+        .map_err(|e| Error::RustError(format!("invalid percent-encoded UTF-8: {e}")))
 }
 
 #[event(fetch)]
@@ -471,14 +457,20 @@ mod tests {
             ("%2B%3D%26", "+=&"),
         ];
         for (input, expected) in cases {
-            assert_eq!(percent_decode(input), expected, "input: {input}");
+            assert_eq!(percent_decode(input).unwrap(), expected, "input: {input}");
         }
     }
 
     #[test]
     fn test_percent_decode_invalid_hex_passes_through() {
-        assert_eq!(percent_decode("%XY"), "%XY");
-        assert_eq!(percent_decode("%1G"), "%1G");
+        assert_eq!(percent_decode("%XY").unwrap(), "%XY");
+        assert_eq!(percent_decode("%1G").unwrap(), "%1G");
+    }
+
+    #[test]
+    fn test_percent_decode_rejects_invalid_utf8() {
+        // %C3 alone is an incomplete 2-byte UTF-8 sequence.
+        assert!(percent_decode("%C3").is_err());
     }
 
     #[test]

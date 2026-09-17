@@ -15,8 +15,10 @@ serde = { version = "1", features = ["derive"] }
 console_error_panic_hook = "0.1"
 ipnetwork = "0.20"
 http = "1"
+percent-encoding = "2"
 
 [profile.release]
 opt-level = "s"
 lto = true
 strip = true
+panic = "abort"

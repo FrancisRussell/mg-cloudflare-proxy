@@ -319,6 +319,7 @@ dependencies = [
  "console_error_panic_hook",
  "http",
  "ipnetwork",
+ "percent-encoding",
  "serde",
  "url",
  "worker",
