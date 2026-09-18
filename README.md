@@ -50,11 +50,15 @@ npx wrangler login
 npx wrangler deploy
 ```
 
-The pre-deploy script (`npm run check-cidr`) keeps `data/telegram-cidrs.txt`
-in sync with Telegram's published list: it skips the check entirely if run
-within the last day, otherwise does a conditional fetch and updates the
-file in place if the list has changed. No manual steps needed — the change
-is picked up on the next build via `include_str!`.
+`data/telegram-cidrs.txt` is the bootstrap Telegram CIDR list baked into the
+build via `include_str!`. Every build (`wrangler dev` or `deploy`, however
+invoked) runs `scripts/verify-cidr-freshness.sh` first and fails loudly if
+that file hasn't been checked in the last 14 days — a build step reaching
+out to Telegram's servers on its own would be fragile, so refreshing it is
+a separate, deliberate step: run `npm run check-cidr` (needs network
+access) to do a conditional fetch and update the file in place if Telegram's
+list has changed. Worth running periodically (manually, or via a scheduled
+CI job) rather than only when the build starts complaining.
 
 ### 3. Configure Mercurygram
 

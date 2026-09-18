@@ -22,6 +22,8 @@ NEW_FILE="$CIDR_FILE.new"
 FETCH_URL="https://core.telegram.org/resources/cidr.txt"
 MAX_AGE_DAYS=1
 
+source "$SCRIPT_DIR/lib-http-date.sh"
+
 # curl's --time-cond only recognizes a handful of date formats (see
 # curl_getdate(3)); anything else is silently treated as a filename, and a
 # non-existent filename is silently ignored, so we write and read HTTP-date
@@ -30,23 +32,7 @@ write_timestamp() {
   date -u +"%a, %d %b %Y %H:%M:%S GMT" > "$TIMESTAMP_FILE"
 }
 
-epoch_of_http_date() {
-  local http_date="$1"
-  if date --version >/dev/null 2>&1; then
-    date -d "$http_date" +%s # GNU date
-  else
-    date -j -f "%a, %d %b %Y %H:%M:%S %Z" "$http_date" +%s # BSD date
-  fi
-}
-
-days_since_timestamp() {
-  local then now
-  then=$(epoch_of_http_date "$(cat "$TIMESTAMP_FILE")")
-  now=$(date +%s)
-  echo $(( (now - then) / 86400 ))
-}
-
-if [[ -f "$TIMESTAMP_FILE" ]] && [[ $(days_since_timestamp) -le $MAX_AGE_DAYS ]]; then
+if [[ -f "$TIMESTAMP_FILE" ]] && [[ $(days_since_http_date_file "$TIMESTAMP_FILE") -le $MAX_AGE_DAYS ]]; then
   echo "CIDR list checked within the last $MAX_AGE_DAYS days ($(cat "$TIMESTAMP_FILE")). Skipping fetch."
   echo "✓ CIDR check passed."
   exit 0
