@@ -1,0 +1,430 @@
+// Telegram IP allowlist: validates an incoming client IP against Telegram's
+// published CIDR ranges, on-demand-fetched and cached in KV. See
+// `is_telegram_ip`'s doc comment for the fetch-triggering rules.
+
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use http::StatusCode;
+use ipnetwork::IpNetwork;
+use worker::*;
+
+mod header_names {
+    use http::HeaderName;
+
+    /// Sent on the outbound CIDR-list fetch, echoing back the last fetch
+    /// attempt's own timestamp, so an unchanged list costs Telegram's
+    /// server a 304 rather than a full body.
+    pub const IF_MODIFIED_SINCE: HeaderName = HeaderName::from_static("if-modified-since");
+}
+
+/// Bootstrap Telegram CIDR list, embedded at build time from
+/// data/telegram-cidrs.txt. Used until the runtime cache (see
+/// `is_telegram_ip`) has ever successfully fetched a fresher one.
+const TELEGRAM_CIDR_BOOTSTRAP: &str = include_str!("../data/telegram-cidrs.txt");
+/// When `TELEGRAM_CIDR_BOOTSTRAP` was last verified against Telegram's live
+/// list (an HTTP-date string), embedded at build time from
+/// data/telegram-cidrs.txt.last-checked, written by scripts/check-cidr.sh
+/// before every deploy. Real and verified, so safe to send as
+/// `If-Modified-Since` while still running on bootstrap (see
+/// `current_cidr_list`).
+const TELEGRAM_CIDR_BOOTSTRAP_LAST_CHECKED: &str = include_str!("../data/telegram-cidrs.txt.last-checked");
+
+/// Validate a CIDR block or plain IP string. Returns true if parseable.
+/// Plain IPs (no "/") are valid and treated as /32 (IPv4) or /128 (IPv6).
+fn validate_cidr_line(line: &str) -> bool {
+    if line.is_empty() {
+        return false;
+    }
+    line.parse::<IpNetwork>().is_ok()
+}
+
+/// True if `ip` is in the given CIDR list.
+fn is_telegram_ip_with_list(ip: std::net::IpAddr, cidr_list: &str) -> bool {
+    cidr_list.lines().any(|net_str| if let Ok(net) = net_str.parse::<IpNetwork>() { net.contains(ip) } else { false })
+}
+
+/// Parse and validate CIDR list, returning only the validated entries.
+/// Skips empty lines; returns None if any non-empty line is malformed or if
+/// list is empty.
+fn parse_cidr_list(content: &str) -> Option<String> {
+    let mut entries = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !validate_cidr_line(trimmed) {
+            return None; // Any malformed line rejects entire list
+        }
+        entries.push(trimmed);
+    }
+
+    if entries.is_empty() {
+        return None;
+    }
+
+    Some(entries.join("\n"))
+}
+
+const CIDR_LIST_KV_KEY: &str = "telegram_cidrs";
+const CIDR_LIST_FETCHED_AT_KV_KEY: &str = "telegram_cidrs_fetched_at";
+/// How long a cached CIDR list is trusted before an unrecognized IP is
+/// allowed to trigger a re-fetch.
+const CIDR_LIST_MAX_AGE: Duration = Duration::from_hours(24);
+/// Beyond this age, force a background re-fetch even for a *recognized* IP
+/// -- otherwise a dropped-and-reassigned Telegram range would stay trusted
+/// forever, since a recognized IP normally never triggers a fetch at all
+/// (see `is_telegram_ip`). Real IPv4 reclaim quarantine periods run 3
+/// months (ARIN) to 6 months (RIPE), so 30 days is a conservative margin.
+const CIDR_LIST_FORCE_REFETCH_MAX_AGE: Duration = Duration::from_hours(30 * 24);
+/// Width of the random jitter subtracted from `CIDR_LIST_FORCE_REFETCH_MAX_AGE`
+/// (see `jittered_force_refetch_max_age`) -- only ever shortens the
+/// effective threshold, never lengthens it, so the 30-day promise is never
+/// exceeded, just sometimes acted on a little early.
+const CIDR_LIST_FORCE_REFETCH_JITTER: Duration = Duration::from_hours(24);
+/// Where to fetch the Telegram CIDR list from. Overridable via the
+/// `CIDR_LIST_URL` wrangler var (see wrangler.toml) so the integration test
+/// can point this at a local mock server instead of Telegram's real endpoint.
+const TELEGRAM_CIDR_URL: &str = "https://core.telegram.org/resources/cidr.txt";
+const CIDR_LIST_URL_VAR: &str = "CIDR_LIST_URL";
+/// Overrides `TELEGRAM_CIDR_BOOTSTRAP_LAST_CHECKED` when set; unset in
+/// production. Lets tests inject an artificially stale date, since the real
+/// embedded value should always be recent in a healthy deployment.
+const CIDR_LIST_BOOTSTRAP_LAST_CHECKED_VAR: &str = "CIDR_LIST_BOOTSTRAP_LAST_CHECKED";
+
+/// How trustworthy the cached CIDR list currently is, oldest-tolerated-use
+/// first. See `CIDR_LIST_MAX_AGE` and `CIDR_LIST_FORCE_REFETCH_MAX_AGE`.
+enum CidrListFreshness {
+    /// Recent enough that even an unrecognized IP shouldn't trigger a fetch.
+    Fresh,
+    /// Old enough that an unrecognized IP may trigger a fetch, but a
+    /// recognized one still won't.
+    Stale,
+    /// Old enough that even a recognized IP should prompt a background
+    /// re-fetch.
+    VeryStale,
+}
+
+/// The Worker runtime's current time. `std::time::SystemTime::now()` isn't
+/// usable here -- `wasm32-unknown-unknown` has no OS clock -- so this goes
+/// through `worker::Date` (backed by the JS host) instead, then converts
+/// into a `SystemTime` so the rest of this module can use ordinary
+/// `Duration`-based arithmetic rather than raw millisecond math.
+fn now() -> SystemTime { UNIX_EPOCH + Duration::from_millis(Date::now().as_millis()) }
+
+/// Milliseconds since the Unix epoch, for storing a `SystemTime` in KV
+/// (which only holds strings) and for handing to `worker::Date`, which
+/// speaks in millis rather than `SystemTime`.
+fn millis_since_epoch(t: SystemTime) -> u64 {
+    #[allow(clippy::cast_possible_truncation)] // millis-since-epoch fits comfortably in a u64 for millions of years
+    t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+/// True if `ip` is a Telegram IP. Checks the cached (or bootstrap, if never
+/// fetched) list first -- a recognized IP never triggers a *blocking* fetch.
+/// Only an unrecognized IP against a list older than `CIDR_LIST_MAX_AGE`
+/// triggers one before answering: real Telegram traffic shouldn't pay for a
+/// round-trip to Telegram on every request, and a flood of unrecognized IPs
+/// shouldn't force more than one fetch per `CIDR_LIST_MAX_AGE` window.
+///
+/// A recognized IP against a *very* stale list still kicks off a re-fetch,
+/// but in the background via `ctx.wait_until`, so it never delays the
+/// response.
+pub(crate) async fn is_telegram_ip(
+    kv: &KvStore, ip: std::net::IpAddr, fetch_url: &str, bootstrap_last_checked_raw: &str, ctx: &Context,
+) -> bool {
+    let (list, freshness, if_modified_since) = current_cidr_list(kv, bootstrap_last_checked_raw).await;
+    if is_telegram_ip_with_list(ip, &list) {
+        if matches!(freshness, CidrListFreshness::VeryStale) {
+            let kv = kv.clone();
+            let fetch_url = fetch_url.to_string();
+            ctx.wait_until(async move {
+                fetch_fresh_cidr_list(&kv, &fetch_url, &list, &if_modified_since).await;
+            });
+        }
+        return true;
+    }
+    if matches!(freshness, CidrListFreshness::Fresh) {
+        return false;
+    }
+
+    match fetch_fresh_cidr_list(kv, fetch_url, &list, &if_modified_since).await {
+        Some(fresh) => is_telegram_ip_with_list(ip, &fresh),
+        None => false,
+    }
+}
+
+/// The CIDR list currently on hand (cached, or the compiled-in bootstrap if
+/// nothing has ever been cached), how fresh it is, and the `If-Modified-Since`
+/// value safe to send if a fetch turns out to be needed.
+async fn current_cidr_list(kv: &KvStore, bootstrap_last_checked_raw: &str) -> (String, CidrListFreshness, String) {
+    let cached_list = kv.get(CIDR_LIST_KV_KEY).text().await.ok().flatten();
+    let list = cached_list.unwrap_or_else(|| TELEGRAM_CIDR_BOOTSTRAP.to_string());
+
+    let now = now();
+    let fetched_at_from_kv = match kv.get(CIDR_LIST_FETCHED_AT_KV_KEY).text().await {
+        Ok(Some(fetched_at)) => fetched_at.parse::<u64>().ok().map(|ms| UNIX_EPOCH + Duration::from_millis(ms)),
+        _ => None,
+    };
+    // Never fetched (or corrupt): use the bootstrap's own real last-checked
+    // date (see its doc comment). Fixed, so nothing needs persisting to KV
+    // to keep it stable across evaluations.
+    let fetched_at = fetched_at_from_kv.unwrap_or_else(|| bootstrap_last_checked(bootstrap_last_checked_raw));
+
+    let freshness = if is_cidr_list_fresh(now, fetched_at, CIDR_LIST_MAX_AGE) {
+        CidrListFreshness::Fresh
+    } else if is_cidr_list_fresh(now, fetched_at, jittered_force_refetch_max_age()) {
+        CidrListFreshness::Stale
+    } else {
+        CidrListFreshness::VeryStale
+    };
+
+    // A real, verified date either way (a prior fetch, or the bootstrap's
+    // own last-checked date) -- safe to send as a truth claim to Telegram.
+    let if_modified_since = http_date(fetched_at);
+
+    (list, freshness, if_modified_since)
+}
+
+/// `raw` (see `CIDR_LIST_BOOTSTRAP_LAST_CHECKED_VAR`) parsed as an
+/// HTTP-date, falling back to `TELEGRAM_CIDR_BOOTSTRAP_LAST_CHECKED` if it
+/// doesn't parse. The fallback is covered by
+/// `test_telegram_cidr_bootstrap_is_valid`, so its `.expect()` shouldn't fire
+/// outside a corrupted build.
+fn bootstrap_last_checked(raw: &str) -> SystemTime {
+    parse_http_date(raw).unwrap_or_else(|| {
+        parse_http_date(TELEGRAM_CIDR_BOOTSTRAP_LAST_CHECKED.trim())
+            .expect("data/telegram-cidrs.txt.last-checked must be a well-formed HTTP-date")
+    })
+}
+
+/// Parses an HTTP-date (e.g. "Thu, 17 Sep 2026 10:03:31 GMT") into a
+/// `SystemTime`. `None` if `s` isn't a well-formed HTTP-date.
+fn parse_http_date(s: &str) -> Option<SystemTime> { chrono::DateTime::parse_from_rfc2822(s).ok().map(SystemTime::from) }
+
+/// True if `fetched_at` is within `max_age` of `now` -- i.e. recent enough
+/// to skip re-fetching. Also false if `fetched_at` is somehow later than
+/// `now` (clock skew, a corrupted value): `SystemTime::duration_since`
+/// returns `Err` in that case, treated the same as "not fresh" rather than
+/// trusting a nonsensical value.
+fn is_cidr_list_fresh(now: SystemTime, fetched_at: SystemTime, max_age: Duration) -> bool {
+    now.duration_since(fetched_at).is_ok_and(|age| age < max_age)
+}
+
+/// `CIDR_LIST_FORCE_REFETCH_MAX_AGE` shortened by a random amount up to
+/// `CIDR_LIST_FORCE_REFETCH_JITTER`, freshly redrawn on every call --
+/// spreads out when different concurrent requests conclude the cache is
+/// `VeryStale`, rather than all of them crossing the same fixed cutoff at
+/// once (a synchronized fleet of edge locations would otherwise all decide
+/// to background-refetch in the same narrow window).
+fn jittered_force_refetch_max_age() -> Duration {
+    let jitter = CIDR_LIST_FORCE_REFETCH_JITTER.mul_f64(js_sys::Math::random());
+    CIDR_LIST_FORCE_REFETCH_MAX_AGE.saturating_sub(jitter)
+}
+
+/// Attempts to fetch, validate, and cache a fresh CIDR list from Telegram.
+/// Sends `if_modified_since` as `If-Modified-Since`: an unchanged list (the
+/// common case) then costs Telegram's server a bodyless 304 instead of the
+/// full list.
+///
+/// The fetched-at timestamp is updated on any definitive answer (a 304, a
+/// success, or a bad-but-reachable response like an unparseable body), so a
+/// broken-but-reachable endpoint isn't hit on every subsequent
+/// unrecognized-IP request either -- only a network-level failure leaves it
+/// untouched, since that's the one case worth retrying sooner than
+/// `CIDR_LIST_MAX_AGE`.
+///
+/// `current_list` is returned unchanged on a 304, since that response
+/// carries no body to re-derive it from.
+async fn fetch_fresh_cidr_list(
+    kv: &KvStore, fetch_url: &str, current_list: &str, if_modified_since: &str,
+) -> Option<String> {
+    let headers = Headers::new();
+    let _ = headers.set(header_names::IF_MODIFIED_SINCE.as_str(), if_modified_since);
+    let mut init = RequestInit::new();
+    init.with_headers(headers);
+    let Ok(req) = Request::new_with_init(fetch_url, &init) else { return None };
+
+    match Fetch::Request(req).send().await {
+        Ok(mut resp) => {
+            let status = resp.status_code();
+            if status == StatusCode::NOT_MODIFIED.as_u16() {
+                console_log!("cidr_fetch: outcome=not_modified status={status}");
+                mark_cidr_list_fetched(kv).await;
+                return Some(current_list.to_string());
+            }
+            if StatusCode::from_u16(status).is_ok_and(|s| s.is_success()) {
+                match resp.text().await {
+                    Ok(body) => {
+                        if let Some(parsed) = parse_cidr_list(&body) {
+                            console_log!(
+                                "cidr_fetch: outcome=success entries={} status={status}",
+                                parsed.lines().count()
+                            );
+                            kv_put_best_effort(kv, CIDR_LIST_KV_KEY, &parsed).await;
+                            mark_cidr_list_fetched(kv).await;
+                            return Some(parsed);
+                        }
+                        console_error!("cidr_fetch: outcome=failed reason=unparseable status={status}");
+                        mark_cidr_list_fetched(kv).await;
+                    }
+                    Err(e) => {
+                        console_error!("cidr_fetch: outcome=failed reason=body_read_error status={status} error={e}");
+                        mark_cidr_list_fetched(kv).await;
+                    }
+                }
+            } else {
+                console_error!("cidr_fetch: outcome=failed reason=bad_status status={status}");
+                mark_cidr_list_fetched(kv).await;
+            }
+        }
+        Err(e) => console_error!("cidr_fetch: outcome=failed reason=network_error error={e}"),
+    }
+    None
+}
+
+/// The `CIDR_LIST_URL` var if set (always true when deployed via
+/// wrangler.toml's own `[vars]` default), falling back to the hardcoded
+/// Telegram URL otherwise.
+pub(crate) fn cidr_list_url(env: &Env) -> String {
+    env.var(CIDR_LIST_URL_VAR).map_or_else(|_| TELEGRAM_CIDR_URL.to_string(), |v| v.to_string())
+}
+
+/// The `CIDR_LIST_BOOTSTRAP_LAST_CHECKED` var if set, falling back to
+/// `TELEGRAM_CIDR_BOOTSTRAP_LAST_CHECKED` otherwise (always, in production
+/// -- see the var's own doc comment).
+pub(crate) fn bootstrap_last_checked_raw(env: &Env) -> String {
+    env.var(CIDR_LIST_BOOTSTRAP_LAST_CHECKED_VAR)
+        .map_or_else(|_| TELEGRAM_CIDR_BOOTSTRAP_LAST_CHECKED.trim().to_string(), |v| v.to_string())
+}
+
+async fn mark_cidr_list_fetched(kv: &KvStore) {
+    kv_put_best_effort(kv, CIDR_LIST_FETCHED_AT_KV_KEY, &millis_since_epoch(now()).to_string()).await;
+}
+
+/// An HTTP-date string (e.g. for `If-Modified-Since`) for the given point
+/// in time.
+fn http_date(t: SystemTime) -> String {
+    let js_date: js_sys::Date = Date::new(DateInit::Millis(millis_since_epoch(t))).into();
+    js_date.to_utc_string().into()
+}
+
+/// `KvStore::put` only constructs a builder -- the write itself doesn't
+/// happen until `.execute().await`, easy to miss since the outer call isn't
+/// itself async. Failures are swallowed here: every caller already has a
+/// fallback for a cache miss (the bootstrap list, or just re-fetching),
+/// so a write failing is never worth failing an otherwise-valid request over.
+async fn kv_put_best_effort(kv: &KvStore, key: &str, value: &str) {
+    if let Ok(builder) = kv.put(key, value) {
+        let _ = builder.execute().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_cidr_line() {
+        let cases = [
+            ("91.108.56.0/22", true),
+            ("0.0.0.0/0", true),
+            ("192.168.1.0/24", true),
+            ("2001:b28:f23d::/48", true),
+            ("::/0", true),
+            ("fe80::/10", true),
+            ("1.2.3.4", true),     // plain IPv4
+            ("2001:db8::1", true), // plain IPv6
+            ("", false),
+            ("not-an-ip", false),
+            ("1.2.3.4/33", false),     // IPv4 prefix too large
+            ("2001:db8::/129", false), // IPv6 prefix too large
+            ("1.2.3.4/abc", false),    // invalid prefix
+        ];
+        for (input, expected) in cases {
+            assert_eq!(validate_cidr_line(input), expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn test_parse_cidr_list_valid() {
+        let list = "91.108.56.0/22\n\n91.108.4.0/22\n1.2.3.4";
+        let result = parse_cidr_list(list).unwrap();
+        assert!(result.contains("91.108.56.0/22"));
+        assert!(result.contains("1.2.3.4"));
+        assert_eq!(result.lines().count(), 3, "empty line should be skipped");
+    }
+
+    #[test]
+    fn test_parse_cidr_list_rejects_malformed() {
+        let list = "91.108.56.0/22\ninvalid-cidr\n91.108.4.0/22";
+        assert!(parse_cidr_list(list).is_none());
+    }
+
+    #[test]
+    fn test_parse_cidr_list_empty() {
+        assert!(parse_cidr_list("").is_none());
+        assert!(parse_cidr_list("\n\n").is_none());
+    }
+
+    #[test]
+    fn test_telegram_cidr_bootstrap_is_valid() {
+        assert!(parse_cidr_list(TELEGRAM_CIDR_BOOTSTRAP).is_some(), "data/telegram-cidrs.txt must parse cleanly");
+        assert!(
+            parse_http_date(TELEGRAM_CIDR_BOOTSTRAP_LAST_CHECKED.trim()).is_some(),
+            "data/telegram-cidrs.txt.last-checked must be a well-formed HTTP-date"
+        );
+    }
+
+    #[test]
+    fn test_is_cidr_list_fresh_within_max_age() {
+        let fetched_at = UNIX_EPOCH + Duration::from_millis(500);
+        let now = UNIX_EPOCH + Duration::from_millis(1_000);
+        assert!(is_cidr_list_fresh(now, fetched_at, CIDR_LIST_MAX_AGE));
+    }
+
+    #[test]
+    fn test_is_cidr_list_fresh_outside_max_age() {
+        let fetched_at = UNIX_EPOCH + Duration::from_millis(1_000);
+        let now = fetched_at + CIDR_LIST_MAX_AGE + Duration::from_millis(1);
+        assert!(!is_cidr_list_fresh(now, fetched_at, CIDR_LIST_MAX_AGE));
+    }
+
+    #[test]
+    fn test_is_cidr_list_fresh_within_force_refetch_max_age() {
+        let fetched_at = UNIX_EPOCH + Duration::from_millis(500);
+        let now = UNIX_EPOCH + Duration::from_millis(1_000);
+        assert!(is_cidr_list_fresh(now, fetched_at, CIDR_LIST_FORCE_REFETCH_MAX_AGE));
+    }
+
+    #[test]
+    fn test_is_cidr_list_fresh_outside_force_refetch_max_age() {
+        let fetched_at = UNIX_EPOCH + Duration::from_millis(1_000);
+        let now = fetched_at + CIDR_LIST_FORCE_REFETCH_MAX_AGE + Duration::from_millis(1);
+        assert!(!is_cidr_list_fresh(now, fetched_at, CIDR_LIST_FORCE_REFETCH_MAX_AGE));
+    }
+
+    #[test]
+    fn test_is_cidr_list_fresh_fetched_at_in_future_is_not_fresh() {
+        let now = UNIX_EPOCH + Duration::from_millis(1_000);
+        let fetched_at = UNIX_EPOCH + Duration::from_millis(2_000);
+        assert!(!is_cidr_list_fresh(now, fetched_at, CIDR_LIST_MAX_AGE));
+    }
+
+    #[test]
+    fn test_is_telegram_ip_with_list() {
+        let cidr_list = "91.108.56.0/22\n1.2.3.4\n2001:b28:f23d::/48";
+        let cases = [
+            ("91.108.56.100", true),    // in IPv4 CIDR block
+            ("1.2.3.4", true),          // exact plain-IP match
+            ("1.2.3.5", false),         // near miss on plain IP
+            ("2001:b28:f23d::1", true), // in IPv6 CIDR block
+            ("2001:db8::1", false),     // not in any range
+            ("9.9.9.9", false),         // not in any range
+        ];
+        for (ip_str, expected) in cases {
+            let ip: std::net::IpAddr = ip_str.parse().unwrap();
+            assert_eq!(is_telegram_ip_with_list(ip, cidr_list), expected, "ip: {ip_str}");
+        }
+    }
+}
