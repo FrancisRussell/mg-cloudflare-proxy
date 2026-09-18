@@ -139,7 +139,12 @@ impl WranglerDev {
     /// `cidr_list_url` overrides wrangler.toml's own `CIDR_LIST_URL` default
     /// (Telegram's real endpoint) for the whole run, so the CIDR-fetch
     /// scenario can point it at a local mock server instead.
-    fn start(cidr_list_url: &str) -> Self {
+    /// `bootstrap_last_checked`
+    /// overrides `TELEGRAM_CIDR_BOOTSTRAP_LAST_CHECKED` -- the real, checked-in
+    /// value is always recent in a healthy repo, which would make "the
+    /// bootstrap is stale enough to fetch" undemonstrable and date-dependent
+    /// otherwise.
+    fn start(cidr_list_url: &str, bootstrap_last_checked: &str) -> Self {
         // Matches wrangler.toml's own [build] command: install (a no-op if
         // already present) rather than requiring a separate manual step.
         let status = Command::new("cargo")
@@ -167,6 +172,8 @@ impl WranglerDev {
                 &port.to_string(),
                 "--var",
                 &format!("CIDR_LIST_URL:{cidr_list_url}"),
+                "--var",
+                &format!("CIDR_LIST_BOOTSTRAP_LAST_CHECKED:{bootstrap_last_checked}"),
                 "--persist-to",
                 persist_dir.to_str().expect("temp dir path must be valid UTF-8"),
             ])
@@ -399,7 +406,13 @@ fn integration_test() {
     // doc comment) plus the two mock-only IPs above.
     let mock_cidr_list = format!("{TELEGRAM_CIDR_BOOTSTRAP}\n{MOCK_CIDR_IP_A}\n{MOCK_CIDR_IP_B}");
     let cidr_server = MockCidrServer::start(mock_cidr_list);
-    let dev = WranglerDev::start(&cidr_server.url());
+    // Deliberately stale (well past CIDR_LIST_MAX_AGE's 24h, well short of
+    // CIDR_LIST_FORCE_REFETCH_MAX_AGE's 30 days) so the "bootstrap is stale
+    // enough to fetch" scenario is deterministic regardless of how recently
+    // data/telegram-cidrs.txt.last-checked's real value happens to have been
+    // updated.
+    let stale_bootstrap_last_checked = (chrono::Utc::now() - chrono::Duration::days(2)).to_rfc2822();
+    let dev = WranglerDev::start(&cidr_server.url(), &stale_bootstrap_last_checked);
     let port = dev.port;
 
     // Must run before any other scenario: it depends on the CIDR cache
@@ -439,10 +452,11 @@ fn fetches_cidr_list_only_for_unrecognized_ip(port: u16, cidr_server: &MockCidrS
         .send_string("body");
     assert_eq!(status_of(resp), 403, "an IP absent from even the freshly-fetched list should stay rejected");
     assert_eq!(cidr_server.request_count(), 1, "an unrecognized IP with no prior fetch should trigger exactly one");
-    assert_eq!(
-        cidr_server.last_if_modified_since(),
-        None,
-        "the very first-ever fetch has nothing cached yet, so it shouldn't send If-Modified-Since"
+    assert!(
+        cidr_server.last_if_modified_since().is_some(),
+        "even the very first-ever fetch should send If-Modified-Since: current_cidr_list synthesizes and \
+         persists a backdated timestamp before fetch_fresh_cidr_list ever runs (see its doc comment in \
+         src/lib.rs), specifically so a never-fetched cache still participates in conditional GET"
     );
 
     let resp = ureq::put(&worker_url(port, &format!("/{target}")))
