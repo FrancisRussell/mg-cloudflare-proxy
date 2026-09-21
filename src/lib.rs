@@ -138,34 +138,51 @@ async fn reject_unless_telegram_ip(
     }
 }
 
-/// Cached SSRF-prevention ranges not covered by Rust's built-in methods.
+/// SSRF-prevention ranges not covered by Rust's built-in methods, taken from
+/// IANA's IPv4 and IPv6 Special-Purpose Address Registries
+/// (<https://www.iana.org/assignments/iana-ipv4-special-registry/> and
+/// <https://www.iana.org/assignments/iana-ipv6-special-registry/>): every
+/// block those list as not globally reachable, plus ranges that embed an IPv4
+/// address, which a translator could turn into a private one.
 mod unsafe_ranges {
     use std::sync::LazyLock;
 
     use ipnetwork::IpNetwork;
 
-    pub static UNSAFE_V4: LazyLock<Vec<IpNetwork>> = LazyLock::new(|| {
-        vec![
-            "0.0.0.0/8".parse().expect("hardcoded CIDR literal must be valid"), // This host
-            "100.64.0.0/10".parse().expect("hardcoded CIDR literal must be valid"), // CGNAT
-            "198.18.0.0/15".parse().expect("hardcoded CIDR literal must be valid"), // Benchmarking
-        ]
-    });
+    const UNSAFE_V4_CIDRS: &[&str] = &[
+        "0.0.0.0/8",      // "This network", RFC 791 section 3.2
+        "100.64.0.0/10",  // Shared address space (CGNAT), RFC 6598
+        "192.0.0.0/24",   // IETF protocol assignments, RFC 6890 section 2.1
+        "192.88.99.0/24", // Deprecated 6to4 relay anycast, RFC 7526
+        "198.18.0.0/15",  // Benchmarking, RFC 2544
+        "240.0.0.0/4",    // Reserved for future use, RFC 1112 section 4
+    ];
 
-    pub static UNSAFE_V6: LazyLock<Vec<IpNetwork>> = LazyLock::new(|| {
-        vec![
-            "64:ff9b::/96".parse().expect("hardcoded CIDR literal must be valid"), // NAT64
-            "64:ff9b:1::/48".parse().expect("hardcoded CIDR literal must be valid"), // NAT64 well-known prefix
-            "2001:db8::/32".parse().expect("hardcoded CIDR literal must be valid"), // Documentation
-            "3fff::/20".parse().expect("hardcoded CIDR literal must be valid"),    // Documentation
-        ]
-    });
+    const UNSAFE_V6_CIDRS: &[&str] = &[
+        "64:ff9b::/96",    // IPv4/IPv6 translation, RFC 6052 section 2.1 (embeds an IPv4 address)
+        "64:ff9b:1::/48",  // Local-use IPv4/IPv6 translation, RFC 8215
+        "100::/64",        // Discard-only, RFC 6666
+        "100:0:0:1::/64",  // Dummy IPv6 prefix, RFC 9780
+        "2001::/23",       // IETF protocol assignments, RFC 2928; includes Teredo (RFC 4380)
+        "2001:db8::/32",   // Documentation, RFC 3849
+        "2002::/16",       // 6to4, RFC 3056 section 2 (embeds an IPv4 address); deprecated by RFC 7526
+        "3fff::/20",       // Documentation, RFC 9637
+        "fec0::/10",       // Site-local, deprecated by RFC 3879
+        "::ffff:0:0:0/96", // IPv4-translated addresses (SIIT), RFC 2765 section 2.1 (embeds an IPv4 address)
+    ];
+
+    fn parse_all(cidrs: &[&str]) -> Vec<IpNetwork> {
+        cidrs.iter().map(|cidr| cidr.parse().expect("hardcoded CIDR literal must be valid")).collect()
+    }
+
+    pub static UNSAFE_V4: LazyLock<Vec<IpNetwork>> = LazyLock::new(|| parse_all(UNSAFE_V4_CIDRS));
+    pub static UNSAFE_V6: LazyLock<Vec<IpNetwork>> = LazyLock::new(|| parse_all(UNSAFE_V6_CIDRS));
 }
 
 /// True if `ip` is a public, routable address. Uses Rust's built-in methods
-/// for standard ranges (loopback, private, link-local, multicast,
-/// documentation, broadcast, unspecified, unique-local) plus cached ipnetwork
-/// ranges Rust doesn't cover.
+/// for the ranges they cover (loopback, private, link-local, multicast,
+/// documentation, broadcast, unspecified, unique-local, IPv4-mapped) plus the
+/// ranges in `unsafe_ranges`.
 fn is_ip_safe(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
@@ -371,41 +388,88 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_ip_safe_public_ipv4() {
-        let ip: std::net::IpAddr = "8.8.8.8".parse().unwrap();
-        assert!(is_ip_safe(ip));
-
-        let ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
-        assert!(is_ip_safe(ip));
+    fn test_is_ip_safe_public_addresses() {
+        for ip in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "192.0.1.1", // just outside 192.0.0.0/24
+            "2001:4860:4860::8888",
+            "2606:4700:4700::1111",
+            "2001:200::1", // just outside 2001::/23
+        ] {
+            assert!(is_ip_safe(ip.parse().unwrap()), "ip: {ip}");
+        }
     }
 
     #[test]
-    fn test_is_ip_safe_private_ipv4() {
-        assert!(!is_ip_safe("127.0.0.1".parse().unwrap())); // loopback
-        assert!(!is_ip_safe("192.168.1.1".parse().unwrap())); // private
-        assert!(!is_ip_safe("10.0.0.1".parse().unwrap())); // private
-        assert!(!is_ip_safe("172.16.0.1".parse().unwrap())); // private
-        assert!(!is_ip_safe("100.64.0.1".parse().unwrap())); // CGNAT
-        assert!(!is_ip_safe("192.0.2.1".parse().unwrap())); // TEST-NET
-        assert!(!is_ip_safe("198.51.100.1".parse().unwrap())); // TEST-NET-2
-        assert!(!is_ip_safe("203.0.113.1".parse().unwrap())); // TEST-NET-3
+    fn test_is_ip_safe_rejects_non_public_ipv4() {
+        for ip in [
+            "0.0.0.1",         // "this network"
+            "10.0.0.1",        // private
+            "100.64.0.1",      // CGNAT
+            "127.0.0.1",       // loopback
+            "169.254.169.254", // link-local
+            "172.16.0.1",      // private
+            "192.0.0.192",     // IETF protocol assignments
+            "192.0.2.1",       // TEST-NET-1
+            "192.88.99.1",     // deprecated 6to4 relay anycast
+            "192.168.1.1",     // private
+            "198.18.0.1",      // benchmarking
+            "198.51.100.1",    // TEST-NET-2
+            "203.0.113.1",     // TEST-NET-3
+            "224.0.0.1",       // multicast
+            "240.0.0.1",       // reserved
+            "255.255.255.255", // broadcast
+        ] {
+            assert!(!is_ip_safe(ip.parse().unwrap()), "ip: {ip}");
+        }
     }
 
     #[test]
-    fn test_is_ip_safe_public_ipv6() {
-        let ip: std::net::IpAddr = "2001:4860:4860::8888".parse().unwrap();
-        assert!(is_ip_safe(ip));
+    fn test_is_ip_safe_rejects_non_public_ipv6() {
+        for ip in [
+            "::1",              // loopback
+            "::",               // unspecified
+            "::ffff:127.0.0.1", // IPv4-mapped loopback
+            "::ffff:0:7f00:1",  // IPv4-translated loopback
+            "64:ff9b::7f00:1",  // NAT64 of 127.0.0.1
+            "64:ff9b:1::1",     // local-use translation
+            "100::1",           // discard-only
+            "100:0:0:1::1",     // dummy prefix
+            "2001::1",          // Teredo
+            "2001:db8::1",      // documentation
+            "2002:7f00:1::",    // 6to4 of 127.0.0.1
+            "3fff::1",          // documentation
+            "fc00::1",          // unique-local
+            "fe80::1",          // link-local
+            "fec0::1",          // deprecated site-local
+            "ff02::1",          // multicast
+        ] {
+            assert!(!is_ip_safe(ip.parse().unwrap()), "ip: {ip}");
+        }
     }
 
     #[test]
-    fn test_is_ip_safe_private_ipv6() {
-        assert!(!is_ip_safe("::1".parse().unwrap())); // loopback
-        assert!(!is_ip_safe("fe80::1".parse().unwrap())); // link-local
-        assert!(!is_ip_safe("fc00::1".parse().unwrap())); // ULA
-        assert!(!is_ip_safe("::ffff:127.0.0.1".parse().unwrap())); // IPv4-mapped loopback
-        assert!(!is_ip_safe("64:ff9b::1".parse().unwrap())); // NAT64
-        assert!(!is_ip_safe("2001:db8::1".parse().unwrap())); // documentation
-        assert!(!is_ip_safe("3fff::1".parse().unwrap())); // documentation
+    fn test_unsafe_range_tables_parse() {
+        // Building the tables panics on a malformed entry.
+        assert!(!unsafe_ranges::UNSAFE_V4.is_empty());
+        assert!(!unsafe_ranges::UNSAFE_V6.is_empty());
+    }
+
+    #[test]
+    fn test_validate_endpoint_rejects_alternative_notations_of_private_ipv4() {
+        // The url crate normalises all of these to a literal IPv4 host.
+        for endpoint in [
+            "http://2130706433/",         // decimal
+            "http://0x7f.1/",             // hex with short form
+            "http://0177.0.0.1/",         // octal
+            "http://127.1/",              // short form
+            "http://127.0.0.1./",         // trailing dot
+            "http://[::ffff:127.0.0.1]/", // IPv4-mapped
+            "http://0/",
+        ] {
+            assert!(validate_endpoint(endpoint).is_err(), "endpoint: {endpoint}");
+        }
     }
 
     #[test]
