@@ -19,7 +19,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -124,6 +124,8 @@ fn pick_free_port() -> u16 {
 struct WranglerDev {
     child: Child,
     port: u16,
+    /// The `CIDR_LIST_URL` the Worker was started with, so a restart reuses it.
+    cidr_list_url: String,
     /// Captured stdout+stderr, printed only if the test panics (see Drop) --
     /// `cargo test`'s own output capturing doesn't reach a child process's
     /// inherited file descriptors, only the test's own print!/println!
@@ -153,6 +155,40 @@ fn spawn_output_reader(mut pipe: impl Read + Send + 'static, output: Arc<Mutex<V
     });
 }
 
+/// Spawns `npx wrangler dev` in its own process group, feeding its output
+/// into `output`.
+fn spawn_wrangler_dev(
+    port: u16, cidr_list_url: &str, persist_dir: &std::path::Path, output: &Arc<Mutex<Vec<u8>>>,
+) -> Child {
+    let mut child = Command::new("npx")
+        .args([
+            "wrangler",
+            "dev",
+            "--port",
+            &port.to_string(),
+            "--var",
+            &format!("CIDR_LIST_URL:{cidr_list_url}"),
+            "--persist-to",
+            persist_dir.to_str().expect("temp dir path must be valid UTF-8"),
+        ])
+        .current_dir(PROJECT_DIR)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Its own process group, so the whole tree (node, workerd, esbuild --
+        // which land on their own ports, e.g. an inspector port) can be
+        // killed together on Drop instead of leaving orphans that accumulate
+        // and slow down every later run.
+        .process_group(0)
+        .spawn()
+        .expect("failed to spawn `npx wrangler dev` (is Node/npm installed?)");
+    // process_group(0) makes the child's PGID equal its own PID.
+    WRANGLER_PGID.store(child.id(), Ordering::SeqCst);
+
+    spawn_output_reader(child.stdout.take().expect("child spawned with piped stdout"), Arc::clone(output));
+    spawn_output_reader(child.stderr.take().expect("child spawned with piped stderr"), Arc::clone(output));
+    child
+}
+
 impl WranglerDev {
     /// `cidr_list_url` overrides wrangler.toml's own `CIDR_LIST_URL` default
     /// (Telegram's real endpoint) for the whole run, so the CIDR-fetch
@@ -178,37 +214,25 @@ impl WranglerDev {
         std::fs::create_dir_all(&persist_dir).expect("failed to create --persist-to directory");
 
         let port = pick_free_port();
-        let mut child = Command::new("npx")
-            .args([
-                "wrangler",
-                "dev",
-                "--port",
-                &port.to_string(),
-                "--var",
-                &format!("CIDR_LIST_URL:{cidr_list_url}"),
-                "--persist-to",
-                persist_dir.to_str().expect("temp dir path must be valid UTF-8"),
-            ])
-            .current_dir(PROJECT_DIR)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // Its own process group, so the whole tree (node, workerd,
-            // esbuild -- which land on their own ports, e.g. an inspector
-            // port) can be killed together on Drop instead of leaving
-            // orphans that accumulate and slow down every later run.
-            .process_group(0)
-            .spawn()
-            .expect("failed to spawn `npx wrangler dev` (is Node/npm installed?)");
-        // process_group(0) makes the child's PGID equal its own PID.
-        WRANGLER_PGID.store(child.id(), Ordering::SeqCst);
-
         let output = Arc::new(Mutex::new(Vec::new()));
-        spawn_output_reader(child.stdout.take().expect("child spawned with piped stdout"), Arc::clone(&output));
-        spawn_output_reader(child.stderr.take().expect("child spawned with piped stderr"), Arc::clone(&output));
-
-        let mut dev = Self { child, port, output, persist_dir };
+        let child = spawn_wrangler_dev(port, cidr_list_url, &persist_dir, &output);
+        let mut dev = Self { child, port, cidr_list_url: cidr_list_url.to_string(), output, persist_dir };
         dev.wait_until_ready();
         dev
+    }
+
+    /// Restarts `wrangler dev` on the same port and with the same KV state,
+    /// which gives the Worker a fresh isolate that has to load everything
+    /// from KV again. The Worker keeps what it has loaded in memory, so this
+    /// is how a scenario makes it notice KV contents changed behind its back.
+    fn restart(&mut self) {
+        kill_wrangler_process_group();
+        let deadline = Instant::now() + REAP_TIMEOUT;
+        while Instant::now() < deadline && !matches!(self.child.try_wait(), Ok(Some(_))) {
+            std::thread::sleep(REAP_POLL_INTERVAL);
+        }
+        self.child = spawn_wrangler_dev(self.port, &self.cidr_list_url, &self.persist_dir, &self.output);
+        self.wait_until_ready();
     }
 
     /// Polls the worker until it answers an HTTP request at all -- any
@@ -259,11 +283,12 @@ impl WranglerDev {
     }
 
     /// Makes the cache look as if Telegram last confirmed the list, and last
-    /// answered at all, `age` ago.
-    fn age_cidr_cache(&self, age: Duration) {
+    /// answered at all, `age` ago, then restarts so the Worker loads that.
+    fn age_cidr_cache_and_restart(&mut self, age: Duration) {
         let timestamp = fetched_at_value(age);
         self.kv_put(CIDR_LIST_FETCHED_AT_KV_KEY, &timestamp);
         self.kv_put(CIDR_LIST_ATTEMPTED_AT_KV_KEY, &timestamp);
+        self.restart();
     }
 
     fn kv_delete(&self, key: &str) {
@@ -451,6 +476,8 @@ struct MockCidrServer {
     body: Arc<Mutex<String>>,
     status: Arc<AtomicU16>,
     unreachable: Arc<AtomicBool>,
+    silent: Arc<AtomicBool>,
+    response_delay: Arc<AtomicU64>,
 }
 
 impl MockCidrServer {
@@ -465,13 +492,18 @@ impl MockCidrServer {
         let body = Arc::new(Mutex::new(body));
         let status = Arc::new(AtomicU16::new(StatusCode::OK.as_u16()));
         let unreachable = Arc::new(AtomicBool::new(false));
+        let silent = Arc::new(AtomicBool::new(false));
+        let response_delay = Arc::new(AtomicU64::new(0));
 
         let count = Arc::clone(&request_count);
         let if_modified_since_store = Arc::clone(&last_if_modified_since);
         let body_store = Arc::clone(&body);
         let status_store = Arc::clone(&status);
         let unreachable_flag = Arc::clone(&unreachable);
+        let silent_flag = Arc::clone(&silent);
+        let delay_millis = Arc::clone(&response_delay);
         std::thread::spawn(move || {
+            let mut held_open = Vec::new();
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
@@ -486,6 +518,11 @@ impl MockCidrServer {
                     // answer.
                     continue;
                 }
+                if silent_flag.load(Ordering::SeqCst) {
+                    held_open.push(stream);
+                    continue;
+                }
+                std::thread::sleep(Duration::from_millis(delay_millis.load(Ordering::SeqCst)));
 
                 let body = body_store.lock().expect("a thread panicked while holding the lock").clone();
                 let status = StatusCode::from_u16(status_store.load(Ordering::SeqCst)).expect("a valid status");
@@ -499,12 +536,21 @@ impl MockCidrServer {
             }
         });
 
-        Self { port, request_count, last_if_modified_since, body, status, unreachable }
+        Self { port, request_count, last_if_modified_since, body, status, unreachable, silent, response_delay }
     }
 
     fn set_body(&self, body: String) { *self.body.lock().expect("a thread panicked while holding the lock") = body; }
 
     fn set_status(&self, status: StatusCode) { self.status.store(status.as_u16(), Ordering::SeqCst); }
+
+    /// While set, requests are counted and their connections held open without
+    /// ever being answered.
+    fn set_silent(&self, silent: bool) { self.silent.store(silent, Ordering::SeqCst); }
+
+    /// How long the server waits before answering each request.
+    fn set_response_delay(&self, delay: Duration) {
+        self.response_delay.store(u64::try_from(delay.as_millis()).expect("a small delay"), Ordering::SeqCst);
+    }
 
     /// While set, requests are counted but the connection is closed without an
     /// answer, so a fetch fails outright.
@@ -571,20 +617,24 @@ fn integration_test() {
 
     let initial_cidr_list = format!("{TELEGRAM_CIDR_RANGE}\n{MOCK_CIDR_IP_A}");
     let cidr_server = MockCidrServer::start(initial_cidr_list);
-    let dev = WranglerDev::start(&cidr_server.url());
+    let mut dev = WranglerDev::start(&cidr_server.url());
     let port = dev.port;
 
     // These share one CIDR cache, and each leaves it in the state the next
     // relies on, so they must run in this order and before the scenarios
     // below (which need `TELEGRAM_IP` recognized).
     seeding_makes_recognized_ips_need_no_fetch(port, &dev, &cidr_server);
+    warm_isolate_answers_from_memory_without_kv(port, &dev);
     unrecognized_ip_against_fresh_cache_does_not_fetch(port, &cidr_server);
-    invalid_requests_from_unrecognized_ip_do_not_fetch(port, &dev, &cidr_server);
-    unrecognized_ip_against_stale_cache_fetches(port, &dev, &cidr_server);
-    failed_fetch_does_not_advance_the_confirmed_time(port, &dev, &cidr_server);
-    unreachable_telegram_records_an_attempt_and_holds_off_the_next(port, &dev, &cidr_server);
-    recognized_ip_against_very_stale_cache_refetches_in_background(port, &dev, &cidr_server);
-    unrecognized_ip_against_empty_cache_fetches_unconditionally(port, &dev, &cidr_server);
+    invalid_requests_from_unrecognized_ip_do_not_fetch(port, &mut dev, &cidr_server);
+    unrecognized_ip_against_stale_cache_fetches(port, &mut dev, &cidr_server);
+    refresh_consults_kv_before_fetching(port, &mut dev, &cidr_server);
+    failed_fetch_does_not_advance_the_confirmed_time(port, &mut dev, &cidr_server);
+    unreachable_telegram_records_an_attempt_and_holds_off_the_next(port, &mut dev, &cidr_server);
+    silent_telegram_is_given_up_on(port, &mut dev, &cidr_server);
+    concurrent_unrecognized_ips_share_one_refresh(port, &mut dev, &cidr_server);
+    recognized_ip_against_very_stale_cache_refetches_in_background(port, &mut dev, &cidr_server);
+    unrecognized_ip_against_empty_cache_fetches_unconditionally(port, &mut dev, &cidr_server);
     seeding_does_not_overwrite_newer_cache(&dev, &cidr_server);
 
     rejects_non_telegram_ip(port);
@@ -658,8 +708,8 @@ fn unrecognized_ip_against_fresh_cache_does_not_fetch(port: u16, cidr_server: &M
 /// consulted, so a prober from an unrecognized IP can't spend a CIDR fetch on
 /// it. That includes a body over the size limit, whether declared up front or
 /// streamed without a length.
-fn invalid_requests_from_unrecognized_ip_do_not_fetch(port: u16, dev: &WranglerDev, cidr_server: &MockCidrServer) {
-    dev.age_cidr_cache(STALE_CACHE_AGE);
+fn invalid_requests_from_unrecognized_ip_do_not_fetch(port: u16, dev: &mut WranglerDev, cidr_server: &MockCidrServer) {
+    dev.age_cidr_cache_and_restart(STALE_CACHE_AGE);
     let fetches_before = cidr_server.request_count();
     let target = encode(&MockDistributor::start(None).url());
     let oversized = vec![b'x'; OVERSIZED_BODY_BYTES];
@@ -713,9 +763,9 @@ fn invalid_requests_from_unrecognized_ip_do_not_fetch(port: u16, dev: &WranglerD
 
 /// Once the cache has gone stale, an unrecognized IP triggers a blocking,
 /// conditional fetch, and is accepted if the refreshed list now contains it.
-fn unrecognized_ip_against_stale_cache_fetches(port: u16, dev: &WranglerDev, cidr_server: &MockCidrServer) {
+fn unrecognized_ip_against_stale_cache_fetches(port: u16, dev: &mut WranglerDev, cidr_server: &MockCidrServer) {
     cidr_server.set_body(format!("{TELEGRAM_CIDR_RANGE}\n{MOCK_CIDR_IP_A}\n{MOCK_CIDR_IP_B}"));
-    dev.age_cidr_cache(STALE_CACHE_AGE);
+    dev.age_cidr_cache_and_restart(STALE_CACHE_AGE);
     let fetches_before = cidr_server.request_count();
 
     assert_eq!(put_from(port, MOCK_CIDR_IP_B), 201, "an IP only the refreshed list contains should be accepted");
@@ -733,25 +783,28 @@ fn unrecognized_ip_against_stale_cache_fetches(port: u16, dev: &WranglerDev, cid
 /// fetches, but leaves the time Telegram last confirmed the list alone. That
 /// time is what the next refresh sends as `If-Modified-Since`: advancing it on
 /// a failure would let Telegram answer 304 for changes made since the list was
-/// really last held, keeping an out-of-date list.
-fn failed_fetch_does_not_advance_the_confirmed_time(port: u16, dev: &WranglerDev, cidr_server: &MockCidrServer) {
+/// really last held, keeping an out-of-date list. With the list unconfirmed and
+/// the refresh failed, an unrecognized IP can't be judged, so it gets a 503.
+fn failed_fetch_does_not_advance_the_confirmed_time(port: u16, dev: &mut WranglerDev, cidr_server: &MockCidrServer) {
     let confirmed_at = fetched_at_value(STALE_CACHE_AGE);
     dev.kv_put(CIDR_LIST_FETCHED_AT_KV_KEY, &confirmed_at);
     dev.kv_put(CIDR_LIST_ATTEMPTED_AT_KV_KEY, &confirmed_at);
+    dev.restart();
     cidr_server.set_status(StatusCode::SERVICE_UNAVAILABLE);
     let fetches_before = cidr_server.request_count();
 
-    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403);
+    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 503);
     assert_eq!(cidr_server.request_count(), fetches_before + 1);
     let if_modified_since_before_failure = cidr_server.last_if_modified_since();
     assert!(if_modified_since_before_failure.is_some());
     assert_eq!(dev.kv_get(CIDR_LIST_FETCHED_AT_KV_KEY).trim(), confirmed_at, "a failed fetch confirmed nothing");
     assert_ne!(dev.kv_get(CIDR_LIST_ATTEMPTED_AT_KV_KEY).trim(), confirmed_at, "the attempt should be recorded");
 
-    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403);
+    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 503);
     assert_eq!(cidr_server.request_count(), fetches_before + 1, "the failed attempt should hold off another");
 
     dev.kv_put(CIDR_LIST_ATTEMPTED_AT_KV_KEY, &confirmed_at);
+    dev.restart();
     cidr_server.set_status(StatusCode::OK);
     assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403);
     assert_eq!(cidr_server.request_count(), fetches_before + 2);
@@ -766,24 +819,26 @@ fn failed_fetch_does_not_advance_the_confirmed_time(port: u16, dev: &WranglerDev
 /// failure, so an outage isn't hit by every request; once the retry interval
 /// has passed the next request tries again.
 fn unreachable_telegram_records_an_attempt_and_holds_off_the_next(
-    port: u16, dev: &WranglerDev, cidr_server: &MockCidrServer,
+    port: u16, dev: &mut WranglerDev, cidr_server: &MockCidrServer,
 ) {
     let confirmed_at = fetched_at_value(STALE_CACHE_AGE);
     dev.kv_put(CIDR_LIST_FETCHED_AT_KV_KEY, &confirmed_at);
     dev.kv_put(CIDR_LIST_ATTEMPTED_AT_KV_KEY, &confirmed_at);
+    dev.restart();
     cidr_server.set_unreachable(true);
     let fetches_before = cidr_server.request_count();
 
-    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403);
+    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 503);
     assert_eq!(cidr_server.request_count(), fetches_before + 1);
     assert_eq!(dev.kv_get(CIDR_LIST_FETCHED_AT_KV_KEY).trim(), confirmed_at, "nothing was confirmed");
     assert_ne!(dev.kv_get(CIDR_LIST_ATTEMPTED_AT_KV_KEY).trim(), confirmed_at, "the attempt should be recorded");
 
-    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403);
+    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 503);
     assert_eq!(cidr_server.request_count(), fetches_before + 1, "the failed attempt should hold off another");
 
     cidr_server.set_unreachable(false);
     dev.kv_put(CIDR_LIST_ATTEMPTED_AT_KV_KEY, &confirmed_at);
+    dev.restart();
     assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403);
     assert_eq!(
         cidr_server.request_count(),
@@ -792,13 +847,84 @@ fn unreachable_telegram_records_an_attempt_and_holds_off_the_next(
     );
 }
 
+/// A Telegram endpoint that accepts the connection and never answers is given
+/// up on after the fetch timeout, and counts as a failed attempt.
+fn silent_telegram_is_given_up_on(port: u16, dev: &mut WranglerDev, cidr_server: &MockCidrServer) {
+    /// Longer than the Worker's fetch timeout, so the Worker's answer is the
+    /// one seen.
+    const CLIENT_PATIENCE: Duration = Duration::from_secs(30);
+    let confirmed_at = fetched_at_value(STALE_CACHE_AGE);
+    dev.kv_put(CIDR_LIST_FETCHED_AT_KV_KEY, &confirmed_at);
+    dev.kv_put(CIDR_LIST_ATTEMPTED_AT_KV_KEY, &confirmed_at);
+    dev.restart();
+    cidr_server.set_silent(true);
+
+    let started = Instant::now();
+    let status = status_of(
+        ureq::put(&worker_url(port, &format!("/{}", encode(&MockDistributor::start(None).url()))))
+            .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
+            .timeout(CLIENT_PATIENCE)
+            .send_string("body"),
+    );
+    cidr_server.set_silent(false);
+
+    assert_eq!(status, 503, "an IP that can't be judged because Telegram never answered");
+    assert!(started.elapsed() < CLIENT_PATIENCE, "the Worker should give up well before the client does");
+    assert_ne!(dev.kv_get(CIDR_LIST_ATTEMPTED_AT_KV_KEY).trim(), confirmed_at, "the attempt should be recorded");
+}
+
+/// Requests for unrecognized IPs that arrive together while the list is being
+/// refreshed share that one refresh instead of each fetching.
+fn concurrent_unrecognized_ips_share_one_refresh(port: u16, dev: &mut WranglerDev, cidr_server: &MockCidrServer) {
+    dev.age_cidr_cache_and_restart(STALE_CACHE_AGE);
+    cidr_server.set_response_delay(Duration::from_secs(1));
+    let fetches_before = cidr_server.request_count();
+
+    let requests: Vec<_> = (0..3).map(|_| std::thread::spawn(move || put_from(port, MOCK_CIDR_IP_UNKNOWN))).collect();
+    let statuses: Vec<u16> = requests.into_iter().map(|r| r.join().expect("a request thread panicked")).collect();
+    cidr_server.set_response_delay(Duration::ZERO);
+
+    assert_eq!(statuses, [403, 403, 403]);
+    assert_eq!(cidr_server.request_count(), fetches_before + 1, "the requests should have shared one fetch");
+}
+
+/// A refresh asks KV before Telegram: another isolate may already have
+/// refreshed the list, and the timestamps it left in KV say whether a fetch is
+/// still due.
+fn refresh_consults_kv_before_fetching(port: u16, dev: &mut WranglerDev, cidr_server: &MockCidrServer) {
+    // A stale list that doesn't include B.
+    dev.kv_put(CIDR_LIST_KV_KEY, &format!("{TELEGRAM_CIDR_RANGE}\n{MOCK_CIDR_IP_A}"));
+    dev.age_cidr_cache_and_restart(STALE_CACHE_AGE);
+    // Loads the stale state into the isolate; a recognized IP starts no
+    // refresh.
+    assert_eq!(put_from(port, TELEGRAM_IP), 201);
+    let fetches_before = cidr_server.request_count();
+
+    // Meanwhile, another isolate refreshed the list, which now includes B.
+    dev.kv_put(CIDR_LIST_KV_KEY, &format!("{TELEGRAM_CIDR_RANGE}\n{MOCK_CIDR_IP_A}\n{MOCK_CIDR_IP_B}"));
+    dev.kv_put(CIDR_LIST_FETCHED_AT_KV_KEY, &fetched_at_value(Duration::ZERO));
+    dev.kv_put(CIDR_LIST_ATTEMPTED_AT_KV_KEY, &fetched_at_value(Duration::ZERO));
+
+    assert_eq!(put_from(port, MOCK_CIDR_IP_B), 201, "the newer list in KV should be adopted");
+    assert_eq!(cidr_server.request_count(), fetches_before, "and Telegram shouldn't have been asked");
+}
+
+/// Once an isolate has loaded the list it answers from memory: removing it
+/// from KV changes nothing until the isolate restarts.
+fn warm_isolate_answers_from_memory_without_kv(port: u16, dev: &WranglerDev) {
+    let list = dev.kv_get(CIDR_LIST_KV_KEY);
+    dev.kv_delete(CIDR_LIST_KV_KEY);
+    assert_eq!(put_from(port, TELEGRAM_IP), 201);
+    dev.kv_put(CIDR_LIST_KV_KEY, list.trim_end());
+}
+
 /// A recognized IP is answered immediately even when the cache is very
 /// stale, but still prompts a refresh, so a reassigned Telegram range can't
 /// stay trusted indefinitely.
 fn recognized_ip_against_very_stale_cache_refetches_in_background(
-    port: u16, dev: &WranglerDev, cidr_server: &MockCidrServer,
+    port: u16, dev: &mut WranglerDev, cidr_server: &MockCidrServer,
 ) {
-    dev.age_cidr_cache(VERY_STALE_CACHE_AGE);
+    dev.age_cidr_cache_and_restart(VERY_STALE_CACHE_AGE);
     let fetches_before = cidr_server.request_count();
 
     assert_eq!(put_from(port, TELEGRAM_IP), 201);
@@ -817,11 +943,12 @@ fn recognized_ip_against_very_stale_cache_refetches_in_background(
 /// still gets a correct answer via a fetch -- unconditional, since there's
 /// no earlier fetch to refer to -- and that fetch populates the cache.
 fn unrecognized_ip_against_empty_cache_fetches_unconditionally(
-    port: u16, dev: &WranglerDev, cidr_server: &MockCidrServer,
+    port: u16, dev: &mut WranglerDev, cidr_server: &MockCidrServer,
 ) {
     dev.kv_delete(CIDR_LIST_KV_KEY);
     dev.kv_delete(CIDR_LIST_FETCHED_AT_KV_KEY);
     dev.kv_delete(CIDR_LIST_ATTEMPTED_AT_KV_KEY);
+    dev.restart();
     let fetches_before = cidr_server.request_count();
 
     assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403);

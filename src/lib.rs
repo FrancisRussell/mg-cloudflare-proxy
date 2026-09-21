@@ -9,6 +9,7 @@
 // since UnifiedPush distributors strip headers. No FCM/VAPID leg — only real
 // UnifiedPush distributors are targeted.
 
+mod cidr_state;
 mod clock;
 mod correlator;
 mod outbound;
@@ -133,9 +134,9 @@ pub(crate) fn error_response(status: StatusCode) -> Result<Response> {
     Response::error(status.canonical_reason().expect("standard status code has a canonical reason"), status.as_u16())
 }
 
-/// How long a client is told to wait before retrying when the CIDR cache
-/// couldn't be read.
-const CACHE_UNAVAILABLE_RETRY_AFTER_SECONDS: &str = "60";
+/// How long a client is told to wait before retrying when its IP couldn't be
+/// verified.
+const UNVERIFIABLE_RETRY_AFTER_SECONDS: &str = "60";
 
 /// `None` if `client_ip` is a Telegram IP, otherwise the response to send
 /// instead of forwarding.
@@ -150,10 +151,10 @@ async fn reject_unless_telegram_ip(
             console_log!("rejected: leg={leg} reason=ip_not_in_telegram_range ip={client_ip}");
             error_response(StatusCode::FORBIDDEN).map(Some)
         }
-        TelegramIpCheck::CacheUnavailable => {
-            console_log!("rejected: leg={leg} reason=cidr_cache_unavailable ip={client_ip}");
+        TelegramIpCheck::Unverifiable => {
+            console_log!("rejected: leg={leg} reason=cannot_verify_ip ip={client_ip}");
             let mut response = error_response(StatusCode::SERVICE_UNAVAILABLE)?;
-            response.headers_mut().set(http::header::RETRY_AFTER.as_str(), CACHE_UNAVAILABLE_RETRY_AFTER_SECONDS)?;
+            response.headers_mut().set(http::header::RETRY_AFTER.as_str(), UNVERIFIABLE_RETRY_AFTER_SECONDS)?;
             Ok(Some(response))
         }
     }
