@@ -148,7 +148,7 @@ pub(crate) async fn is_telegram_ip(
             let kv = kv.clone();
             let fetch_url = fetch_url.to_string();
             ctx.wait_until(async move {
-                fetch_fresh_cidr_list(&kv, &fetch_url, &cached.list, cached.if_modified_since.as_deref()).await;
+                fetch_fresh_cidr_list(&kv, &fetch_url, cached.if_modified_since.as_deref()).await;
             });
         }
         return TelegramIpCheck::Telegram;
@@ -157,7 +157,7 @@ pub(crate) async fn is_telegram_ip(
         return TelegramIpCheck::NotTelegram;
     }
 
-    match fetch_fresh_cidr_list(kv, fetch_url, &cached.list, cached.if_modified_since.as_deref()).await {
+    match fetch_fresh_cidr_list(kv, fetch_url, cached.if_modified_since.as_deref()).await {
         Some(fresh) if is_telegram_ip_with_list(ip, &fresh) => TelegramIpCheck::Telegram,
         _ => TelegramIpCheck::NotTelegram,
     }
@@ -223,73 +223,95 @@ fn jittered_force_refetch_max_age() -> Duration {
     CIDR_LIST_FORCE_REFETCH_MAX_AGE.saturating_sub(jitter)
 }
 
-/// Attempts to fetch, validate, and cache a fresh CIDR list from Telegram.
-/// Sends `if_modified_since` as `If-Modified-Since`: an unchanged list (the
-/// common case) then costs Telegram's server a bodyless 304 instead of the
-/// full list.
+/// What asking Telegram for the CIDR list came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CidrFetchOutcome {
+    /// Telegram sent a valid list.
+    Updated(String),
+    /// Telegram confirmed the cached list is current.
+    NotModified,
+    /// Telegram answered, but not with a usable list.
+    Rejected,
+    /// Telegram couldn't be reached.
+    Unreachable,
+}
+
+/// Fetches a fresh CIDR list from Telegram and caches it. Sends
+/// `if_modified_since` as `If-Modified-Since`: an unchanged list (the common
+/// case) then costs Telegram's server a bodyless 304 instead of the full list.
+/// Returns the new list, or `None` if the cached one stands.
 ///
 /// Any definitive answer (a 304, a success, or a bad-but-reachable response
 /// like an unparseable body) records an attempt, so a broken-but-reachable
 /// endpoint isn't hit on every subsequent unrecognized-IP request either.
-/// Only a 304 or a valid list also records that Telegram confirmed the list.
-/// A network-level failure records nothing, since that's the one case worth
-/// retrying sooner than `CIDR_LIST_MAX_AGE`.
-///
-/// `current_list` is returned unchanged on a 304, since that response
-/// carries no body to re-derive it from.
-async fn fetch_fresh_cidr_list(
-    kv: &KvStore, fetch_url: &str, current_list: &str, if_modified_since: Option<&str>,
-) -> Option<String> {
+/// Only a 304 or a valid list that was written to KV also records that
+/// Telegram confirmed the list. A network-level failure records nothing,
+/// since that's the one case worth retrying sooner than `CIDR_LIST_MAX_AGE`.
+async fn fetch_fresh_cidr_list(kv: &KvStore, fetch_url: &str, if_modified_since: Option<&str>) -> Option<String> {
+    match request_cidr_list(fetch_url, if_modified_since).await {
+        CidrFetchOutcome::Updated(list) => {
+            // Only vouch for the list in KV if it actually got written.
+            if kv_put_best_effort(kv, CIDR_LIST_KV_KEY, &list).await {
+                mark_cidr_list_confirmed(kv).await;
+            } else {
+                console_error!("cidr_fetch: outcome=failed reason=kv_write_error");
+                mark_cidr_list_attempted(kv).await;
+            }
+            Some(list)
+        }
+        CidrFetchOutcome::NotModified => {
+            mark_cidr_list_confirmed(kv).await;
+            None
+        }
+        CidrFetchOutcome::Rejected => {
+            mark_cidr_list_attempted(kv).await;
+            None
+        }
+        CidrFetchOutcome::Unreachable => None,
+    }
+}
+
+/// Asks Telegram for the CIDR list and logs how that went, without touching
+/// KV.
+async fn request_cidr_list(fetch_url: &str, if_modified_since: Option<&str>) -> CidrFetchOutcome {
     let mut init = RequestInit::new();
     if let Some(if_modified_since) = if_modified_since {
         let headers = Headers::new();
         let _ = headers.set(header_names::IF_MODIFIED_SINCE.as_str(), if_modified_since);
         init.with_headers(headers);
     }
-    let Ok(req) = Request::new_with_init(fetch_url, &init) else { return None };
+    let Ok(req) = Request::new_with_init(fetch_url, &init) else { return CidrFetchOutcome::Unreachable };
 
-    match Fetch::Request(req).send().await {
-        Ok(mut resp) => {
-            let status = resp.status_code();
-            if status == StatusCode::NOT_MODIFIED.as_u16() {
-                console_log!("cidr_fetch: outcome=not_modified status={status}");
-                mark_cidr_list_confirmed(kv).await;
-                return Some(current_list.to_string());
-            }
-            if StatusCode::from_u16(status).is_ok_and(|s| s.is_success()) {
-                match resp.text().await {
-                    Ok(body) => {
-                        if let Some(parsed) = parse_cidr_list(&body) {
-                            console_log!(
-                                "cidr_fetch: outcome=success entries={} status={status}",
-                                parsed.lines().count()
-                            );
-                            // Only vouch for the list in KV if it actually got
-                            // written.
-                            if kv_put_best_effort(kv, CIDR_LIST_KV_KEY, &parsed).await {
-                                mark_cidr_list_confirmed(kv).await;
-                            } else {
-                                console_error!("cidr_fetch: outcome=failed reason=kv_write_error");
-                                mark_cidr_list_attempted(kv).await;
-                            }
-                            return Some(parsed);
-                        }
-                        console_error!("cidr_fetch: outcome=failed reason=unparseable status={status}");
-                        mark_cidr_list_attempted(kv).await;
-                    }
-                    Err(e) => {
-                        console_error!("cidr_fetch: outcome=failed reason=body_read_error status={status} error={e}");
-                        mark_cidr_list_attempted(kv).await;
-                    }
-                }
-            } else {
-                console_error!("cidr_fetch: outcome=failed reason=bad_status status={status}");
-                mark_cidr_list_attempted(kv).await;
-            }
+    let mut resp = match Fetch::Request(req).send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            console_error!("cidr_fetch: outcome=failed reason=network_error error={e}");
+            return CidrFetchOutcome::Unreachable;
         }
-        Err(e) => console_error!("cidr_fetch: outcome=failed reason=network_error error={e}"),
+    };
+
+    let status = resp.status_code();
+    if status == StatusCode::NOT_MODIFIED.as_u16() {
+        console_log!("cidr_fetch: outcome=not_modified status={status}");
+        return CidrFetchOutcome::NotModified;
     }
-    None
+    if !StatusCode::from_u16(status).is_ok_and(|s| s.is_success()) {
+        console_error!("cidr_fetch: outcome=failed reason=bad_status status={status}");
+        return CidrFetchOutcome::Rejected;
+    }
+    let body = match resp.text().await {
+        Ok(body) => body,
+        Err(e) => {
+            console_error!("cidr_fetch: outcome=failed reason=body_read_error status={status} error={e}");
+            return CidrFetchOutcome::Rejected;
+        }
+    };
+    let Some(list) = parse_cidr_list(&body) else {
+        console_error!("cidr_fetch: outcome=failed reason=unparseable status={status}");
+        return CidrFetchOutcome::Rejected;
+    };
+    console_log!("cidr_fetch: outcome=success entries={} status={status}", list.lines().count());
+    CidrFetchOutcome::Updated(list)
 }
 
 /// The `CIDR_LIST_URL` var if set (always true when deployed via
