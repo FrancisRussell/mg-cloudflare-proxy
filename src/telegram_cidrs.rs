@@ -1,7 +1,7 @@
 // Telegram IP allowlist: validates an incoming client IP against Telegram's
-// published CIDR ranges, cached in KV. The cache is seeded before the first
-// deploy (scripts/seed-cidr-cache.sh) and refreshed on demand -- see
-// `is_telegram_ip`'s doc comment for the fetch-triggering rules.
+// published CIDR ranges, cached in KV. The cache is expected to be seeded
+// before the first deploy and is refreshed on demand -- see `is_telegram_ip`'s
+// doc comment for the fetch-triggering rules.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -11,6 +11,7 @@ use worker::*;
 
 use crate::clock;
 
+/// Header names used on the outbound CIDR-list fetch.
 mod header_names {
     use http::HeaderName;
 
@@ -87,9 +88,9 @@ const CIDR_LIST_FORCE_REFETCH_JITTER: Duration = Duration::from_hours(24);
 const TELEGRAM_CIDR_URL: &str = "https://core.telegram.org/resources/cidr.txt";
 const CIDR_LIST_URL_VAR: &str = "CIDR_LIST_URL";
 
-/// How trustworthy the cached CIDR list currently is, oldest-tolerated-use
-/// first. See `CIDR_LIST_MAX_AGE` and `CIDR_LIST_FORCE_REFETCH_MAX_AGE`.
-#[derive(Debug, PartialEq, Eq)]
+/// How far the cached CIDR list can be trusted, from most to least. See
+/// `CIDR_LIST_MAX_AGE` and `CIDR_LIST_FORCE_REFETCH_MAX_AGE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CidrListFreshness {
     /// Recent enough that even an unrecognized IP shouldn't trigger a fetch.
     Fresh,
@@ -110,6 +111,7 @@ fn millis_since_epoch(t: SystemTime) -> u64 {
 }
 
 /// Whether a client IP is a Telegram IP.
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum TelegramIpCheck {
     Telegram,
     NotTelegram,
@@ -162,6 +164,7 @@ pub(crate) async fn is_telegram_ip(
 }
 
 /// What's currently in the KV cache, and how far to trust it.
+#[derive(Debug, Clone)]
 struct CachedCidrList {
     /// Empty if nothing has been cached.
     list: String,
@@ -357,7 +360,7 @@ mod tests {
     #[test]
     fn test_parse_cidr_list_valid() {
         let list = "91.108.56.0/22\n\n91.108.4.0/22\n1.2.3.4";
-        let result = parse_cidr_list(list).unwrap();
+        let result = parse_cidr_list(list).expect("the test list is valid");
         assert!(result.contains("91.108.56.0/22"));
         assert!(result.contains("1.2.3.4"));
         assert_eq!(result.lines().count(), 3, "empty line should be skipped");
@@ -440,7 +443,7 @@ mod tests {
             ("9.9.9.9", false),         // not in any range
         ];
         for (ip_str, expected) in cases {
-            let ip: std::net::IpAddr = ip_str.parse().unwrap();
+            let ip: std::net::IpAddr = ip_str.parse().expect("test address literal must parse");
             assert_eq!(is_telegram_ip_with_list(ip, cidr_list), expected, "ip: {ip_str}");
         }
     }

@@ -5,9 +5,9 @@
 // WebPush one, so a PUT is sent for every event and a POST also for regular
 // messages. Like aesgcm-proxy, this drops the PUT when the POST for the same
 // endpoint has just arrived. One instance of this Durable Object exists per
-// endpoint URL (see `call_correlator` in lib.rs), so the PUT and POST for the
-// same endpoint always land on the same instance and can be correlated — a
-// plain Worker gives no such guarantee across separate requests.
+// endpoint URL, so the PUT and POST for the same endpoint always land on the
+// same instance and can be correlated — a plain Worker gives no such
+// guarantee across separate requests.
 //
 // State lives in `Cell`, not `state.storage()`: the correlation window is
 // only ~2s, well under a Durable Object's idle eviction time, so nothing
@@ -46,8 +46,8 @@ const TTL_SECONDS: u32 = 30 * 24 * 60 * 60;
 /// RFC 8030 §5.3 delivery priority sent on the forwarded push -- Telegram
 /// notifications are time-sensitive, so always the highest priority.
 const URGENCY_HIGH: &str = "high";
-/// The `WebPush` payload encoding of the forwarded body -- aesgcm Draft-04's
-/// only supported encoding.
+/// The `Content-Encoding` sent on every forwarded push. The folded body is not
+/// itself aes128gcm-encoded.
 const CONTENT_ENCODING_AES128GCM: &str = "aes128gcm";
 
 /// How long a successful POST's timestamp counts as "recent" when a PUT for
@@ -55,9 +55,9 @@ const CONTENT_ENCODING_AES128GCM: &str = "aes128gcm";
 const RECENT_POST_WINDOW: Duration = Duration::from_secs(2);
 
 /// How long the PUT handler waits for a same-endpoint POST to land before
-/// giving up and forwarding a synthetic wake-up. Telegram's docs don't
-/// describe this dual-delivery pattern at all, so there's no documented
-/// timing to derive this from — it's an empirical guess, not a spec value.
+/// giving up and forwarding a synthetic wake-up. Nothing documents how far
+/// apart the two requests arrive, so this is an empirical guess, not a spec
+/// value.
 const CORRELATION_WAIT: Duration = Duration::from_millis(200);
 
 /// The longest a PUT keeps waiting for POSTs that are still being forwarded
@@ -68,6 +68,8 @@ const POST_IN_FLIGHT_MAX_WAIT: Duration = Duration::from_secs(5);
 /// How often that wait checks whether the POSTs have finished.
 const POST_IN_FLIGHT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// One endpoint's record of recent POSTs, used to decide whether its PUTs are
+/// redundant wake-ups.
 #[durable_object]
 #[derive(Debug)]
 pub struct Correlator {
@@ -162,6 +164,7 @@ impl Correlator {
 
 /// Counts a POST as in flight for as long as it lives, including if it is
 /// cancelled or fails.
+#[derive(Debug)]
 struct PostInFlight<'a>(&'a Cell<u32>);
 
 impl<'a> PostInFlight<'a> {
@@ -178,6 +181,7 @@ impl Drop for PostInFlight<'_> {
 /// Holds `Correlator::put_in_flight` for as long as it lives. Releasing on
 /// drop means a PUT that is cancelled while waiting can't leave the flag set
 /// and every later PUT for the endpoint suppressed.
+#[derive(Debug)]
 struct PutInFlight<'a>(&'a Cell<bool>);
 
 impl<'a> PutInFlight<'a> {
@@ -204,12 +208,8 @@ fn is_post_recent(now: SystemTime, last_post: Option<SystemTime>, window: Durati
 /// a `201 Created` with a `Location` header on success, and some senders
 /// back off on other 2xx codes, so any 2xx is normalized to that shape.
 ///
-/// Uses `redirect: manual` rather than `redirect: error`: both stop a
-/// redirect from being followed, but `error` throws on construction under
-/// the local Miniflare/workerd runtime for reasons that didn't reproduce
-/// under `follow`/`manual` in isolation testing, while `manual` also has the
-/// advantage (server-side, unlike a browser) of surfacing the redirect's
-/// real status and `Location` rather than an opaque response.
+/// Uses `redirect: manual`, which stops a redirect being followed and
+/// surfaces its real status and `Location` rather than an opaque response.
 async fn forward(target: &url::Url, body: Vec<u8>) -> Result<Response> {
     let headers = Headers::new();
     headers.set(header_names::TTL.as_str(), &TTL_SECONDS.to_string())?;

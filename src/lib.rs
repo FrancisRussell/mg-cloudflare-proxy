@@ -6,8 +6,7 @@
 //
 // Web Push rewrite proxy for a UnifiedPush distributor (e.g. Sunup, ntfy):
 // folds the `Encryption`/`Crypto-Key` headers Telegram sends into the body,
-// since UnifiedPush distributors strip headers. See src/correlator.rs for the
-// wake-up correlation this depends on. No FCM/VAPID leg — only real
+// since UnifiedPush distributors strip headers. No FCM/VAPID leg — only real
 // UnifiedPush distributors are targeted.
 
 mod clock;
@@ -34,13 +33,12 @@ mod header_names {
     /// Telegram's aesgcm Draft-04 key.
     pub const CRYPTO_KEY: HeaderName = HeaderName::from_static("crypto-key");
     /// Internal header carrying the validated forwarding target from the
-    /// Worker to the Correlator Durable Object (see src/correlator.rs).
+    /// Worker to the Correlator Durable Object.
     pub(crate) const X_RELAY_TARGET: HeaderName = HeaderName::from_static("x-relay-target");
 }
 
 /// Real `WebPush` ciphertext is small; anything past this is treated as
-/// abuse rather than buffered and forwarded. 16KB covers real Telegram
-/// notifications with headroom; anything larger is likely garbage.
+/// abuse rather than buffered and forwarded.
 const MAX_BODY_BYTES: usize = 16_384;
 
 /// The request body, or `None` if it exceeds `MAX_BODY_BYTES`. A declared
@@ -262,14 +260,12 @@ async fn call_correlator(env: &Env, endpoint: &url::Url, method: Method, body: V
 
 /// POST /aesgcm?e=<url-encoded-endpoint>
 ///
-/// Structural validation (the `?e=` param, the target endpoint, body size)
-/// runs before the Telegram-IP check: those are free, local, in-process
-/// checks, and there's no reason a malformed request -- e.g. a random
-/// scanner missing `?e=` entirely, which was never going to be forwarded
-/// either way -- should get to spend a CIDR-list fetch attempt just because
-/// it happens to come from an unrecognized IP. Only a request that's
-/// otherwise well-formed enough to actually forward reaches the one check
-/// that can trigger outbound traffic to Telegram.
+/// Structural validation (the `?e=` param, the target endpoint, the aesgcm
+/// headers, body size) runs before the Telegram-IP check: those are free,
+/// local checks, and a malformed request from an unrecognized IP shouldn't
+/// get to spend a CIDR-list fetch. Only a request that's otherwise
+/// well-formed enough to forward reaches the one check that can trigger
+/// outbound traffic to Telegram.
 async fn handle_aesgcm(mut req: Request, ctx: RouteContext<Context>) -> Result<Response> {
     let Some(client_ip_str) = get_client_ip(&req) else {
         console_log!("rejected: leg=aesgcm reason=missing_cf_connecting_ip");
@@ -372,6 +368,7 @@ fn percent_decode(s: &str) -> Result<String> {
         .map_err(|e| Error::RustError(format!("invalid percent-encoded UTF-8: {e}")))
 }
 
+/// The Worker's fetch entry point: routes Telegram's POST and PUT requests.
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
     console_error_panic_hook::set_once();
@@ -397,7 +394,7 @@ mod tests {
             "2606:4700:4700::1111",
             "2001:200::1", // just outside 2001::/23
         ] {
-            assert!(is_ip_safe(ip.parse().unwrap()), "ip: {ip}");
+            assert!(is_ip_safe(ip.parse().expect("test address literal must parse")), "ip: {ip}");
         }
     }
 
@@ -421,7 +418,7 @@ mod tests {
             "240.0.0.1",       // reserved
             "255.255.255.255", // broadcast
         ] {
-            assert!(!is_ip_safe(ip.parse().unwrap()), "ip: {ip}");
+            assert!(!is_ip_safe(ip.parse().expect("test address literal must parse")), "ip: {ip}");
         }
     }
 
@@ -445,7 +442,7 @@ mod tests {
             "fec0::1",          // deprecated site-local
             "ff02::1",          // multicast
         ] {
-            assert!(!is_ip_safe(ip.parse().unwrap()), "ip: {ip}");
+            assert!(!is_ip_safe(ip.parse().expect("test address literal must parse")), "ip: {ip}");
         }
     }
 
@@ -481,14 +478,14 @@ mod tests {
             ("%2B%3D%26", "+=&"),
         ];
         for (input, expected) in cases {
-            assert_eq!(percent_decode(input).unwrap(), expected, "input: {input}");
+            assert_eq!(percent_decode(input).expect("test input must decode"), expected, "input: {input}");
         }
     }
 
     #[test]
     fn test_percent_decode_invalid_hex_passes_through() {
-        assert_eq!(percent_decode("%XY").unwrap(), "%XY");
-        assert_eq!(percent_decode("%1G").unwrap(), "%1G");
+        assert_eq!(percent_decode("%XY").expect("invalid hex is passed through"), "%XY");
+        assert_eq!(percent_decode("%1G").expect("invalid hex is passed through"), "%1G");
     }
 
     #[test]
@@ -555,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_endpoint_no_host() {
+    fn test_validate_endpoint_empty_host() {
         assert!(validate_endpoint("http://").is_err());
     }
 }

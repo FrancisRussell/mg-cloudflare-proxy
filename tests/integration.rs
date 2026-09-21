@@ -56,18 +56,17 @@ const TELEGRAM_IP: &str = "91.108.56.1";
 
 /// KV keys and binding the Worker caches the CIDR list under. Must match
 /// `CIDR_LIST_KV_KEY`, `CIDR_LIST_FETCHED_AT_KV_KEY`,
-/// `CIDR_LIST_ATTEMPTED_AT_KV_KEY` and
-/// `CIDR_CACHE_KV_BINDING` in src/, which this test can't import (the crate
-/// only builds for wasm).
+/// `CIDR_LIST_ATTEMPTED_AT_KV_KEY` and `CIDR_CACHE_KV_BINDING` in src/, which
+/// this test can't import (the crate only builds for wasm).
 const CIDR_CACHE_BINDING: &str = "CIDR_CACHE";
 const CIDR_LIST_KV_KEY: &str = "telegram_cidrs";
 const CIDR_LIST_FETCHED_AT_KV_KEY: &str = "telegram_cidrs_fetched_at";
 const CIDR_LIST_ATTEMPTED_AT_KV_KEY: &str = "telegram_cidrs_attempted_at";
 
-/// Cache ages used to force each freshness class deterministically. The
-/// Worker treats a list as stale past 24h, and as very stale past somewhere
-/// between 29 and 30 days (a 30-day threshold shortened by up to 24h of
-/// jitter), so these sit comfortably inside their bands.
+/// Cache ages that put the cache in each freshness class deterministically:
+/// past the Worker's fresh window but inside its force-refetch window even
+/// after that window is shortened by jitter, and past the force-refetch
+/// window whatever the jitter.
 const STALE_CACHE_AGE: Duration = Duration::from_hours(2 * 24);
 const VERY_STALE_CACHE_AGE: Duration = Duration::from_hours(31 * 24);
 
@@ -117,7 +116,7 @@ fn install_sigint_cleanup() {
 /// clean that up), where a fresh one from the OS just doesn't collide.
 fn pick_free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("failed to reserve a port");
-    listener.local_addr().unwrap().port()
+    listener.local_addr().expect("a bound listener has an address").port()
 }
 
 /// Manages a `wrangler dev` child process covering the whole test run:
@@ -149,7 +148,7 @@ fn spawn_output_reader(mut pipe: impl Read + Send + 'static, output: Arc<Mutex<V
         loop {
             match pipe.read(&mut buf) {
                 Ok(0) | Err(_) => return,
-                Ok(n) => output.lock().unwrap().extend_from_slice(&buf[..n]),
+                Ok(n) => output.lock().expect("a thread panicked while holding the lock").extend_from_slice(&buf[..n]),
             }
         }
     });
@@ -323,7 +322,7 @@ impl Drop for WranglerDev {
         // point of capturing this was to have it on hand exactly when
         // something -- ours or wrangler's own -- went wrong.
         if std::thread::panicking() {
-            let output = self.output.lock().unwrap();
+            let output = self.output.lock().expect("a thread panicked while holding the lock");
             eprintln!("--- wrangler dev output ---\n{}", String::from_utf8_lossy(&output));
         }
 
@@ -376,14 +375,16 @@ impl MockDistributor {
                 count.fetch_add(1, Ordering::SeqCst);
                 let mut body = Vec::new();
                 let _ = request.as_reader().read_to_end(&mut body);
-                *body_store.lock().unwrap() = Some(body);
+                *body_store.lock().expect("a thread panicked while holding the lock") = Some(body);
 
                 std::thread::sleep(response_delay);
                 let status = if redirect_to.is_some() { StatusCode::FOUND } else { status };
                 let response = Response::from_string("").with_status_code(status.as_u16());
                 let response = match redirect_to {
-                    Some(location) => response
-                        .with_header(tiny_http::Header::from_bytes(&b"Location"[..], location.as_bytes()).unwrap()),
+                    Some(location) => response.with_header(
+                        tiny_http::Header::from_bytes(&b"Location"[..], location.as_bytes())
+                            .expect("the location is a valid header value"),
+                    ),
                     None => response,
                 };
                 let _ = request.respond(response);
@@ -403,7 +404,13 @@ impl MockDistributor {
 
     fn request_count(&self) -> usize { self.request_count.load(Ordering::SeqCst) }
 
-    fn last_body(&self) -> Vec<u8> { self.last_body.lock().unwrap().clone().expect("distributor received no request") }
+    fn last_body(&self) -> Vec<u8> {
+        self.last_body
+            .lock()
+            .expect("a thread panicked while holding the lock")
+            .clone()
+            .expect("distributor received no request")
+    }
 }
 
 /// A minimal HTTP server standing in for Telegram's CIDR list endpoint,
@@ -446,9 +453,9 @@ impl MockCidrServer {
                     .iter()
                     .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("if-modified-since"))
                     .map(|h| h.value.as_str().to_string());
-                *if_modified_since_store.lock().unwrap() = seen;
+                *if_modified_since_store.lock().expect("a thread panicked while holding the lock") = seen;
 
-                let body = body_store.lock().unwrap().clone();
+                let body = body_store.lock().expect("a thread panicked while holding the lock").clone();
                 let status = status_store.load(Ordering::SeqCst);
                 let _ = request.respond(Response::from_string(body).with_status_code(status));
             }
@@ -457,7 +464,7 @@ impl MockCidrServer {
         Self { port, request_count, last_if_modified_since, body, status }
     }
 
-    fn set_body(&self, body: String) { *self.body.lock().unwrap() = body; }
+    fn set_body(&self, body: String) { *self.body.lock().expect("a thread panicked while holding the lock") = body; }
 
     fn set_status(&self, status: StatusCode) { self.status.store(status.as_u16(), Ordering::SeqCst); }
 
@@ -467,7 +474,9 @@ impl MockCidrServer {
 
     fn request_count(&self) -> usize { self.request_count.load(Ordering::SeqCst) }
 
-    fn last_if_modified_since(&self) -> Option<String> { self.last_if_modified_since.lock().unwrap().clone() }
+    fn last_if_modified_since(&self) -> Option<String> {
+        self.last_if_modified_since.lock().expect("a thread panicked while holding the lock").clone()
+    }
 }
 
 fn worker_url(port: u16, path: &str) -> String { format!("http://127.0.0.1:{port}{path}") }
@@ -512,7 +521,6 @@ fn integration_test() {
     unrecognized_ip_against_empty_cache_fetches_unconditionally(port, &dev, &cidr_server);
     seeding_does_not_overwrite_newer_cache(&dev, &cidr_server);
 
-    rejects_absent_cf_connecting_ip(port);
     rejects_non_telegram_ip(port);
     rejects_literal_private_ip_target(port);
     forwards_put_to_valid_target(port);
@@ -537,7 +545,7 @@ fn put_from(port: u16, client_ip: &str) -> u16 {
 /// A timestamp `age` ago, in the millisecond-string form the Worker stores.
 fn fetched_at_value(age: Duration) -> String {
     let fetched_at = std::time::SystemTime::now() - age;
-    fetched_at.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis().to_string()
+    fetched_at.duration_since(std::time::UNIX_EPOCH).expect("the clock is after the epoch").as_millis().to_string()
 }
 
 /// Polls until `condition` holds, for observing effects of a `ctx.wait_until`
@@ -737,23 +745,6 @@ fn seeding_does_not_overwrite_newer_cache(dev: &WranglerDev, cidr_server: &MockC
 
     assert_eq!(dev.kv_get(CIDR_LIST_KV_KEY), list_before);
     assert_eq!(cidr_server.request_count(), fetches_before, "the local copy is still recent, so no fetch");
-}
-
-/// Doesn't set `CF-Connecting-IP` at all -- but this can't actually verify
-/// `get_client_ip` returning `None` (the genuinely-absent-header path), since
-/// under `wrangler dev` the header gets set anyway: `CF-Connecting-IP`'s
-/// purpose is reflecting the real connecting peer, and Miniflare does that
-/// faithfully even locally, where the peer is genuinely 127.0.0.1 over a real
-/// loopback connection. So this exercises the same "IP not in Telegram's
-/// range" rejection as `rejects_non_telegram_ip`, just via a different IP --
-/// kept as a separate test because the two have distinct intent even though
-/// they collapse to the same code path here (no way to actually omit what
-/// Miniflare will reflect from a real, unspoofed local test client).
-fn rejects_absent_cf_connecting_ip(port: u16) {
-    let resp = ureq::put(&worker_url(port, &format!("/{}", encode("http://example.com/"))))
-        .timeout(REQUEST_TIMEOUT)
-        .send_string("body");
-    assert_eq!(status_of(resp), 403, "PUT with no explicit CF-Connecting-IP should be rejected");
 }
 
 fn rejects_non_telegram_ip(port: u16) {
