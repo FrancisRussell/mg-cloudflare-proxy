@@ -1,9 +1,13 @@
-// Telegram sends two requests per message: a content-bearing POST and a
-// bare PUT wake-up (used when there's no content to send, e.g. secret
-// chats). One instance of this Durable Object exists per endpoint URL (see
-// `call_correlator` in lib.rs), so the PUT and POST for the same endpoint
-// always land on the same instance and can be correlated — a plain Worker
-// gives no such guarantee across separate requests.
+// Mercurygram's notifications arrive as two kinds of request: a content-bearing
+// POST and a bare PUT wake-up (all there is when there's no content to send,
+// e.g. secret chats). Per aesgcm-proxy, which this is ported from, that's
+// because a Simple Push token (`token_type=4`) is registered alongside the
+// WebPush one, so a PUT is sent for every event and a POST also for regular
+// messages. Like aesgcm-proxy, this drops the PUT when the POST for the same
+// endpoint has just arrived. One instance of this Durable Object exists per
+// endpoint URL (see `call_correlator` in lib.rs), so the PUT and POST for the
+// same endpoint always land on the same instance and can be correlated — a
+// plain Worker gives no such guarantee across separate requests.
 //
 // State lives in `Cell`, not `state.storage()`: the correlation window is
 // only ~2s, well under a Durable Object's idle eviction time, so nothing
