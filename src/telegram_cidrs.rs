@@ -61,27 +61,35 @@ fn parse_cidr_list(content: &str) -> Option<String> {
 const CIDR_LIST_KV_KEY: &str = "telegram_cidrs";
 /// When Telegram last confirmed the cached list: a successful fetch or a 304.
 const CIDR_LIST_FETCHED_AT_KV_KEY: &str = "telegram_cidrs_fetched_at";
-/// When Telegram last gave any definitive answer, usable or not. Throttles
-/// re-fetches without claiming the list was confirmed, which
+/// When a fetch from Telegram was last attempted, whatever came of it.
+/// Throttles re-fetches without claiming the list was confirmed, which
 /// `CIDR_LIST_FETCHED_AT_KV_KEY` must never do: it is sent as
 /// `If-Modified-Since`, and a 304 against a time we never actually got the
 /// list at would keep a stale list forever.
 const CIDR_LIST_ATTEMPTED_AT_KV_KEY: &str = "telegram_cidrs_attempted_at";
-/// How long after the last answer from Telegram an unrecognized IP may not
-/// trigger another re-fetch.
+/// How long a confirmation keeps the cached list fresh: while it lasts, an
+/// unrecognized IP doesn't trigger a re-fetch.
 const CIDR_LIST_MAX_AGE: Duration = Duration::from_hours(24);
-/// Beyond this time since Telegram last confirmed the list, force a
-/// background re-fetch even for a *recognized* IP
-/// -- otherwise a dropped-and-reassigned Telegram range would stay trusted
-/// forever, since a recognized IP normally never triggers a fetch at all
-/// (see `is_telegram_ip`). Real IPv4 reclaim quarantine periods run 3
-/// months (ARIN) to 6 months (RIPE), so 30 days is a conservative margin.
+/// After a fetch attempt, of any outcome, no further fetch until about this
+/// long has passed (give or take `CIDR_LIST_RETRY_JITTER`), so a failing
+/// Telegram endpoint isn't hit by every request.
+const CIDR_LIST_RETRY_INTERVAL: Duration = Duration::from_hours(6);
+/// How far either side of `CIDR_LIST_RETRY_INTERVAL` the random jitter reaches
+/// (see `jittered`), spreading out retries that would otherwise all become due
+/// at the same moment.
+const CIDR_LIST_RETRY_JITTER: Duration = Duration::from_hours(1);
+/// Once about this long has passed since Telegram last confirmed the list
+/// (give or take `CIDR_LIST_FORCE_REFETCH_JITTER`), force a background re-fetch
+/// even for a *recognized* IP -- otherwise a dropped-and-reassigned Telegram
+/// range would stay trusted forever, since a recognized IP normally never
+/// triggers a fetch at all (see `is_telegram_ip`). Real IPv4 reclaim
+/// quarantine periods run 3 months (ARIN) to 6 months (RIPE), so 30 days is a
+/// conservative margin.
 const CIDR_LIST_FORCE_REFETCH_MAX_AGE: Duration = Duration::from_hours(30 * 24);
-/// Width of the random jitter subtracted from `CIDR_LIST_FORCE_REFETCH_MAX_AGE`
-/// (see `jittered_force_refetch_max_age`) -- only ever shortens the
-/// effective threshold, never lengthens it, so the 30-day promise is never
-/// exceeded, just sometimes acted on a little early.
-const CIDR_LIST_FORCE_REFETCH_JITTER: Duration = Duration::from_hours(24);
+/// How far either side of `CIDR_LIST_FORCE_REFETCH_MAX_AGE` the random jitter
+/// reaches (see `jittered`), so requests don't all cross the threshold at the
+/// same instant.
+const CIDR_LIST_FORCE_REFETCH_JITTER: Duration = Duration::from_hours(12);
 /// Where to fetch the Telegram CIDR list from. Overridable via the
 /// `CIDR_LIST_URL` wrangler var (see wrangler.toml) so the integration test
 /// can point this at a local mock server instead of Telegram's real endpoint.
@@ -125,7 +133,7 @@ pub(crate) enum TelegramIpCheck {
 /// than `CIDR_LIST_MAX_AGE` (or a missing one) triggers one before answering:
 /// real Telegram traffic shouldn't pay for a round-trip to Telegram on every
 /// request, and a flood of unrecognized IPs shouldn't force more than one
-/// fetch per `CIDR_LIST_MAX_AGE` window.
+/// fetch per `CIDR_LIST_RETRY_INTERVAL`.
 ///
 /// A recognized IP against a *very* stale list still kicks off a re-fetch,
 /// but in the background via `ctx.wait_until`, so it never delays the
@@ -183,7 +191,13 @@ async fn current_cidr_list(kv: &KvStore) -> std::result::Result<CachedCidrList, 
     let fetched_at = read_timestamp(kv, CIDR_LIST_FETCHED_AT_KV_KEY).await?;
     let attempted_at = read_timestamp(kv, CIDR_LIST_ATTEMPTED_AT_KV_KEY).await?;
 
-    let freshness = freshness_of(clock::now(), attempted_at, fetched_at, jittered_force_refetch_max_age());
+    let freshness = freshness_of(
+        clock::now(),
+        attempted_at,
+        fetched_at,
+        jittered(CIDR_LIST_RETRY_INTERVAL, CIDR_LIST_RETRY_JITTER),
+        jittered(CIDR_LIST_FORCE_REFETCH_MAX_AGE, CIDR_LIST_FORCE_REFETCH_JITTER),
+    );
     let if_modified_since = list.as_ref().and(fetched_at).map(http_date);
     Ok(CachedCidrList { list: list.unwrap_or_default(), freshness, if_modified_since })
 }
@@ -195,15 +209,18 @@ async fn read_timestamp(kv: &KvStore, key: &str) -> std::result::Result<Option<S
     Ok(value.and_then(|v| v.parse::<u64>().ok()).map(|ms| UNIX_EPOCH + Duration::from_millis(ms)))
 }
 
-/// Classifies the cache. `Fresh` means Telegram answered recently, so no
-/// fetch is due. Otherwise the list is `Stale` while it was confirmed within
-/// `force_refetch_max_age`, and `VeryStale` beyond that or with no confirmed
-/// time at all, so an unseeded or damaged cache fails toward refreshing.
+/// Classifies the cache. `Fresh` means no fetch is due: Telegram confirmed
+/// the list within `CIDR_LIST_MAX_AGE`, or a fetch was attempted within
+/// `retry_interval`. Otherwise the list is `Stale` while it was confirmed
+/// within `force_refetch_max_age`, and `VeryStale` beyond that or with no
+/// confirmed time at all, so an unseeded or damaged cache fails toward
+/// refreshing.
 fn freshness_of(
-    now: SystemTime, attempted_at: Option<SystemTime>, fetched_at: Option<SystemTime>, force_refetch_max_age: Duration,
+    now: SystemTime, attempted_at: Option<SystemTime>, fetched_at: Option<SystemTime>, retry_interval: Duration,
+    force_refetch_max_age: Duration,
 ) -> CidrListFreshness {
     let within = |then: Option<SystemTime>, max_age| then.is_some_and(|then| clock::is_within(now, then, max_age));
-    if within(attempted_at, CIDR_LIST_MAX_AGE) || within(fetched_at, CIDR_LIST_MAX_AGE) {
+    if within(attempted_at, retry_interval) || within(fetched_at, CIDR_LIST_MAX_AGE) {
         CidrListFreshness::Fresh
     } else if within(fetched_at, force_refetch_max_age) {
         CidrListFreshness::Stale
@@ -212,15 +229,19 @@ fn freshness_of(
     }
 }
 
-/// `CIDR_LIST_FORCE_REFETCH_MAX_AGE` shortened by a random amount up to
-/// `CIDR_LIST_FORCE_REFETCH_JITTER`, freshly redrawn on every call --
-/// spreads out when different concurrent requests conclude the cache is
-/// `VeryStale`, rather than all of them crossing the same fixed cutoff at
-/// once (a synchronized fleet of edge locations would otherwise all decide
-/// to background-refetch in the same narrow window).
-fn jittered_force_refetch_max_age() -> Duration {
-    let jitter = CIDR_LIST_FORCE_REFETCH_JITTER.mul_f64(js_sys::Math::random());
-    CIDR_LIST_FORCE_REFETCH_MAX_AGE.saturating_sub(jitter)
+/// `centre` moved by a random amount up to `jitter` either way, freshly drawn
+/// on every call. Concurrent requests then cross a threshold at different
+/// moments, rather than all deciding at the same instant.
+fn jittered(centre: Duration, jitter: Duration) -> Duration { apply_jitter(centre, jitter, js_sys::Math::random()) }
+
+/// `centre` moved by up to `jitter` either way: `unit`, in `0.0..=1.0`, picks
+/// the position across that range, with 0.5 leaving `centre` unchanged.
+fn apply_jitter(centre: Duration, jitter: Duration, unit: f64) -> Duration {
+    if unit < 0.5 {
+        centre.saturating_sub(jitter.mul_f64(1.0 - 2.0 * unit))
+    } else {
+        centre.saturating_add(jitter.mul_f64(2.0 * unit - 1.0))
+    }
 }
 
 /// What asking Telegram for the CIDR list came to.
@@ -241,12 +262,10 @@ enum CidrFetchOutcome {
 /// case) then costs Telegram's server a bodyless 304 instead of the full list.
 /// Returns the new list, or `None` if the cached one stands.
 ///
-/// Any definitive answer (a 304, a success, or a bad-but-reachable response
-/// like an unparseable body) records an attempt, so a broken-but-reachable
-/// endpoint isn't hit on every subsequent unrecognized-IP request either.
-/// Only a 304 or a valid list that was written to KV also records that
-/// Telegram confirmed the list. A network-level failure records nothing,
-/// since that's the one case worth retrying sooner than `CIDR_LIST_MAX_AGE`.
+/// Every attempt is recorded, so a failing endpoint isn't hit by every
+/// request, whether it answered badly or couldn't be reached. Only a 304 or a
+/// valid list that was written to KV also records that Telegram confirmed the
+/// list.
 async fn fetch_fresh_cidr_list(kv: &KvStore, fetch_url: &str, if_modified_since: Option<&str>) -> Option<String> {
     match request_cidr_list(fetch_url, if_modified_since).await {
         CidrFetchOutcome::Updated(list) => {
@@ -263,11 +282,10 @@ async fn fetch_fresh_cidr_list(kv: &KvStore, fetch_url: &str, if_modified_since:
             mark_cidr_list_confirmed(kv).await;
             None
         }
-        CidrFetchOutcome::Rejected => {
+        CidrFetchOutcome::Rejected | CidrFetchOutcome::Unreachable => {
             mark_cidr_list_attempted(kv).await;
             None
         }
-        CidrFetchOutcome::Unreachable => None,
     }
 }
 
@@ -321,7 +339,7 @@ pub(crate) fn cidr_list_url(env: &Env) -> String {
     env.var(CIDR_LIST_URL_VAR).map_or_else(|_| TELEGRAM_CIDR_URL.to_string(), |v| v.to_string())
 }
 
-/// Records that Telegram answered, whether or not the answer was usable.
+/// Records that a fetch was attempted, whether or not it produced a list.
 async fn mark_cidr_list_attempted(kv: &KvStore) {
     kv_put_best_effort(kv, CIDR_LIST_ATTEMPTED_AT_KV_KEY, &millis_since_epoch(clock::now()).to_string()).await;
 }
@@ -404,6 +422,13 @@ mod tests {
     /// time.
     fn now_for_freshness_tests() -> SystemTime { UNIX_EPOCH + CIDR_LIST_FORCE_REFETCH_MAX_AGE * 2 }
 
+    /// `freshness_of` with the unjittered retry interval and force-refetch age.
+    fn freshness(
+        now: SystemTime, attempted_at: Option<SystemTime>, fetched_at: Option<SystemTime>,
+    ) -> CidrListFreshness {
+        freshness_of(now, attempted_at, fetched_at, CIDR_LIST_RETRY_INTERVAL, CIDR_LIST_FORCE_REFETCH_MAX_AGE)
+    }
+
     #[test]
     fn test_freshness_of_by_confirmed_age() {
         let now = now_for_freshness_tests();
@@ -414,43 +439,58 @@ mod tests {
             (now + Duration::from_secs(1), CidrListFreshness::VeryStale), // confirmed "in the future"
         ];
         for (fetched_at, expected) in cases {
-            assert_eq!(freshness_of(now, None, Some(fetched_at), CIDR_LIST_FORCE_REFETCH_MAX_AGE), expected);
+            assert_eq!(freshness(now, None, Some(fetched_at)), expected);
         }
     }
 
     #[test]
     fn test_freshness_of_missing_timestamps_is_very_stale() {
         let now = now_for_freshness_tests();
-        assert_eq!(freshness_of(now, None, None, CIDR_LIST_FORCE_REFETCH_MAX_AGE), CidrListFreshness::VeryStale);
+        assert_eq!(freshness(now, None, None), CidrListFreshness::VeryStale);
     }
 
     #[test]
     fn test_freshness_of_recent_attempt_throttles_regardless_of_confirmed_age() {
         let now = now_for_freshness_tests();
         let long_ago = now - CIDR_LIST_FORCE_REFETCH_MAX_AGE - Duration::from_secs(1);
-        let recent = now - Duration::from_secs(1);
+        let just_inside_retry_interval = now - CIDR_LIST_RETRY_INTERVAL + Duration::from_secs(1);
         for fetched_at in [Some(long_ago), None] {
-            assert_eq!(
-                freshness_of(now, Some(recent), fetched_at, CIDR_LIST_FORCE_REFETCH_MAX_AGE),
-                CidrListFreshness::Fresh
-            );
+            assert_eq!(freshness(now, Some(just_inside_retry_interval), fetched_at), CidrListFreshness::Fresh);
         }
     }
 
     #[test]
     fn test_freshness_of_old_attempt_falls_back_to_confirmed_age() {
         let now = now_for_freshness_tests();
-        let old_attempt = now - CIDR_LIST_MAX_AGE - Duration::from_secs(1);
-        let confirmed_recently = now - CIDR_LIST_MAX_AGE - Duration::from_secs(2);
+        let old_attempt = now - CIDR_LIST_RETRY_INTERVAL - Duration::from_secs(1);
+        let confirmed_recently = now - CIDR_LIST_MAX_AGE - Duration::from_secs(1);
         let confirmed_long_ago = now - CIDR_LIST_FORCE_REFETCH_MAX_AGE - Duration::from_secs(1);
-        assert_eq!(
-            freshness_of(now, Some(old_attempt), Some(confirmed_recently), CIDR_LIST_FORCE_REFETCH_MAX_AGE),
-            CidrListFreshness::Stale
-        );
-        assert_eq!(
-            freshness_of(now, Some(old_attempt), Some(confirmed_long_ago), CIDR_LIST_FORCE_REFETCH_MAX_AGE),
-            CidrListFreshness::VeryStale
-        );
+        assert_eq!(freshness(now, Some(old_attempt), Some(confirmed_recently)), CidrListFreshness::Stale);
+        assert_eq!(freshness(now, Some(old_attempt), Some(confirmed_long_ago)), CidrListFreshness::VeryStale);
+    }
+
+    #[test]
+    fn test_freshness_of_confirmation_within_max_age_is_fresh_despite_an_old_attempt() {
+        let now = now_for_freshness_tests();
+        let old_attempt = now - CIDR_LIST_RETRY_INTERVAL - Duration::from_secs(1);
+        let confirmed_within_max_age = now - CIDR_LIST_MAX_AGE + Duration::from_secs(1);
+        assert_eq!(freshness(now, Some(old_attempt), Some(confirmed_within_max_age)), CidrListFreshness::Fresh);
+    }
+
+    #[test]
+    fn test_apply_jitter_spans_either_side_of_the_centre() {
+        let centre = Duration::from_hours(6);
+        let jitter = Duration::from_hours(1);
+        assert_eq!(apply_jitter(centre, jitter, 0.0), Duration::from_hours(5));
+        assert_eq!(apply_jitter(centre, jitter, 0.5), centre);
+        assert_eq!(apply_jitter(centre, jitter, 1.0), Duration::from_hours(7));
+        assert!(apply_jitter(centre, jitter, 0.25) < centre);
+        assert!(apply_jitter(centre, jitter, 0.75) > centre);
+    }
+
+    #[test]
+    fn test_apply_jitter_saturates_at_zero() {
+        assert_eq!(apply_jitter(Duration::from_secs(1), Duration::from_hours(1), 0.0), Duration::ZERO);
     }
 
     #[test]

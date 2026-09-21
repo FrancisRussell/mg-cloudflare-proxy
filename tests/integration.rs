@@ -15,11 +15,11 @@
 // binary rather than failing to build.
 #![cfg(unix)]
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -63,10 +63,9 @@ const CIDR_LIST_KV_KEY: &str = "telegram_cidrs";
 const CIDR_LIST_FETCHED_AT_KV_KEY: &str = "telegram_cidrs_fetched_at";
 const CIDR_LIST_ATTEMPTED_AT_KV_KEY: &str = "telegram_cidrs_attempted_at";
 
-/// Cache ages that put the cache in each freshness class deterministically:
-/// past the Worker's fresh window but inside its force-refetch window even
-/// after that window is shortened by jitter, and past the force-refetch
-/// window whatever the jitter.
+/// Cache ages that put the cache in each freshness class whatever the Worker's
+/// jitter draws: past the fresh window but well inside the force-refetch
+/// window, and well past the force-refetch window.
 const STALE_CACHE_AGE: Duration = Duration::from_hours(2 * 24);
 const VERY_STALE_CACHE_AGE: Duration = Duration::from_hours(31 * 24);
 
@@ -451,44 +450,65 @@ struct MockCidrServer {
     last_if_modified_since: Arc<Mutex<Option<String>>>,
     body: Arc<Mutex<String>>,
     status: Arc<AtomicU16>,
+    unreachable: Arc<AtomicBool>,
 }
 
 impl MockCidrServer {
     fn start(body: String) -> Self {
-        let port = pick_free_port();
-        let server = tiny_http::Server::http(("127.0.0.1", port)).expect("failed to start mock CIDR server");
+        // A hand-rolled server rather than `tiny_http`, so that "unreachable"
+        // can close a connection without answering.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("failed to start mock CIDR server");
+        let port = listener.local_addr().expect("a bound listener has an address").port();
         let request_count = Arc::new(AtomicUsize::new(0));
         let last_if_modified_since = Arc::new(Mutex::new(None));
 
         let body = Arc::new(Mutex::new(body));
         let status = Arc::new(AtomicU16::new(StatusCode::OK.as_u16()));
+        let unreachable = Arc::new(AtomicBool::new(false));
 
         let count = Arc::clone(&request_count);
         let if_modified_since_store = Arc::clone(&last_if_modified_since);
         let body_store = Arc::clone(&body);
         let status_store = Arc::clone(&status);
+        let unreachable_flag = Arc::clone(&unreachable);
         std::thread::spawn(move || {
-            for request in server.incoming_requests() {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
+                let Some(request_head) = read_request_head(&mut stream) else { continue };
+
                 count.fetch_add(1, Ordering::SeqCst);
-                let seen = request
-                    .headers()
-                    .iter()
-                    .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("if-modified-since"))
-                    .map(|h| h.value.as_str().to_string());
-                *if_modified_since_store.lock().expect("a thread panicked while holding the lock") = seen;
+                *if_modified_since_store.lock().expect("a thread panicked while holding the lock") =
+                    header_value(&request_head, "if-modified-since");
+
+                if unreachable_flag.load(Ordering::SeqCst) {
+                    // Dropping the stream closes the connection without an
+                    // answer.
+                    continue;
+                }
 
                 let body = body_store.lock().expect("a thread panicked while holding the lock").clone();
-                let status = status_store.load(Ordering::SeqCst);
-                let _ = request.respond(Response::from_string(body).with_status_code(status));
+                let status = StatusCode::from_u16(status_store.load(Ordering::SeqCst)).expect("a valid status");
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    status.as_u16(),
+                    status.canonical_reason().unwrap_or(""),
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
             }
         });
 
-        Self { port, request_count, last_if_modified_since, body, status }
+        Self { port, request_count, last_if_modified_since, body, status, unreachable }
     }
 
     fn set_body(&self, body: String) { *self.body.lock().expect("a thread panicked while holding the lock") = body; }
 
     fn set_status(&self, status: StatusCode) { self.status.store(status.as_u16(), Ordering::SeqCst); }
+
+    /// While set, requests are counted but the connection is closed without an
+    /// answer, so a fetch fails outright.
+    fn set_unreachable(&self, unreachable: bool) { self.unreachable.store(unreachable, Ordering::SeqCst); }
 
     /// A hostname, not a literal IP, for the same reason as
     /// `MockDistributor::url` -- see its doc comment.
@@ -499,6 +519,29 @@ impl MockCidrServer {
     fn last_if_modified_since(&self) -> Option<String> {
         self.last_if_modified_since.lock().expect("a thread panicked while holding the lock").clone()
     }
+}
+
+/// Reads a request up to the end of its headers, or `None` if the connection
+/// ends or times out first.
+fn read_request_head(stream: &mut impl Read) -> Option<String> {
+    const HEADER_END: &[u8] = b"\r\n\r\n";
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !head.windows(HEADER_END.len()).any(|window| window == HEADER_END) {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => head.extend_from_slice(&chunk[..n]),
+        }
+    }
+    Some(String::from_utf8_lossy(&head).into_owned())
+}
+
+/// The value of header `name` (lowercase) in a raw request head, if present.
+fn header_value(request_head: &str, name: &str) -> Option<String> {
+    request_head.lines().find_map(|line| {
+        let (field, value) = line.split_once(':')?;
+        field.trim().eq_ignore_ascii_case(name).then(|| value.trim().to_string())
+    })
 }
 
 fn worker_url(port: u16, path: &str) -> String { format!("http://127.0.0.1:{port}{path}") }
@@ -539,6 +582,7 @@ fn integration_test() {
     invalid_requests_from_unrecognized_ip_do_not_fetch(port, &dev, &cidr_server);
     unrecognized_ip_against_stale_cache_fetches(port, &dev, &cidr_server);
     failed_fetch_does_not_advance_the_confirmed_time(port, &dev, &cidr_server);
+    unreachable_telegram_records_an_attempt_and_holds_off_the_next(port, &dev, &cidr_server);
     recognized_ip_against_very_stale_cache_refetches_in_background(port, &dev, &cidr_server);
     unrecognized_ip_against_empty_cache_fetches_unconditionally(port, &dev, &cidr_server);
     seeding_does_not_overwrite_newer_cache(&dev, &cidr_server);
@@ -713,6 +757,36 @@ fn failed_fetch_does_not_advance_the_confirmed_time(port: u16, dev: &WranglerDev
         cidr_server.last_if_modified_since(),
         if_modified_since_before_failure,
         "the refresh after a failure should still be conditioned on when the list was last confirmed"
+    );
+}
+
+/// Telegram not answering at all is recorded as an attempt like any other
+/// failure, so an outage isn't hit by every request; once the retry interval
+/// has passed the next request tries again.
+fn unreachable_telegram_records_an_attempt_and_holds_off_the_next(
+    port: u16, dev: &WranglerDev, cidr_server: &MockCidrServer,
+) {
+    let confirmed_at = fetched_at_value(STALE_CACHE_AGE);
+    dev.kv_put(CIDR_LIST_FETCHED_AT_KV_KEY, &confirmed_at);
+    dev.kv_put(CIDR_LIST_ATTEMPTED_AT_KV_KEY, &confirmed_at);
+    cidr_server.set_unreachable(true);
+    let fetches_before = cidr_server.request_count();
+
+    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403);
+    assert_eq!(cidr_server.request_count(), fetches_before + 1);
+    assert_eq!(dev.kv_get(CIDR_LIST_FETCHED_AT_KV_KEY).trim(), confirmed_at, "nothing was confirmed");
+    assert_ne!(dev.kv_get(CIDR_LIST_ATTEMPTED_AT_KV_KEY).trim(), confirmed_at, "the attempt should be recorded");
+
+    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403);
+    assert_eq!(cidr_server.request_count(), fetches_before + 1, "the failed attempt should hold off another");
+
+    cidr_server.set_unreachable(false);
+    dev.kv_put(CIDR_LIST_ATTEMPTED_AT_KV_KEY, &confirmed_at);
+    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403);
+    assert_eq!(
+        cidr_server.request_count(),
+        fetches_before + 2,
+        "once the interval has passed, the next request retries"
     );
 }
 
