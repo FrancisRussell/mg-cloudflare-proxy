@@ -239,36 +239,54 @@ async fn forward(target: &url::Url, body: Vec<u8>) -> Result<Response> {
     }
 
     let location = resp.headers().get(header_names::LOCATION.as_str())?;
-
-    let result = match wake_up_response_shape(distributor_status, location.as_deref(), target.as_str()) {
-        None => Ok(resp),
-        Some((status, location)) => Response::empty().map(|r| {
-            r.with_status(status).with_headers({
-                let h = Headers::new();
-                let _ = h.set(header_names::LOCATION.as_str(), &location);
-                h
-            })
-        }),
+    let retry_after = resp.headers().get(http::header::RETRY_AFTER.as_str())?;
+    let response = match forward_reply(distributor_status, location.as_deref(), retry_after.as_deref(), target.as_str())
+    {
+        ForwardReply::Created { location } => {
+            let headers = Headers::new();
+            headers.set(header_names::LOCATION.as_str(), &location)?;
+            Response::empty()?.with_status(StatusCode::CREATED.as_u16()).with_headers(headers)
+        }
+        ForwardReply::Failed { status, retry_after } => {
+            let headers = Headers::new();
+            if let Some(retry_after) = retry_after {
+                headers.set(http::header::RETRY_AFTER.as_str(), &retry_after)?;
+            }
+            Response::empty()?.with_status(status).with_headers(headers)
+        }
     };
 
-    if let Ok(r) = &result {
-        console_log!(
-            "forwarded: host={host} body_size={body_size} distributor_status={distributor_status} our_status={}",
-            r.status_code()
-        );
-    }
-    result
+    console_log!(
+        "forwarded: host={host} body_size={body_size} distributor_status={distributor_status} our_status={}",
+        response.status_code()
+    );
+    Ok(response)
 }
 
-/// The `(status, location)` `forward` should respond with for a POST that
-/// got back `status`/`location` from `target`, per RFC 8030 §5's
-/// `201 Created` + `Location` shape. `None` means pass the response through
-/// unchanged (a non-2xx status).
-fn wake_up_response_shape(status: u16, location: Option<&str>, target: &str) -> Option<(u16, String)> {
-    if !StatusCode::from_u16(status).is_ok_and(|s| s.is_success()) {
-        return None;
+/// How `forward` answers the caller once the push server has answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ForwardReply {
+    /// The push was accepted: RFC 8030 section 5's `201 Created` with the
+    /// push message's `Location`.
+    Created { location: String },
+    /// The push server refused it. Only its status is passed on (RFC 8030
+    /// gives statuses such as 404 for an expired subscription and 429 for a
+    /// rate limit a meaning) along with `Retry-After`, which it may send with
+    /// a 429 (RFC 8030 section 8.4). Its body and other headers have no
+    /// defined meaning and aren't relayed.
+    Failed { status: u16, retry_after: Option<String> },
+}
+
+/// The reply for a push server that answered `status`, with the given
+/// `Location` and `Retry-After`. Any 2xx counts as accepted, since some
+/// senders back off on other 2xx codes; a missing `Location` falls back to
+/// `target`.
+fn forward_reply(status: u16, location: Option<&str>, retry_after: Option<&str>, target: &str) -> ForwardReply {
+    if StatusCode::from_u16(status).is_ok_and(|s| s.is_success()) {
+        ForwardReply::Created { location: location.map_or_else(|| target.to_string(), String::from) }
+    } else {
+        ForwardReply::Failed { status, retry_after: retry_after.map(String::from) }
     }
-    Some((StatusCode::CREATED.as_u16(), location.map_or_else(|| target.to_string(), String::from)))
 }
 
 #[cfg(test)]
@@ -317,26 +335,31 @@ mod tests {
     }
 
     #[test]
-    fn test_wake_up_response_shape_non_2xx_passes_through() {
-        let internal_error = StatusCode::INTERNAL_SERVER_ERROR.as_u16();
-        let not_found = StatusCode::NOT_FOUND.as_u16();
+    fn test_forward_reply_failure_passes_on_only_status_and_retry_after() {
+        let target = "https://target.example";
         assert_eq!(
-            wake_up_response_shape(internal_error, Some("https://example.com/x"), "https://target.example"),
-            None
+            forward_reply(StatusCode::TOO_MANY_REQUESTS.as_u16(), Some("https://example.com/x"), Some("30"), target),
+            ForwardReply::Failed { status: 429, retry_after: Some("30".to_string()) }
         );
-        assert_eq!(wake_up_response_shape(not_found, None, "https://target.example"), None);
+        assert_eq!(
+            forward_reply(StatusCode::NOT_FOUND.as_u16(), None, None, target),
+            ForwardReply::Failed { status: 404, retry_after: None }
+        );
     }
 
     #[test]
-    fn test_wake_up_response_shape_2xx_preserves_location() {
-        let result =
-            wake_up_response_shape(StatusCode::OK.as_u16(), Some("https://example.com/x"), "https://target.example");
-        assert_eq!(result, Some((StatusCode::CREATED.as_u16(), "https://example.com/x".to_string())));
+    fn test_forward_reply_2xx_preserves_location() {
+        assert_eq!(
+            forward_reply(StatusCode::OK.as_u16(), Some("https://example.com/x"), None, "https://target.example"),
+            ForwardReply::Created { location: "https://example.com/x".to_string() }
+        );
     }
 
     #[test]
-    fn test_wake_up_response_shape_2xx_falls_back_to_target() {
-        let result = wake_up_response_shape(StatusCode::NO_CONTENT.as_u16(), None, "https://target.example");
-        assert_eq!(result, Some((StatusCode::CREATED.as_u16(), "https://target.example".to_string())));
+    fn test_forward_reply_2xx_falls_back_to_target() {
+        assert_eq!(
+            forward_reply(StatusCode::NO_CONTENT.as_u16(), None, None, "https://target.example"),
+            ForwardReply::Created { location: "https://target.example".to_string() }
+        );
     }
 }

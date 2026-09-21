@@ -332,6 +332,13 @@ impl Drop for WranglerDev {
 
 /// A minimal HTTP server standing in for a `UnifiedPush` distributor,
 /// recording what it receives instead of doing anything with it.
+/// The body and `Retry-After` a `MockDistributor` answers with.
+#[derive(Debug, Clone, Copy, Default)]
+struct Reply {
+    body: &'static str,
+    retry_after: Option<&'static str>,
+}
+
 struct MockDistributor {
     port: u16,
     request_count: Arc<AtomicUsize>,
@@ -352,17 +359,25 @@ impl MockDistributor {
     /// `MockDistributor` from every test would then leak for the remainder
     /// of the whole `cargo test` run rather than being scoped to just one.
     fn start(redirect_to: Option<&'static str>) -> Self {
-        Self::start_with(redirect_to, Duration::ZERO, StatusCode::OK)
+        Self::start_with(redirect_to, Duration::ZERO, StatusCode::OK, Reply::default())
     }
 
     /// A distributor that waits `response_delay` before answering every
     /// request with `status`, for exercising requests that are still being
     /// forwarded when another arrives.
     fn start_slow(response_delay: Duration, status: StatusCode) -> Self {
-        Self::start_with(None, response_delay, status)
+        Self::start_with(None, response_delay, status, Reply::default())
     }
 
-    fn start_with(redirect_to: Option<&'static str>, response_delay: Duration, status: StatusCode) -> Self {
+    /// A distributor that refuses every push with `status` and `reply`, as a
+    /// rate-limiting push server would.
+    fn start_refusing(status: StatusCode, reply: Reply) -> Self {
+        Self::start_with(None, Duration::ZERO, status, reply)
+    }
+
+    fn start_with(
+        redirect_to: Option<&'static str>, response_delay: Duration, status: StatusCode, reply: Reply,
+    ) -> Self {
         let port = pick_free_port();
         let server = tiny_http::Server::http(("127.0.0.1", port)).expect("failed to start mock distributor");
         let request_count = Arc::new(AtomicUsize::new(0));
@@ -379,7 +394,14 @@ impl MockDistributor {
 
                 std::thread::sleep(response_delay);
                 let status = if redirect_to.is_some() { StatusCode::FOUND } else { status };
-                let response = Response::from_string("").with_status_code(status.as_u16());
+                let response = Response::from_string(reply.body).with_status_code(status.as_u16());
+                let response = match reply.retry_after {
+                    Some(seconds) => response.with_header(
+                        tiny_http::Header::from_bytes(&b"Retry-After"[..], seconds.as_bytes())
+                            .expect("a static header is valid"),
+                    ),
+                    None => response,
+                };
                 let response = match redirect_to {
                     Some(location) => response.with_header(
                         tiny_http::Header::from_bytes(&b"Location"[..], location.as_bytes())
@@ -528,6 +550,7 @@ fn integration_test() {
     post_suppresses_following_put(port);
     put_waits_for_a_slow_post_and_is_suppressed_when_it_succeeds(port);
     put_forwards_after_a_slow_post_that_fails(port);
+    refusal_passes_on_only_status_and_retry_after(port);
 }
 
 /// PUTs to a throwaway distributor from `client_ip`, returning the proxy's
@@ -872,4 +895,24 @@ fn put_forwards_after_a_slow_post_that_fails(port: u16) {
     assert_eq!(post_answer, 500, "the push server's failure is passed back to the POST");
     assert_eq!(put_answer, 500, "the PUT was forwarded, so it gets the push server's answer");
     assert_eq!(distributor.request_count(), 2, "the failed POST must not have suppressed the PUT");
+}
+
+/// A refusing push server's status, and `Retry-After` for a rate limit, are
+/// what the caller needs; whatever body it wrote is not relayed.
+fn refusal_passes_on_only_status_and_retry_after(port: u16) {
+    const RETRY_AFTER_SECONDS: &str = "30";
+    let distributor = MockDistributor::start_refusing(
+        StatusCode::TOO_MANY_REQUESTS,
+        Reply { body: "details only the push server should see", retry_after: Some(RETRY_AFTER_SECONDS) },
+    );
+
+    let resp = ureq::put(&worker_url(port, &format!("/{}", encode(&distributor.url()))))
+        .set("CF-Connecting-IP", TELEGRAM_IP)
+        .timeout(REQUEST_TIMEOUT)
+        .send_string("wake-up-body");
+
+    let Err(ureq::Error::Status(status, resp)) = resp else { panic!("expected the refusal to be passed on") };
+    assert_eq!(status, 429);
+    assert_eq!(resp.header("Retry-After"), Some(RETRY_AFTER_SECONDS));
+    assert_eq!(resp.into_string().expect("the response body is readable"), "", "the push server's body isn't relayed");
 }
