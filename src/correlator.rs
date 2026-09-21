@@ -68,7 +68,7 @@ pub struct Correlator {
     // concurrent requests to the same instance, interleaved at `.await`
     // points. Without this flag, two PUTs arriving close together could
     // both pass the "no recent POST" check, both wait out
-    // `CORRELATION_WAIT_MS`, and both forward — a duplicate wake-up. Whichever
+    // `CORRELATION_WAIT`, and both forward — a duplicate wake-up. Whichever
     // PUT claims this flag first is the sole decision-maker; a second
     // concurrent PUT defers to it instead of racing to its own forward.
     put_in_flight: Cell<bool>,
@@ -117,14 +117,12 @@ impl Correlator {
         if self.recent_post() {
             return Response::ok("");
         }
-        if self.put_in_flight.replace(true) {
-            return Response::ok("");
-        }
+        let Some(claim) = PutInFlight::claim(&self.put_in_flight) else { return Response::ok("") };
 
         Delay::from(CORRELATION_WAIT).await;
 
         let should_forward = !self.recent_post();
-        self.put_in_flight.set(false);
+        drop(claim);
 
         if should_forward {
             forward(target, body).await
@@ -134,6 +132,26 @@ impl Correlator {
     }
 
     fn recent_post(&self) -> bool { is_post_recent(clock::now(), self.last_post.get(), RECENT_POST_WINDOW) }
+}
+
+/// Holds `Correlator::put_in_flight` for as long as it lives. Releasing on
+/// drop means a PUT that is cancelled while waiting can't leave the flag set
+/// and every later PUT for the endpoint suppressed.
+struct PutInFlight<'a>(&'a Cell<bool>);
+
+impl<'a> PutInFlight<'a> {
+    /// The claim, or `None` if another PUT already holds `flag`.
+    fn claim(flag: &'a Cell<bool>) -> Option<Self> {
+        if flag.replace(true) {
+            None
+        } else {
+            Some(Self(flag))
+        }
+    }
+}
+
+impl Drop for PutInFlight<'_> {
+    fn drop(&mut self) { self.0.set(false); }
 }
 
 /// True if `last_post` is within `window` of `now`.
@@ -217,6 +235,15 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     use super::*;
+
+    #[test]
+    fn test_put_in_flight_is_exclusive_until_dropped() {
+        let flag = Cell::new(false);
+        let first = PutInFlight::claim(&flag).expect("nothing holds the flag yet");
+        assert!(PutInFlight::claim(&flag).is_none(), "a second claim must wait for the first to be released");
+        drop(first);
+        assert!(PutInFlight::claim(&flag).is_some(), "dropping the claim releases the flag");
+    }
 
     #[test]
     fn test_is_post_recent_within_window() {
