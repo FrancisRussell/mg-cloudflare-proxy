@@ -217,3 +217,9 @@ retention — the proxy itself keeps no logs of its own.
 Dual-licensed under [MIT](./LICENSE-MIT) or [Apache-2.0](./LICENSE-APACHE),
 matching the upstream project this was ported from. See [NOTICE](./NOTICE)
 for attribution details.
+
+## AI usage
+
+This repository discloses AI involvement per the
+[ai-disclosure](https://github.com/ggfevans/ai-disclosure) convention - see
+[AI_DISCLOSURE.md](AI_DISCLOSURE.md) for details.
