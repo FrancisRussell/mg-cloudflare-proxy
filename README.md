@@ -1,14 +1,15 @@
-# mg-edge-relay
+# mg-cloudflare-relay
 
-A Cloudflare Worker + Durable Object relay for Mercurygram's legacy WebPush
-(aesgcm Draft-04) notifications, deployed under your own Cloudflare account
-instead of relying on Mercurygram's public gateway.
+Adapts Mercurygram's legacy Telegram WebPush (aesgcm Draft-04) push
+notifications into UnifiedPush. Deploy it under your own Cloudflare account
+(as a Worker named `mercurygram-relay` by default) instead of routing
+through Mercurygram's own public gateway,
+[Mercurygram/aesgcm-proxy](https://github.com/Mercurygram/aesgcm-proxy).
 
-Reimplements the `/aesgcm` and PUT routes of
-[Mercurygram/aesgcm-proxy](https://github.com/Mercurygram/aesgcm-proxy) (see
-[NOTICE](./NOTICE) for exactly what was ported). Does not implement the
-`/fcm/<token>` (VAPID/FCM) leg — this relay targets a real UnifiedPush
-distributor (e.g. [Sunup](https://codeberg.org/Sunup/android), self-hosted
+Reimplements aesgcm-proxy's `/aesgcm` and PUT routes (see [NOTICE](./NOTICE)
+for exactly what was ported). Does not implement the `/fcm/<token>`
+(VAPID/FCM) leg — this relay targets a real UnifiedPush distributor (e.g.
+[Sunup](https://codeberg.org/Sunup/android), self-hosted
 [ntfy](https://ntfy.sh)) directly.
 
 ## Why a Durable Object
@@ -28,8 +29,10 @@ See the doc comment at the top of `src/correlator.rs`.
 ### 1. Create a KV namespace
 
 Log in to your Cloudflare dashboard and create a new KV namespace (Workers &
-AI → KV → Create namespace). Choose a name like `mg-edge-relay-cidrs` and note
-the namespace ID and preview ID.
+AI → KV → Create namespace). Choose a name like `mercurygram-relay` and note
+the namespace ID and preview ID — the `CIDR_CACHE` binding name is what the
+code actually keys off, so the namespace's own name is free to stay generic
+even though it's currently only used for the CIDR cache.
 
 ### 2. Configure wrangler and deploy
 
@@ -51,14 +54,21 @@ npx wrangler deploy
 ```
 
 `data/telegram-cidrs.txt` is the bootstrap Telegram CIDR list baked into the
-build via `include_str!`. Every build (`wrangler dev` or `deploy`, however
-invoked) runs `scripts/verify-cidr-freshness.sh` first and fails loudly if
-that file hasn't been checked in the last 14 days — a build step reaching
-out to Telegram's servers on its own would be fragile, so refreshing it is
-a separate, deliberate step: run `npm run check-cidr` (needs network
-access) to do a conditional fetch and update the file in place if Telegram's
-list has changed. Worth running periodically (manually, or via a scheduled
-CI job) rather than only when the build starts complaining.
+build via `include_str!`, letting a freshly-deployed Worker recognize
+Telegram's own IP ranges immediately, with no fetch needed. Every build
+(`wrangler dev` or `deploy`, however invoked) runs
+`scripts/verify-cidr-freshness.sh` first and fails loudly if that file
+hasn't been checked in the last 14 days — a build step reaching out to
+Telegram's servers on its own would be fragile, so refreshing it is a
+separate, deliberate step: run `npm run check-cidr` (needs network access)
+to do a conditional fetch and update the file in place if Telegram's list
+has changed. Worth running periodically (manually, or via a scheduled CI
+job) rather than only when the build starts complaining.
+
+The `CIDR_CACHE` KV namespace persists independently of the Worker's code,
+so a redeploy inherits whatever's already cached rather than starting cold
+again — the bootstrap only matters for the very first deploy against a
+genuinely empty namespace.
 
 ### 3. Configure Mercurygram
 
@@ -92,10 +102,11 @@ cargo test --features integration-tests --test integration
 `wrangler.toml`'s own `[build]` command — no separate step needed.)
 
 This covers what the unit tests structurally can't reach — routing, header
-reading, KV, Durable Object correlation, and real outbound `fetch()`s — and
-is what actually caught the redirect-forwarding bug noted under Security
-notes below. Gated behind the `integration-tests` feature since it needs
-Node/npm installed — a plain `cargo test` doesn't build or run it at all.
+reading, KV, Durable Object correlation, and real outbound `fetch()`s, and
+is what verifies the redirect-rejection mitigation under Security notes
+below (a plain unit test can't drive a real `fetch()` redirect). Gated
+behind the `integration-tests` feature since it needs Node/npm installed —
+a plain `cargo test` doesn't build or run it at all.
 Unix-only (process groups aren't portable); compiles to an empty, harmless
 test binary on other platforms.
 
@@ -107,18 +118,28 @@ npx wrangler dev
 
 ## Security notes
 
-Reviewed under an adversarial threat model before first deploy; three real
-bugs were found and fixed (an IPv6-literal bypass of the private-IP filter
-in `is_ip_safe`, a panic-on-attacker-input DoS in the path percent-decoder,
-and — found via the integration test suite, not the review — a distributor
-redirecting the forward request bypassing the SSRF check done on the
-original URL, fixed by forwarding with `redirect: manual` and rejecting any
-3xx response outright instead of following it), plus a body-size cap and
-Telegram IP filtering were added. The relay validates all inbound requests
-against Telegram's published CIDR ranges (a recognized IP never triggers a
-fetch; an unrecognized one triggers at most one re-fetch attempt per day);
-requests
-from non-Telegram IPs are rejected at the edge.
+The relay validates all inbound requests against Telegram's published CIDR
+ranges before forwarding anything (a recognized IP never triggers a fetch;
+an unrecognized one triggers at most one re-fetch attempt per day); requests
+from non-Telegram IPs are rejected at the edge, before any Durable Object is
+even addressed.
+
+Mitigations in place against a few specific threats:
+
+- **SSRF via the forwarding target**: `validate_endpoint`/`is_ip_safe`
+  reject literal private, loopback, link-local, and other non-public IP
+  ranges for both IPv4 and IPv6 equally, so a target URL can't point the
+  relay's outbound `fetch()` at internal infrastructure.
+- **SSRF via a redirecting distributor**: forwarding uses `redirect: manual`
+  and rejects any 3xx response from the distributor outright rather than
+  following it — the SSRF check above only validated the *original* target,
+  so blindly following a redirect would let a malicious distributor route
+  the request somewhere that check never saw.
+- **Malformed input causing a panic**: the percent-decoder used on the PUT
+  leg's path rejects invalid percent-encoded sequences with an error rather
+  than panicking on attacker-controlled input.
+- **Oversized payloads**: request bodies over `MAX_BODY_BYTES` (16KB, well
+  above real Telegram `WebPush` ciphertext sizes) are rejected outright.
 
 Known residual gaps, accepted rather than fixed:
 
@@ -127,10 +148,23 @@ Known residual gaps, accepted rather than fixed:
   gives no hook to validate the resolved address at connect time the way
   the original proxy's custom DNS resolver does. In practice, setting your
   distributor to a real hostname (not a literal IP) mitigates this.
-- **Durable Object cost multiplier**: each distinct target-URL string gets
-  its own billed Durable Object instance, so varying the target is cheaper
-  for an attacker than for the account owner. This is a cost-nuisance risk
-  on free tier, not a data or availability risk.
+- **Durable Object cost scaling**: each distinct target-URL gets its own
+  billed Durable Object instance, but that's only reachable after the
+  Telegram-IP check passes — an external attacker can't reach it at all, so
+  this is cost scaling with genuine usage (more real distributor targets in
+  use), not an attacker-controlled cost multiplier.
+
+## Logging and privacy
+
+Every rejection logs its reason and the client IP. A successful forward logs
+the distributor's *host* only — never the full target URL, path, or query
+string, since UnifiedPush endpoint URLs are bearer-capability tokens: logging
+one would be logging a credential. Forward logs also include the request
+body size and both the distributor's response status and the relay's own.
+CIDR-list fetch attempts log their outcome (success and entry count, a 304,
+or the specific failure reason) but nothing about the request that triggered
+them. Nothing here is stored beyond Cloudflare's normal `wrangler tail`/log
+retention — the relay itself keeps no logs of its own.
 
 ## License
 

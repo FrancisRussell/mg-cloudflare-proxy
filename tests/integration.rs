@@ -160,7 +160,7 @@ impl WranglerDev {
             .expect("failed to run worker-build");
         assert!(status.success(), "worker-build failed");
 
-        let persist_dir = std::env::temp_dir().join(format!("mg-edge-relay-test-{}", std::process::id()));
+        let persist_dir = std::env::temp_dir().join(format!("mg-cloudflare-relay-test-{}", std::process::id()));
         std::fs::create_dir_all(&persist_dir).expect("failed to create --persist-to directory");
 
         let port = pick_free_port();

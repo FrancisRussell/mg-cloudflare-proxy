@@ -1,4 +1,4 @@
-name = "mg-edge-relay"
+name = "mercurygram-relay"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-09-01"
 
