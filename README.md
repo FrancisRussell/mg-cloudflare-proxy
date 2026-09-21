@@ -163,7 +163,7 @@ is kept current on demand:
 - A recognized IP is accepted without any fetch.
 - An unrecognized IP against a list more than a day old triggers a fetch, so
   a newly added Telegram range is picked up promptly; at most one such fetch
-  per day.
+  per day (excluding issues with Telegram's servers).
 - A recognized IP against a list about a month old still gets an immediate
   answer, but triggers a background fetch, so a range Telegram has dropped
   can't stay trusted indefinitely.
@@ -182,8 +182,8 @@ Mitigations in place against a few specific threats:
   so blindly following a redirect would let a malicious push server route
   the request somewhere that check never saw.
 - **Malformed input causing a panic**: the percent-decoder used on the PUT
-  leg's path rejects invalid percent-encoded sequences with an error rather
-  than panicking on attacker-controlled input.
+  leg's path rejects sequences that decode to invalid UTF-8 rather than
+  panicking on attacker-controlled input.
 - **Oversized payloads**: request bodies over `MAX_BODY_BYTES` (16KB, well
   above real Telegram `WebPush` ciphertext sizes) are rejected outright.
 
