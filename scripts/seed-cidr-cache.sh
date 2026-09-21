@@ -29,7 +29,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT" # Wrangler finds wrangler.toml from here.
 FETCH_URL="${CIDR_LIST_URL:-https://core.telegram.org/resources/cidr.txt}"
-CACHE_DIR="${CIDR_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/mg-cloudflare-relay}"
+CACHE_DIR="${CIDR_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/mg-cloudflare-proxy}"
 LOCAL_LIST="$CACHE_DIR/telegram-cidrs.txt"
 KV_BINDING="CIDR_CACHE"
 LIST_KEY="telegram_cidrs"

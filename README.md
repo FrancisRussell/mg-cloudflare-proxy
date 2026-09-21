@@ -1,14 +1,14 @@
-# mg-cloudflare-relay
+# mg-cloudflare-proxy
 
 Adapts Mercurygram's legacy Telegram WebPush (aesgcm Draft-04) push
 notifications into UnifiedPush. Deploy it under your own Cloudflare account
-(as a Worker named `mercurygram-relay` by default) instead of routing
+(as a Worker named `mercurygram-proxy` by default) instead of routing
 through Mercurygram's own public gateway,
 [Mercurygram/aesgcm-proxy](https://github.com/Mercurygram/aesgcm-proxy).
 
 Reimplements aesgcm-proxy's `/aesgcm` and PUT routes (see [NOTICE](./NOTICE)
 for exactly what was ported). Does not implement the `/fcm/<token>`
-(VAPID/FCM) leg — this relay targets a real UnifiedPush distributor (e.g.
+(VAPID/FCM) leg — this proxy targets a real UnifiedPush distributor (e.g.
 [Sunup](https://codeberg.org/Sunup/android), self-hosted
 [ntfy](https://ntfy.sh)) directly.
 
@@ -29,7 +29,7 @@ See the doc comment at the top of `src/correlator.rs`.
 ### 1. Create a KV namespace
 
 Log in to your Cloudflare dashboard and create a new KV namespace (Workers &
-AI → KV → Create namespace). Choose a name like `mercurygram-relay` and note
+AI → KV → Create namespace). Choose a name like `mercurygram-proxy` and note
 the namespace ID and preview ID — the `CIDR_CACHE` binding name is what the
 code actually keys off, so the namespace's own name is free to stay generic
 even though it's currently only used for the CIDR cache.
@@ -54,7 +54,7 @@ npx wrangler login
 
 ### 3. Seed the Telegram CIDR cache
 
-The relay only accepts requests from Telegram's published IP ranges, cached
+The proxy only accepts requests from Telegram's published IP ranges, cached
 in the `CIDR_CACHE` namespace. Fill it before the first deploy so the Worker
 starts with a warm cache rather than every early request fetching the list
 at once:
@@ -64,7 +64,7 @@ npm run seed-cidr
 ```
 
 This fetches the list from Telegram (needs network access) into
-`~/.cache/mg-cloudflare-relay/` (`$XDG_CACHE_HOME` if set) and uploads it,
+`~/.cache/mg-cloudflare-proxy/` (`$XDG_CACHE_HOME` if set) and uploads it,
 with its fetch time, to the namespace. Repeated runs reuse the local copy for a day rather than hitting Telegram again, and
 skip the upload if the namespace already holds a list at least as new. Delete
 that directory to force a fresh fetch. The namespace outlives redeploys, so the
@@ -127,7 +127,7 @@ npx wrangler dev
 
 ## Security notes
 
-The relay validates all inbound requests against Telegram's published CIDR
+The proxy validates all inbound requests against Telegram's published CIDR
 ranges before forwarding anything; requests from non-Telegram IPs are
 rejected at the edge, before any Durable Object is even addressed. The list
 is kept current on demand:
@@ -147,7 +147,7 @@ Mitigations in place against a few specific threats:
 - **SSRF via the forwarding target**: `validate_endpoint`/`is_ip_safe`
   reject literal private, loopback, link-local, and other non-public IP
   ranges for both IPv4 and IPv6 equally, so a target URL can't point the
-  relay's outbound `fetch()` at internal infrastructure.
+  proxy's outbound `fetch()` at internal infrastructure.
 - **SSRF via a redirecting distributor**: forwarding uses `redirect: manual`
   and rejects any 3xx response from the distributor outright rather than
   following it — the SSRF check above only validated the *original* target,
@@ -178,11 +178,11 @@ Every rejection logs its reason and the client IP. A successful forward logs
 the distributor's *host* only — never the full target URL, path, or query
 string, since UnifiedPush endpoint URLs are bearer-capability tokens: logging
 one would be logging a credential. Forward logs also include the request
-body size and both the distributor's response status and the relay's own.
+body size and both the distributor's response status and the proxy's own.
 CIDR-list fetch attempts log their outcome (success and entry count, a 304,
 or the specific failure reason) but nothing about the request that triggered
 them. Nothing here is stored beyond Cloudflare's normal `wrangler tail`/log
-retention — the relay itself keeps no logs of its own.
+retention — the proxy itself keeps no logs of its own.
 
 ## License
 

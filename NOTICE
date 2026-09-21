@@ -1,8 +1,8 @@
-mg-cloudflare-relay
+mg-cloudflare-proxy
 Copyright 2026 Francis
 
 This software reimplements, for the Cloudflare Workers platform, the
-`/aesgcm` and PUT relay routes of:
+`/aesgcm` and PUT routes of:
 
     Mercurygram/aesgcm-proxy
     <https://github.com/Mercurygram/aesgcm-proxy>
@@ -38,7 +38,7 @@ Specifically ported or directly derived from that project's src/main.rs:
     `post_and_record`.
 
 Not ported: aesgcm-proxy's `/fcm/<token>` route and VAPID signing
-(src/fcm.rs) — this relay targets UnifiedPush distributors directly and
+(src/fcm.rs) — this proxy targets UnifiedPush distributors directly and
 has no FCM leg.
 
 This NOTICE file is provided for informational purposes and does not

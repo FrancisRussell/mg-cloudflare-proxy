@@ -168,7 +168,7 @@ impl WranglerDev {
             .expect("failed to run worker-build");
         assert!(status.success(), "worker-build failed");
 
-        let persist_dir = std::env::temp_dir().join(format!("mg-cloudflare-relay-test-{}", std::process::id()));
+        let persist_dir = std::env::temp_dir().join(format!("mg-cloudflare-proxy-test-{}", std::process::id()));
         std::fs::create_dir_all(&persist_dir).expect("failed to create --persist-to directory");
 
         let port = pick_free_port();
@@ -326,7 +326,7 @@ struct MockDistributor {
 impl MockDistributor {
     /// Starts a mock distributor. If `redirect_to` is set, every request
     /// gets a redirect pointing there instead of a plain 200 -- for testing
-    /// that the relay won't follow a distributor's attempt to redirect it
+    /// that the proxy won't follow a distributor's attempt to redirect it
     /// somewhere its SSRF check on the original URL never validated.
     ///
     /// Its background thread and `tiny_http::Server` are never explicitly
@@ -365,7 +365,7 @@ impl MockDistributor {
         Self { port, request_count, last_body }
     }
 
-    /// This must be a hostname, not a literal IP: the relay's SSRF check
+    /// This must be a hostname, not a literal IP: the proxy's SSRF check
     /// (`validate_endpoint`/`is_ip_safe`) rejects literal loopback IPs like
     /// 127.0.0.1 outright, but only checks literal IPs -- a hostname like
     /// "localhost" passes that check untouched (the documented DNS-rebinding
@@ -381,7 +381,7 @@ impl MockDistributor {
 /// A minimal HTTP server standing in for Telegram's CIDR list endpoint,
 /// serving a body that tests can change, and recording how many times it was
 /// hit and the `If-Modified-Since` (if any) the latest request carried --
-/// used to verify the relay only fetches when it actually needs to, and
+/// used to verify the proxy only fetches when it actually needs to, and
 /// sends a conditional header only when it has a genuine fetch to refer to.
 /// Never answers 304.
 ///
@@ -484,9 +484,9 @@ fn integration_test() {
     post_suppresses_following_put(port);
 }
 
-/// PUTs to a throwaway distributor from `client_ip`, returning the relay's
+/// PUTs to a throwaway distributor from `client_ip`, returning the proxy's
 /// status. What the distributor does with it doesn't matter to the CIDR
-/// scenarios, only whether the relay let the request through.
+/// scenarios, only whether the proxy let the request through.
 fn put_from(port: u16, client_ip: &str) -> u16 {
     let distributor = MockDistributor::start(None);
     let resp = ureq::put(&worker_url(port, &format!("/{}", encode(&distributor.url()))))
@@ -668,7 +668,7 @@ fn rejects_redirecting_distributor(port: u16) {
     assert_eq!(
         distributor.request_count(),
         1,
-        "the relay should have actually dialed the distributor and seen its 302"
+        "the proxy should have actually dialed the distributor and seen its 302"
     );
 }
 

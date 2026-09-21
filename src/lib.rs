@@ -4,9 +4,9 @@
 // would be noise.
 #![allow(clippy::wildcard_imports, clippy::missing_errors_doc)]
 //
-// Web Push relay for a UnifiedPush distributor (e.g. Sunup, ntfy): folds the
-// `Encryption`/`Crypto-Key` headers Telegram sends into the body, since
-// UnifiedPush distributors strip headers. See src/correlator.rs for the
+// Web Push rewrite proxy for a UnifiedPush distributor (e.g. Sunup, ntfy):
+// folds the `Encryption`/`Crypto-Key` headers Telegram sends into the body,
+// since UnifiedPush distributors strip headers. See src/correlator.rs for the
 // wake-up correlation this depends on. No FCM/VAPID leg — only real
 // UnifiedPush distributors are targeted.
 

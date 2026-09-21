@@ -1,8 +1,8 @@
 {
-  "name": "mg-cloudflare-relay",
+  "name": "mg-cloudflare-proxy",
   "version": "0.1.0",
   "private": true,
-  "description": "Mercurygram legacy WebPush (aesgcm Draft-04) to UnifiedPush relay, deployed as a Cloudflare Worker.",
+  "description": "Mercurygram legacy WebPush (aesgcm Draft-04) to UnifiedPush rewrite proxy, deployed as a Cloudflare Worker.",
   "scripts": {
     "dev": "wrangler dev",
     "seed-cidr": "bash scripts/seed-cidr-cache.sh",

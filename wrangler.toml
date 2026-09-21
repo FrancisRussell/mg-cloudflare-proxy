@@ -1,4 +1,4 @@
-name = "mercurygram-relay"
+name = "mercurygram-proxy"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-09-01"
 
