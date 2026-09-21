@@ -56,12 +56,12 @@ const TELEGRAM_IP: &str = "91.108.56.1";
 
 /// KV keys and binding the Worker caches the CIDR list under. Must match
 /// `CIDR_LIST_KV_KEY`, `CIDR_LIST_FETCHED_AT_KV_KEY`,
-/// `CIDR_LIST_ATTEMPTED_AT_KV_KEY` and `CIDR_CACHE_KV_BINDING` in src/, which
+/// `CIDR_LIST_FAILED_AT_KV_KEY` and `CIDR_CACHE_KV_BINDING` in src/, which
 /// this test can't import (the crate only builds for wasm).
 const CIDR_CACHE_BINDING: &str = "CIDR_CACHE";
 const CIDR_LIST_KV_KEY: &str = "telegram_cidrs";
 const CIDR_LIST_FETCHED_AT_KV_KEY: &str = "telegram_cidrs_fetched_at";
-const CIDR_LIST_ATTEMPTED_AT_KV_KEY: &str = "telegram_cidrs_attempted_at";
+const CIDR_LIST_FAILED_AT_KV_KEY: &str = "telegram_cidrs_failed_at";
 
 /// Cache ages that put the cache in each freshness class whatever the Worker's
 /// jitter draws: past the fresh window but well inside the force-refetch
@@ -74,6 +74,10 @@ const VERY_STALE_CACHE_AGE: Duration = Duration::from_hours(31 * 24);
 const TEST_RESPONSE_BUDGET: Duration = Duration::from_secs(3);
 /// How far past the response budget a timeout answer may arrive.
 const BUDGET_TOLERANCE: Duration = Duration::from_millis(1500);
+
+/// A time since a failed fetch that is past the retry interval whatever its
+/// jitter.
+const LONG_AFTER_FAILURE: Duration = Duration::from_hours(8);
 
 /// A body size comfortably over the Worker's request body limit.
 const OVERSIZED_BODY_BYTES: usize = 64 * 1024;
@@ -329,10 +333,12 @@ impl WranglerDev {
         self.run_against_local_kv(cmd, "wrangler kv bulk delete");
     }
 
-    /// Sets when Telegram last confirmed the cached list and when a fetch was
-    /// last attempted, in one wrangler call.
-    fn set_cidr_times(&self, fetched_at: &str, attempted_at: &str) {
-        self.kv_put_many(&[(CIDR_LIST_FETCHED_AT_KV_KEY, fetched_at), (CIDR_LIST_ATTEMPTED_AT_KV_KEY, attempted_at)]);
+    /// Sets when Telegram last confirmed the cached list and when the last
+    /// fetch failed, in one wrangler call. A failure time that isn't later than
+    /// the confirmation counts as no failure, which is how a scenario clears
+    /// one without a separate delete.
+    fn set_cidr_times(&self, fetched_at: &str, failed_at: &str) {
+        self.kv_put_many(&[(CIDR_LIST_FETCHED_AT_KV_KEY, fetched_at), (CIDR_LIST_FAILED_AT_KV_KEY, failed_at)]);
     }
 
     /// Runs `cmd` with the flags that point wrangler's KV commands at the
@@ -668,7 +674,7 @@ fn integration_test() {
     unrecognized_ip_against_stale_cache_fetches(port, &mut dev, &cidr_server);
     refresh_consults_kv_before_fetching(port, &mut dev, &cidr_server);
     failed_fetch_does_not_advance_the_confirmed_time(port, &mut dev, &cidr_server);
-    unreachable_telegram_records_an_attempt_and_holds_off_the_next(port, &mut dev, &cidr_server);
+    unreachable_telegram_records_a_failure_and_holds_off_the_next(port, &mut dev, &cidr_server);
     silent_telegram_holds_up_the_request_only_for_the_budget(port, &mut dev, &cidr_server);
     concurrent_unrecognized_ips_share_one_refresh(port, &mut dev, &cidr_server);
     recognized_ip_against_very_stale_cache_refetches_in_background(port, &mut dev, &cidr_server);
@@ -838,7 +844,7 @@ fn unrecognized_ip_against_stale_cache_fetches(port: u16, dev: &mut WranglerDev,
     assert_eq!(cidr_server.request_count(), fetches_before + 1, "the refresh should have made the cache fresh again");
 }
 
-/// A fetch that fails is recorded as an attempt, which holds off further
+/// A fetch that fails is recorded as a failure, which holds off further
 /// fetches, but leaves the time Telegram last confirmed the list alone. That
 /// time is what the next refresh sends as `If-Modified-Since`: advancing it on
 /// a failure would let Telegram answer 304 for changes made since the list was
@@ -856,12 +862,14 @@ fn failed_fetch_does_not_advance_the_confirmed_time(port: u16, dev: &mut Wrangle
     let if_modified_since_before_failure = cidr_server.last_if_modified_since();
     assert!(if_modified_since_before_failure.is_some());
     assert_eq!(dev.kv_get(CIDR_LIST_FETCHED_AT_KV_KEY).trim(), confirmed_at, "a failed fetch confirmed nothing");
-    assert_ne!(dev.kv_get(CIDR_LIST_ATTEMPTED_AT_KV_KEY).trim(), confirmed_at, "the attempt should be recorded");
+    assert_ne!(dev.kv_get(CIDR_LIST_FAILED_AT_KV_KEY).trim(), confirmed_at, "the failure should be recorded");
 
     assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 503);
-    assert_eq!(cidr_server.request_count(), fetches_before + 1, "the failed attempt should hold off another");
+    assert_eq!(cidr_server.request_count(), fetches_before + 1, "the failure should hold off another fetch");
 
-    dev.kv_put(CIDR_LIST_ATTEMPTED_AT_KV_KEY, &confirmed_at);
+    // The retry interval has passed: only the failure's age matters now, not
+    // the list's.
+    dev.kv_put(CIDR_LIST_FAILED_AT_KV_KEY, &fetched_at_value(LONG_AFTER_FAILURE));
     dev.restart();
     cidr_server.set_status(StatusCode::OK);
     assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403);
@@ -871,12 +879,16 @@ fn failed_fetch_does_not_advance_the_confirmed_time(port: u16, dev: &mut Wrangle
         if_modified_since_before_failure,
         "the refresh after a failure should still be conditioned on when the list was last confirmed"
     );
+    assert!(
+        dev.kv_get(CIDR_LIST_FAILED_AT_KV_KEY).trim().parse::<u64>().is_err(),
+        "a successful fetch should clear the recorded failure"
+    );
 }
 
-/// Telegram not answering at all is recorded as an attempt like any other
+/// Telegram not answering at all is recorded as a failure like any other
 /// failure, so an outage isn't hit by every request; once the retry interval
 /// has passed the next request tries again.
-fn unreachable_telegram_records_an_attempt_and_holds_off_the_next(
+fn unreachable_telegram_records_a_failure_and_holds_off_the_next(
     port: u16, dev: &mut WranglerDev, cidr_server: &MockCidrServer,
 ) {
     let confirmed_at = fetched_at_value(STALE_CACHE_AGE);
@@ -888,13 +900,13 @@ fn unreachable_telegram_records_an_attempt_and_holds_off_the_next(
     assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 503);
     assert_eq!(cidr_server.request_count(), fetches_before + 1);
     assert_eq!(dev.kv_get(CIDR_LIST_FETCHED_AT_KV_KEY).trim(), confirmed_at, "nothing was confirmed");
-    assert_ne!(dev.kv_get(CIDR_LIST_ATTEMPTED_AT_KV_KEY).trim(), confirmed_at, "the attempt should be recorded");
+    assert_ne!(dev.kv_get(CIDR_LIST_FAILED_AT_KV_KEY).trim(), confirmed_at, "the failure should be recorded");
 
     assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 503);
-    assert_eq!(cidr_server.request_count(), fetches_before + 1, "the failed attempt should hold off another");
+    assert_eq!(cidr_server.request_count(), fetches_before + 1, "the failure should hold off another fetch");
 
     cidr_server.set_unreachable(false);
-    dev.kv_put(CIDR_LIST_ATTEMPTED_AT_KV_KEY, &confirmed_at);
+    dev.kv_put(CIDR_LIST_FAILED_AT_KV_KEY, &fetched_at_value(LONG_AFTER_FAILURE));
     dev.restart();
     assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403);
     assert_eq!(
@@ -907,7 +919,7 @@ fn unreachable_telegram_records_an_attempt_and_holds_off_the_next(
 /// A Telegram endpoint that accepts the connection and never answers holds up
 /// the request only for the response budget, which then gets a 503. The
 /// refresh carries on in the background until the fetch times out, and its
-/// attempt is recorded then.
+/// failure is recorded then.
 fn silent_telegram_holds_up_the_request_only_for_the_budget(
     port: u16, dev: &mut WranglerDev, cidr_server: &MockCidrServer,
 ) {
@@ -933,11 +945,11 @@ fn silent_telegram_holds_up_the_request_only_for_the_budget(
 
     assert_eq!(status, 503, "an IP that can't be judged because Telegram hasn't answered");
     assert!(elapsed <= TEST_RESPONSE_BUDGET + BUDGET_TOLERANCE, "answered long after the budget: {elapsed:?}");
-    assert_eq!(dev.kv_get(CIDR_LIST_ATTEMPTED_AT_KV_KEY).trim(), confirmed_at, "the fetch is still running");
+    assert_eq!(dev.kv_get(CIDR_LIST_FAILED_AT_KV_KEY).trim(), confirmed_at, "the fetch is still running");
 
     let give_up = Instant::now() + BACKGROUND_FETCH_PATIENCE;
-    while dev.kv_get(CIDR_LIST_ATTEMPTED_AT_KV_KEY).trim() == confirmed_at {
-        assert!(Instant::now() < give_up, "the background refresh never recorded its attempt");
+    while dev.kv_get(CIDR_LIST_FAILED_AT_KV_KEY).trim() == confirmed_at {
+        assert!(Instant::now() < give_up, "the background refresh never recorded its failure");
         std::thread::sleep(POLL_INTERVAL);
     }
 }
@@ -974,7 +986,7 @@ fn refresh_consults_kv_before_fetching(port: u16, dev: &mut WranglerDev, cidr_se
     dev.kv_put_many(&[
         (CIDR_LIST_KV_KEY, &format!("{TELEGRAM_CIDR_RANGE}\n{MOCK_CIDR_IP_A}\n{MOCK_CIDR_IP_B}")),
         (CIDR_LIST_FETCHED_AT_KV_KEY, &just_now),
-        (CIDR_LIST_ATTEMPTED_AT_KV_KEY, &just_now),
+        (CIDR_LIST_FAILED_AT_KV_KEY, &just_now),
     ]);
 
     assert_eq!(put_from(port, MOCK_CIDR_IP_B), 201, "the newer list in KV should be adopted");
@@ -1017,7 +1029,7 @@ fn recognized_ip_against_very_stale_cache_refetches_in_background(
 fn unrecognized_ip_against_empty_cache_fetches_unconditionally(
     port: u16, dev: &mut WranglerDev, cidr_server: &MockCidrServer,
 ) {
-    dev.kv_delete_many(&[CIDR_LIST_KV_KEY, CIDR_LIST_FETCHED_AT_KV_KEY, CIDR_LIST_ATTEMPTED_AT_KV_KEY]);
+    dev.kv_delete_many(&[CIDR_LIST_KV_KEY, CIDR_LIST_FETCHED_AT_KV_KEY, CIDR_LIST_FAILED_AT_KV_KEY]);
     dev.restart();
     let fetches_before = cidr_server.request_count();
 
