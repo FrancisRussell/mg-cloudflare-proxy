@@ -294,8 +294,7 @@ impl WranglerDev {
     /// answered at all, `age` ago, then restarts so the Worker loads that.
     fn age_cidr_cache_and_restart(&mut self, age: Duration) {
         let timestamp = fetched_at_value(age);
-        self.kv_put(CIDR_LIST_FETCHED_AT_KV_KEY, &timestamp);
-        self.kv_put(CIDR_LIST_ATTEMPTED_AT_KV_KEY, &timestamp);
+        self.set_cidr_times(&timestamp, &timestamp);
         self.restart();
     }
 
@@ -303,6 +302,37 @@ impl WranglerDev {
         let mut cmd = Command::new("npx");
         cmd.args(["wrangler", "kv", "key", "delete", "--binding", CIDR_CACHE_BINDING, key]);
         self.run_against_local_kv(cmd, "wrangler kv key delete");
+    }
+
+    /// Writes several keys in one wrangler call. Each call pays wrangler's
+    /// whole startup, so writing keys together is much quicker than a
+    /// `kv_put` apiece.
+    fn kv_put_many(&self, entries: &[(&str, &str)]) {
+        let file = self.persist_dir.join("bulk-put.json");
+        let objects: Vec<String> = entries
+            .iter()
+            .map(|(key, value)| format!("{{\"key\":{},\"value\":{}}}", json_string(key), json_string(value)))
+            .collect();
+        std::fs::write(&file, format!("[{}]", objects.join(","))).expect("failed to write the bulk put file");
+        let mut cmd = Command::new("npx");
+        cmd.args(["wrangler", "kv", "bulk", "put"]).arg(&file).args(["--binding", CIDR_CACHE_BINDING]);
+        self.run_against_local_kv(cmd, "wrangler kv bulk put");
+    }
+
+    /// Deletes several keys in one wrangler call; see `kv_put_many`.
+    fn kv_delete_many(&self, keys: &[&str]) {
+        let file = self.persist_dir.join("bulk-delete.json");
+        let quoted: Vec<String> = keys.iter().map(|key| json_string(key)).collect();
+        std::fs::write(&file, format!("[{}]", quoted.join(","))).expect("failed to write the bulk delete file");
+        let mut cmd = Command::new("npx");
+        cmd.args(["wrangler", "kv", "bulk", "delete"]).arg(&file).args(["--binding", CIDR_CACHE_BINDING, "--force"]);
+        self.run_against_local_kv(cmd, "wrangler kv bulk delete");
+    }
+
+    /// Sets when Telegram last confirmed the cached list and when a fetch was
+    /// last attempted, in one wrangler call.
+    fn set_cidr_times(&self, fetched_at: &str, attempted_at: &str) {
+        self.kv_put_many(&[(CIDR_LIST_FETCHED_AT_KV_KEY, fetched_at), (CIDR_LIST_ATTEMPTED_AT_KV_KEY, attempted_at)]);
     }
 
     /// Runs `cmd` with the flags that point wrangler's KV commands at the
@@ -675,6 +705,27 @@ fn fetched_at_value(age: Duration) -> String {
     fetched_at.duration_since(std::time::UNIX_EPOCH).expect("the clock is after the epoch").as_millis().to_string()
 }
 
+/// `value` as a JSON string literal.
+fn json_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                use std::fmt::Write as _;
+                write!(out, "\\u{:04x}", u32::from(c)).expect("writing to a String can't fail");
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Polls until `condition` holds, for observing effects of a `ctx.wait_until`
 /// task, which finishes after the response has already been sent.
 fn wait_for(what: &str, condition: impl Fn() -> bool) {
@@ -795,8 +846,7 @@ fn unrecognized_ip_against_stale_cache_fetches(port: u16, dev: &mut WranglerDev,
 /// the refresh failed, an unrecognized IP can't be judged, so it gets a 503.
 fn failed_fetch_does_not_advance_the_confirmed_time(port: u16, dev: &mut WranglerDev, cidr_server: &MockCidrServer) {
     let confirmed_at = fetched_at_value(STALE_CACHE_AGE);
-    dev.kv_put(CIDR_LIST_FETCHED_AT_KV_KEY, &confirmed_at);
-    dev.kv_put(CIDR_LIST_ATTEMPTED_AT_KV_KEY, &confirmed_at);
+    dev.set_cidr_times(&confirmed_at, &confirmed_at);
     dev.restart();
     cidr_server.set_status(StatusCode::SERVICE_UNAVAILABLE);
     let fetches_before = cidr_server.request_count();
@@ -830,8 +880,7 @@ fn unreachable_telegram_records_an_attempt_and_holds_off_the_next(
     port: u16, dev: &mut WranglerDev, cidr_server: &MockCidrServer,
 ) {
     let confirmed_at = fetched_at_value(STALE_CACHE_AGE);
-    dev.kv_put(CIDR_LIST_FETCHED_AT_KV_KEY, &confirmed_at);
-    dev.kv_put(CIDR_LIST_ATTEMPTED_AT_KV_KEY, &confirmed_at);
+    dev.set_cidr_times(&confirmed_at, &confirmed_at);
     dev.restart();
     cidr_server.set_unreachable(true);
     let fetches_before = cidr_server.request_count();
@@ -868,8 +917,7 @@ fn silent_telegram_holds_up_the_request_only_for_the_budget(
     const BACKGROUND_FETCH_PATIENCE: Duration = Duration::from_secs(30);
 
     let confirmed_at = fetched_at_value(STALE_CACHE_AGE);
-    dev.kv_put(CIDR_LIST_FETCHED_AT_KV_KEY, &confirmed_at);
-    dev.kv_put(CIDR_LIST_ATTEMPTED_AT_KV_KEY, &confirmed_at);
+    dev.set_cidr_times(&confirmed_at, &confirmed_at);
     dev.restart();
     cidr_server.set_silent(true);
 
@@ -922,9 +970,12 @@ fn refresh_consults_kv_before_fetching(port: u16, dev: &mut WranglerDev, cidr_se
     let fetches_before = cidr_server.request_count();
 
     // Meanwhile, another isolate refreshed the list, which now includes B.
-    dev.kv_put(CIDR_LIST_KV_KEY, &format!("{TELEGRAM_CIDR_RANGE}\n{MOCK_CIDR_IP_A}\n{MOCK_CIDR_IP_B}"));
-    dev.kv_put(CIDR_LIST_FETCHED_AT_KV_KEY, &fetched_at_value(Duration::ZERO));
-    dev.kv_put(CIDR_LIST_ATTEMPTED_AT_KV_KEY, &fetched_at_value(Duration::ZERO));
+    let just_now = fetched_at_value(Duration::ZERO);
+    dev.kv_put_many(&[
+        (CIDR_LIST_KV_KEY, &format!("{TELEGRAM_CIDR_RANGE}\n{MOCK_CIDR_IP_A}\n{MOCK_CIDR_IP_B}")),
+        (CIDR_LIST_FETCHED_AT_KV_KEY, &just_now),
+        (CIDR_LIST_ATTEMPTED_AT_KV_KEY, &just_now),
+    ]);
 
     assert_eq!(put_from(port, MOCK_CIDR_IP_B), 201, "the newer list in KV should be adopted");
     assert_eq!(cidr_server.request_count(), fetches_before, "and Telegram shouldn't have been asked");
@@ -966,9 +1017,7 @@ fn recognized_ip_against_very_stale_cache_refetches_in_background(
 fn unrecognized_ip_against_empty_cache_fetches_unconditionally(
     port: u16, dev: &mut WranglerDev, cidr_server: &MockCidrServer,
 ) {
-    dev.kv_delete(CIDR_LIST_KV_KEY);
-    dev.kv_delete(CIDR_LIST_FETCHED_AT_KV_KEY);
-    dev.kv_delete(CIDR_LIST_ATTEMPTED_AT_KV_KEY);
+    dev.kv_delete_many(&[CIDR_LIST_KV_KEY, CIDR_LIST_FETCHED_AT_KV_KEY, CIDR_LIST_ATTEMPTED_AT_KV_KEY]);
     dev.restart();
     let fetches_before = cidr_server.request_count();
 
