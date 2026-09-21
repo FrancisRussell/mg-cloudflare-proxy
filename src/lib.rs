@@ -277,7 +277,13 @@ async fn call_correlator(env: &Env, endpoint: &url::Url, method: Method, body: V
     init.with_method(method).with_headers(headers).with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into()));
 
     let req = Request::new_with_init("https://do/relay", &init)?;
-    stub.fetch_with_request(req).await
+    match stub.fetch_with_request(req).await {
+        Ok(response) => Ok(response),
+        Err(e) => {
+            console_error!("correlator_call: outcome=failed error={e}");
+            error_response(StatusCode::SERVICE_UNAVAILABLE)
+        }
+    }
 }
 
 /// POST /aesgcm?e=<url-encoded-endpoint>
