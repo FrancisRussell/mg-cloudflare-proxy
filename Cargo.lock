@@ -455,7 +455,6 @@ dependencies = [
  "ipnetwork",
  "nix",
  "percent-encoding",
- "serde",
  "tiny_http",
  "ureq",
  "url",
