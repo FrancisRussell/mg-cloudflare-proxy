@@ -4,6 +4,7 @@ use std::pin::pin;
 use std::time::Duration;
 
 use futures_util::future::{select, Either};
+use http::StatusCode;
 use thiserror::Error;
 use worker::{AbortController, Delay, Error as WorkerError, Fetch, Request, Response};
 
@@ -53,9 +54,27 @@ pub(crate) async fn send_with_timeout(req: Request, timeout: Duration) -> std::r
     }
 }
 
+/// The status to answer the caller with when the server gave no answer: a
+/// gateway timeout if it was too slow, otherwise a bad gateway.
+impl From<FetchFailure> for StatusCode {
+    fn from(failure: FetchFailure) -> Self {
+        match failure {
+            FetchFailure::TimedOut => Self::GATEWAY_TIMEOUT,
+            FetchFailure::Dns | FetchFailure::Connection => Self::BAD_GATEWAY,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_failure_status() {
+        assert_eq!(StatusCode::from(FetchFailure::TimedOut), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(StatusCode::from(FetchFailure::Dns), StatusCode::BAD_GATEWAY);
+        assert_eq!(StatusCode::from(FetchFailure::Connection), StatusCode::BAD_GATEWAY);
+    }
 
     #[test]
     fn test_from_fetch_error_recognises_dns_failures() {

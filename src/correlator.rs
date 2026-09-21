@@ -20,7 +20,7 @@ use http::StatusCode;
 use worker::*;
 
 use crate::clock::{self, Deadline};
-use crate::outbound::{send_with_timeout, FetchFailure};
+use crate::outbound::send_with_timeout;
 
 /// Push headers from RFC 8030 that the `http` crate has no constant for.
 /// `HeaderName::from_static` is `const fn`, so these are checked and built at
@@ -236,7 +236,7 @@ async fn forward(target: &url::Url, body: Vec<u8>, deadline: Deadline) -> Result
         Ok(resp) => resp,
         Err(failure) => {
             console_error!("forward failed: host={host} reason={failure}");
-            return crate::error_response(failure_status(failure));
+            return crate::error_response(failure.into());
         }
     };
     let push_server_status = resp.status_code();
@@ -252,36 +252,27 @@ async fn forward(target: &url::Url, body: Vec<u8>, deadline: Deadline) -> Result
 
     let location = resp.headers().get(http::header::LOCATION.as_str())?;
     let retry_after = resp.headers().get(http::header::RETRY_AFTER.as_str())?;
-    let response = match forward_reply(push_server_status, location.as_deref(), retry_after.as_deref(), target.as_str())
-    {
-        ForwardReply::Created { location } => {
-            let headers = Headers::new();
-            headers.set(http::header::LOCATION.as_str(), &location)?;
-            Response::empty()?.with_status(StatusCode::CREATED.as_u16()).with_headers(headers)
-        }
-        ForwardReply::Failed { status, retry_after } => {
-            let headers = Headers::new();
-            if let Some(retry_after) = retry_after {
-                headers.set(http::header::RETRY_AFTER.as_str(), &retry_after)?;
+    let response =
+        match ForwardReply::new(push_server_status, location.as_deref(), retry_after.as_deref(), target.as_str()) {
+            ForwardReply::Created { location } => {
+                let headers = Headers::new();
+                headers.set(http::header::LOCATION.as_str(), &location)?;
+                Response::empty()?.with_status(StatusCode::CREATED.as_u16()).with_headers(headers)
             }
-            Response::empty()?.with_status(status).with_headers(headers)
-        }
-    };
+            ForwardReply::Failed { status, retry_after } => {
+                let headers = Headers::new();
+                if let Some(retry_after) = retry_after {
+                    headers.set(http::header::RETRY_AFTER.as_str(), &retry_after)?;
+                }
+                Response::empty()?.with_status(status).with_headers(headers)
+            }
+        };
 
     console_log!(
         "forwarded: host={host} body_size={body_size} push_server_status={push_server_status} our_status={}",
         response.status_code()
     );
     Ok(response)
-}
-
-/// The status to answer the caller with when the push server gave no answer:
-/// a gateway timeout if it was too slow, otherwise a bad gateway.
-fn failure_status(failure: FetchFailure) -> StatusCode {
-    match failure {
-        FetchFailure::TimedOut => StatusCode::GATEWAY_TIMEOUT,
-        FetchFailure::Dns | FetchFailure::Connection => StatusCode::BAD_GATEWAY,
-    }
 }
 
 /// How `forward` answers the caller once the push server has answered.
@@ -298,15 +289,17 @@ enum ForwardReply {
     Failed { status: u16, retry_after: Option<String> },
 }
 
-/// The reply for a push server that answered `status`, with the given
-/// `Location` and `Retry-After`. Any 2xx counts as accepted, since some
-/// senders back off on other 2xx codes; a missing `Location` falls back to
-/// `target`.
-fn forward_reply(status: u16, location: Option<&str>, retry_after: Option<&str>, target: &str) -> ForwardReply {
-    if StatusCode::from_u16(status).is_ok_and(|s| s.is_success()) {
-        ForwardReply::Created { location: location.map_or_else(|| target.to_string(), String::from) }
-    } else {
-        ForwardReply::Failed { status, retry_after: retry_after.map(String::from) }
+impl ForwardReply {
+    /// The reply for a push server that answered `status`, with the given
+    /// `Location` and `Retry-After`. Any 2xx counts as accepted, since some
+    /// senders back off on other 2xx codes; a missing `Location` falls back to
+    /// `target`.
+    fn new(status: u16, location: Option<&str>, retry_after: Option<&str>, target: &str) -> Self {
+        if StatusCode::from_u16(status).is_ok_and(|s| s.is_success()) {
+            Self::Created { location: location.map_or_else(|| target.to_string(), String::from) }
+        } else {
+            Self::Failed { status, retry_after: retry_after.map(String::from) }
+        }
     }
 }
 
@@ -348,24 +341,22 @@ mod tests {
     }
 
     #[test]
-    fn test_failure_status() {
-        assert_eq!(failure_status(FetchFailure::TimedOut), StatusCode::GATEWAY_TIMEOUT);
-        assert_eq!(failure_status(FetchFailure::Dns), StatusCode::BAD_GATEWAY);
-        assert_eq!(failure_status(FetchFailure::Connection), StatusCode::BAD_GATEWAY);
-    }
-
-    #[test]
     fn test_forward_reply_failure_passes_on_only_status_and_retry_after() {
         let target = "https://target.example";
         assert_eq!(
-            forward_reply(StatusCode::TOO_MANY_REQUESTS.as_u16(), Some("https://example.com/x"), Some("30"), target),
+            ForwardReply::new(
+                StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                Some("https://example.com/x"),
+                Some("30"),
+                target
+            ),
             ForwardReply::Failed {
                 status: StatusCode::TOO_MANY_REQUESTS.as_u16(),
                 retry_after: Some("30".to_string())
             }
         );
         assert_eq!(
-            forward_reply(StatusCode::NOT_FOUND.as_u16(), None, None, target),
+            ForwardReply::new(StatusCode::NOT_FOUND.as_u16(), None, None, target),
             ForwardReply::Failed { status: 404, retry_after: None }
         );
     }
@@ -373,7 +364,7 @@ mod tests {
     #[test]
     fn test_forward_reply_2xx_preserves_location() {
         assert_eq!(
-            forward_reply(StatusCode::OK.as_u16(), Some("https://example.com/x"), None, "https://target.example"),
+            ForwardReply::new(StatusCode::OK.as_u16(), Some("https://example.com/x"), None, "https://target.example"),
             ForwardReply::Created { location: "https://example.com/x".to_string() }
         );
     }
@@ -381,7 +372,7 @@ mod tests {
     #[test]
     fn test_forward_reply_2xx_falls_back_to_target() {
         assert_eq!(
-            forward_reply(StatusCode::NO_CONTENT.as_u16(), None, None, "https://target.example"),
+            ForwardReply::new(StatusCode::NO_CONTENT.as_u16(), None, None, "https://target.example"),
             ForwardReply::Created { location: "https://target.example".to_string() }
         );
     }
