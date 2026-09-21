@@ -109,18 +109,38 @@ fn millis_since_epoch(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
-/// True if `ip` is a Telegram IP. Checks the cached list first -- a
-/// recognized IP never triggers a *blocking* fetch. Only an unrecognized IP
-/// against a list older than `CIDR_LIST_MAX_AGE` (or a missing one) triggers
-/// one before answering: real Telegram traffic shouldn't pay for a round-trip
-/// to Telegram on every request, and a flood of unrecognized IPs shouldn't
-/// force more than one fetch per `CIDR_LIST_MAX_AGE` window.
+/// Whether a client IP is a Telegram IP.
+pub(crate) enum TelegramIpCheck {
+    Telegram,
+    NotTelegram,
+    /// The cache couldn't be read, so the question can't be answered. Not the
+    /// same as an empty cache, which is answered by fetching the list.
+    CacheUnavailable,
+}
+
+/// Checks `ip` against the cached list first -- a recognized IP never
+/// triggers a *blocking* fetch. Only an unrecognized IP against a list older
+/// than `CIDR_LIST_MAX_AGE` (or a missing one) triggers one before answering:
+/// real Telegram traffic shouldn't pay for a round-trip to Telegram on every
+/// request, and a flood of unrecognized IPs shouldn't force more than one
+/// fetch per `CIDR_LIST_MAX_AGE` window.
 ///
 /// A recognized IP against a *very* stale list still kicks off a re-fetch,
 /// but in the background via `ctx.wait_until`, so it never delays the
 /// response.
-pub(crate) async fn is_telegram_ip(kv: &KvStore, ip: std::net::IpAddr, fetch_url: &str, ctx: &Context) -> bool {
-    let cached = current_cidr_list(kv).await;
+///
+/// If the cache can't be read, nothing is fetched: a KV outage must not
+/// turn into a fetch per request.
+pub(crate) async fn is_telegram_ip(
+    kv: &KvStore, ip: std::net::IpAddr, fetch_url: &str, ctx: &Context,
+) -> TelegramIpCheck {
+    let cached = match current_cidr_list(kv).await {
+        Ok(cached) => cached,
+        Err(e) => {
+            console_error!("cidr_cache: outcome=failed reason=kv_read_error error={e}");
+            return TelegramIpCheck::CacheUnavailable;
+        }
+    };
     if is_telegram_ip_with_list(ip, &cached.list) {
         if matches!(cached.freshness, CidrListFreshness::VeryStale) {
             let kv = kv.clone();
@@ -129,15 +149,15 @@ pub(crate) async fn is_telegram_ip(kv: &KvStore, ip: std::net::IpAddr, fetch_url
                 fetch_fresh_cidr_list(&kv, &fetch_url, &cached.list, cached.if_modified_since.as_deref()).await;
             });
         }
-        return true;
+        return TelegramIpCheck::Telegram;
     }
     if matches!(cached.freshness, CidrListFreshness::Fresh) {
-        return false;
+        return TelegramIpCheck::NotTelegram;
     }
 
     match fetch_fresh_cidr_list(kv, fetch_url, &cached.list, cached.if_modified_since.as_deref()).await {
-        Some(fresh) => is_telegram_ip_with_list(ip, &fresh),
-        None => false,
+        Some(fresh) if is_telegram_ip_with_list(ip, &fresh) => TelegramIpCheck::Telegram,
+        _ => TelegramIpCheck::NotTelegram,
     }
 }
 
@@ -153,21 +173,23 @@ struct CachedCidrList {
     if_modified_since: Option<String>,
 }
 
-async fn current_cidr_list(kv: &KvStore) -> CachedCidrList {
-    let list = kv.get(CIDR_LIST_KV_KEY).text().await.ok().flatten();
-    let fetched_at = read_timestamp(kv, CIDR_LIST_FETCHED_AT_KV_KEY).await;
-    let attempted_at = read_timestamp(kv, CIDR_LIST_ATTEMPTED_AT_KV_KEY).await;
+/// The cache's contents, or an error if KV can't be read. Keys that are
+/// absent, or hold an unparseable timestamp, are treated as not cached.
+async fn current_cidr_list(kv: &KvStore) -> std::result::Result<CachedCidrList, KvError> {
+    let list = kv.get(CIDR_LIST_KV_KEY).text().await?;
+    let fetched_at = read_timestamp(kv, CIDR_LIST_FETCHED_AT_KV_KEY).await?;
+    let attempted_at = read_timestamp(kv, CIDR_LIST_ATTEMPTED_AT_KV_KEY).await?;
 
     let freshness = freshness_of(clock::now(), attempted_at, fetched_at, jittered_force_refetch_max_age());
     let if_modified_since = list.as_ref().and(fetched_at).map(http_date);
-    CachedCidrList { list: list.unwrap_or_default(), freshness, if_modified_since }
+    Ok(CachedCidrList { list: list.unwrap_or_default(), freshness, if_modified_since })
 }
 
-/// The millis-since-epoch timestamp stored under `key`, or `None` if it's
-/// absent or unreadable.
-async fn read_timestamp(kv: &KvStore, key: &str) -> Option<SystemTime> {
-    let value = kv.get(key).text().await.ok().flatten()?;
-    value.parse::<u64>().ok().map(|ms| UNIX_EPOCH + Duration::from_millis(ms))
+/// The millis-since-epoch timestamp stored under `key`; `None` if absent or
+/// unparseable.
+async fn read_timestamp(kv: &KvStore, key: &str) -> std::result::Result<Option<SystemTime>, KvError> {
+    let value = kv.get(key).text().await?;
+    Ok(value.and_then(|v| v.parse::<u64>().ok()).map(|ms| UNIX_EPOCH + Duration::from_millis(ms)))
 }
 
 /// Classifies the cache. `Fresh` means Telegram answered recently, so no

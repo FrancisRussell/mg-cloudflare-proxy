@@ -17,6 +17,7 @@ mod telegram_cidrs;
 pub use correlator::Correlator;
 use futures_util::StreamExt;
 use http::StatusCode;
+use telegram_cidrs::TelegramIpCheck;
 use worker::*;
 
 /// Header names this crate reads or writes. `HeaderName::from_static` is
@@ -109,6 +110,32 @@ fn get_client_ip(req: &Request) -> Option<String> {
 /// extra diagnostic detail beyond the status itself.
 pub(crate) fn error_response(status: StatusCode) -> Result<Response> {
     Response::error(status.canonical_reason().expect("standard status code has a canonical reason"), status.as_u16())
+}
+
+/// How long a client is told to wait before retrying when the CIDR cache
+/// couldn't be read.
+const CACHE_UNAVAILABLE_RETRY_AFTER_SECONDS: &str = "60";
+
+/// `None` if `client_ip` is a Telegram IP, otherwise the response to send
+/// instead of forwarding.
+async fn reject_unless_telegram_ip(
+    leg: &str, client_ip: std::net::IpAddr, ctx: &RouteContext<Context>,
+) -> Result<Option<Response>> {
+    let kv = ctx.env.kv(CIDR_CACHE_KV_BINDING)?;
+    let fetch_url = telegram_cidrs::cidr_list_url(&ctx.env);
+    match telegram_cidrs::is_telegram_ip(&kv, client_ip, &fetch_url, &ctx.data).await {
+        TelegramIpCheck::Telegram => Ok(None),
+        TelegramIpCheck::NotTelegram => {
+            console_log!("rejected: leg={leg} reason=ip_not_in_telegram_range ip={client_ip}");
+            error_response(StatusCode::FORBIDDEN).map(Some)
+        }
+        TelegramIpCheck::CacheUnavailable => {
+            console_log!("rejected: leg={leg} reason=cidr_cache_unavailable ip={client_ip}");
+            let mut response = error_response(StatusCode::SERVICE_UNAVAILABLE)?;
+            response.headers_mut().set(http::header::RETRY_AFTER.as_str(), CACHE_UNAVAILABLE_RETRY_AFTER_SECONDS)?;
+            Ok(Some(response))
+        }
+    }
 }
 
 /// Cached SSRF-prevention ranges not covered by Rust's built-in methods.
@@ -257,11 +284,8 @@ async fn handle_aesgcm(mut req: Request, ctx: RouteContext<Context>) -> Result<R
 
     // Keep this last: an unrecognized IP can trigger a CIDR fetch, so only
     // otherwise-valid requests may reach it.
-    let kv = ctx.env.kv(CIDR_CACHE_KV_BINDING)?;
-    let fetch_url = telegram_cidrs::cidr_list_url(&ctx.env);
-    if !telegram_cidrs::is_telegram_ip(&kv, client_ip, &fetch_url, &ctx.data).await {
-        console_log!("rejected: leg=aesgcm reason=ip_not_in_telegram_range ip={client_ip}");
-        return error_response(StatusCode::FORBIDDEN);
+    if let Some(rejection) = reject_unless_telegram_ip("aesgcm", client_ip, &ctx).await? {
+        return Ok(rejection);
     }
 
     let folded = fold_aesgcm_body(&encryption, &crypto_key, &body);
@@ -305,11 +329,8 @@ async fn handle_put(mut req: Request, ctx: RouteContext<Context>) -> Result<Resp
 
     // Keep this last: an unrecognized IP can trigger a CIDR fetch, so only
     // otherwise-valid requests may reach it.
-    let kv = ctx.env.kv(CIDR_CACHE_KV_BINDING)?;
-    let fetch_url = telegram_cidrs::cidr_list_url(&ctx.env);
-    if !telegram_cidrs::is_telegram_ip(&kv, client_ip, &fetch_url, &ctx.data).await {
-        console_log!("rejected: leg=put reason=ip_not_in_telegram_range ip={client_ip}");
-        return error_response(StatusCode::FORBIDDEN);
+    if let Some(rejection) = reject_unless_telegram_ip("put", client_ip, &ctx).await? {
+        return Ok(rejection);
     }
 
     call_correlator(&ctx.env, &endpoint, Method::Put, body).await
