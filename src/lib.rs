@@ -255,6 +255,8 @@ async fn handle_aesgcm(mut req: Request, ctx: RouteContext<Context>) -> Result<R
         return error_response(StatusCode::PAYLOAD_TOO_LARGE);
     };
 
+    // Keep this last: an unrecognized IP can trigger a CIDR fetch, so only
+    // otherwise-valid requests may reach it.
     let kv = ctx.env.kv(CIDR_CACHE_KV_BINDING)?;
     let fetch_url = telegram_cidrs::cidr_list_url(&ctx.env);
     if !telegram_cidrs::is_telegram_ip(&kv, client_ip, &fetch_url, &ctx.data).await {
@@ -301,6 +303,8 @@ async fn handle_put(mut req: Request, ctx: RouteContext<Context>) -> Result<Resp
         return error_response(StatusCode::PAYLOAD_TOO_LARGE);
     };
 
+    // Keep this last: an unrecognized IP can trigger a CIDR fetch, so only
+    // otherwise-valid requests may reach it.
     let kv = ctx.env.kv(CIDR_CACHE_KV_BINDING)?;
     let fetch_url = telegram_cidrs::cidr_list_url(&ctx.env);
     if !telegram_cidrs::is_telegram_ip(&kv, client_ip, &fetch_url, &ctx.data).await {
