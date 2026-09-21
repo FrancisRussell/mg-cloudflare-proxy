@@ -138,20 +138,43 @@ impl CidrSnapshot {
         }
         updated
     }
-}
 
-/// The result of combining what this isolate remembers with what KV holds.
-/// The latest timestamps win, and so does the list that was confirmed most
-/// recently, preferring KV on a tie. A list is never replaced by an empty one.
-pub(crate) fn merge(memory: Option<&CidrSnapshot>, kv: CidrSnapshot) -> CidrSnapshot {
-    let Some(memory) = memory else { return kv };
-    let memory_list_is_newer = memory.fetched_at > kv.fetched_at;
-    let take_memory_list = !memory.networks.is_empty() && (memory_list_is_newer || kv.networks.is_empty());
-    CidrSnapshot::new(
-        if take_memory_list { memory.networks.clone() } else { kv.networks },
-        memory.fetched_at.max(kv.fetched_at),
-        memory.failed_at.max(kv.failed_at),
-    )
+    /// This snapshot, which is what an isolate remembers, combined with what KV
+    /// holds. The latest timestamps win, and so does the list that was
+    /// confirmed most recently, preferring KV on a tie. A list is never
+    /// replaced by an empty one.
+    pub(crate) fn merged_with(&self, kv: Self) -> Self {
+        let memory_list_is_newer = self.fetched_at > kv.fetched_at;
+        let take_memory_list = !self.networks.is_empty() && (memory_list_is_newer || kv.networks.is_empty());
+        Self::new(
+            if take_memory_list { self.networks.clone() } else { kv.networks },
+            self.fetched_at.max(kv.fetched_at),
+            self.failed_at.max(kv.failed_at),
+        )
+    }
+
+    /// True if a request from a *recognized* IP should also start a background
+    /// refresh. After a failed fetch that's once the retry interval has passed,
+    /// whatever the list's age, until a fetch succeeds. Otherwise it's when
+    /// Telegram hasn't confirmed the list for
+    /// `thresholds.force_refetch_max_age`.
+    pub(crate) fn background_refresh_due(&self, now: SystemTime, thresholds: Thresholds) -> bool {
+        if self.failed_at.is_some() {
+            return !self.retry_pending(now, thresholds.retry_interval);
+        }
+        self.fetched_at.is_none_or(|fetched| !clock::is_within(now, fetched, thresholds.force_refetch_max_age))
+    }
+
+    /// What a request from an IP that isn't in the list should do.
+    pub(crate) fn unknown_ip_plan(&self, now: SystemTime, thresholds: Thresholds) -> UnknownIpPlan {
+        if self.confirmed_recently(now) {
+            UnknownIpPlan::Reject
+        } else if self.retry_pending(now, thresholds.retry_interval) {
+            UnknownIpPlan::Unverifiable
+        } else {
+            UnknownIpPlan::Refresh
+        }
+    }
 }
 
 /// The thresholds one request applies, each drawn at random within a fixed
@@ -179,17 +202,6 @@ impl Thresholds {
     }
 }
 
-/// True if a request from a *recognized* IP should also start a background
-/// refresh. After a failed fetch that's once the retry interval has passed,
-/// whatever the list's age, until a fetch succeeds. Otherwise it's when
-/// Telegram hasn't confirmed the list for `thresholds.force_refetch_max_age`.
-pub(crate) fn background_refresh_due(snapshot: &CidrSnapshot, now: SystemTime, thresholds: Thresholds) -> bool {
-    if snapshot.failed_at.is_some() {
-        return !snapshot.retry_pending(now, thresholds.retry_interval);
-    }
-    snapshot.fetched_at.is_none_or(|fetched| !clock::is_within(now, fetched, thresholds.force_refetch_max_age))
-}
-
 /// What a request from an IP that isn't in the list should do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnknownIpPlan {
@@ -200,17 +212,6 @@ pub(crate) enum UnknownIpPlan {
     Unverifiable,
     /// The list isn't confirmed current and a refresh is due.
     Refresh,
-}
-
-/// What a request from an IP that isn't in the list should do.
-pub(crate) fn unknown_ip_plan(snapshot: &CidrSnapshot, now: SystemTime, thresholds: Thresholds) -> UnknownIpPlan {
-    if snapshot.confirmed_recently(now) {
-        UnknownIpPlan::Reject
-    } else if snapshot.retry_pending(now, thresholds.retry_interval) {
-        UnknownIpPlan::Unverifiable
-    } else {
-        UnknownIpPlan::Refresh
-    }
 }
 
 /// What asking Telegram for the CIDR list came to.
@@ -382,7 +383,7 @@ mod tests {
             (snapshot(None, None), UnknownIpPlan::Refresh),
         ];
         for (state, expected) in cases {
-            assert_eq!(unknown_ip_plan(&state, now(), Thresholds::undrawn()), expected, "state: {state:?}");
+            assert_eq!(state.unknown_ip_plan(now(), Thresholds::undrawn()), expected, "state: {state:?}");
         }
     }
 
@@ -390,7 +391,7 @@ mod tests {
     fn test_unknown_ip_plan_treats_a_future_confirmation_as_unconfirmed() {
         let mut state = snapshot(None, None);
         state.fetched_at = Some(now() + SECOND);
-        assert_eq!(unknown_ip_plan(&state, now(), Thresholds::undrawn()), UnknownIpPlan::Refresh);
+        assert_eq!(state.unknown_ip_plan(now(), Thresholds::undrawn()), UnknownIpPlan::Refresh);
     }
 
     #[test]
@@ -405,7 +406,7 @@ mod tests {
             (snapshot(None, None), true),               // never confirmed
         ];
         for (state, expected) in cases {
-            assert_eq!(background_refresh_due(&state, now(), Thresholds::undrawn()), expected, "state: {state:?}");
+            assert_eq!(state.background_refresh_due(now(), Thresholds::undrawn()), expected, "state: {state:?}");
         }
     }
 
@@ -415,11 +416,11 @@ mod tests {
         // attempt counts.
         for confirmed in [Some(WITHIN_A_MONTH), Some(PAST_A_MONTH), None] {
             assert!(
-                !background_refresh_due(&snapshot(confirmed, Some(SOON_AFTER_ATTEMPT)), now(), Thresholds::undrawn()),
+                !snapshot(confirmed, Some(SOON_AFTER_ATTEMPT)).background_refresh_due(now(), Thresholds::undrawn()),
                 "confirmed {confirmed:?} ago, failed soon ago"
             );
             assert!(
-                background_refresh_due(&snapshot(confirmed, Some(LONG_AFTER_ATTEMPT)), now(), Thresholds::undrawn()),
+                snapshot(confirmed, Some(LONG_AFTER_ATTEMPT)).background_refresh_due(now(), Thresholds::undrawn()),
                 "confirmed {confirmed:?} ago, failed long ago"
             );
         }
@@ -456,12 +457,6 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_without_memory_is_kv() {
-        let kv = snapshot(Some(SECOND), Some(SECOND));
-        assert_eq!(merge(None, kv.clone()), kv);
-    }
-
-    #[test]
     fn test_merge_takes_the_latest_timestamps_and_the_newer_list() {
         let hour = Duration::from_hours(1);
         let mut memory = snapshot(Some(5 * hour), Some(hour));
@@ -469,7 +464,7 @@ mod tests {
         let mut kv = snapshot(Some(4 * hour), Some(2 * hour));
         kv.networks = vec![network("2.2.2.0/24")];
 
-        let merged = merge(Some(&memory), kv.clone());
+        let merged = memory.merged_with(kv.clone());
         // KV confirmed the list more recently (4h ago vs 5h ago).
         assert_eq!(merged.networks, kv.networks);
         assert_eq!(merged.fetched_at, kv.fetched_at);
@@ -482,7 +477,7 @@ mod tests {
         let hour = Duration::from_hours(1);
         let memory = snapshot(Some(5 * hour), Some(3 * hour)); // failed 3h ago
         let kv = snapshot(Some(hour), None); // but confirmed 1h ago
-        assert_eq!(merge(Some(&memory), kv).failed_at, None);
+        assert_eq!(memory.merged_with(kv).failed_at, None);
     }
 
     #[test]
@@ -491,14 +486,14 @@ mod tests {
         memory.networks = vec![network("1.1.1.0/24")];
         let mut kv = snapshot(Some(2 * SECOND), None);
         kv.networks = vec![network("2.2.2.0/24")];
-        assert_eq!(merge(Some(&memory), kv).networks, memory.networks);
+        assert_eq!(memory.merged_with(kv).networks, memory.networks);
     }
 
     #[test]
     fn test_merge_never_replaces_a_list_with_an_empty_one() {
         let memory = snapshot(Some(2 * SECOND), None);
         let kv = CidrSnapshot::new(vec![], Some(now() - SECOND), None);
-        assert_eq!(merge(Some(&memory), kv).networks, memory.networks);
+        assert_eq!(memory.merged_with(kv).networks, memory.networks);
     }
 
     #[test]

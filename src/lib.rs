@@ -21,7 +21,7 @@ use clock::Deadline;
 pub use correlator::Correlator;
 use futures_util::StreamExt;
 use http::StatusCode;
-use telegram_cidrs::TelegramIpCheck;
+use telegram_cidrs::{CidrAllowlist, TelegramIpCheck};
 use thiserror::Error;
 use worker::*;
 
@@ -126,8 +126,6 @@ fn validate_endpoint(raw: &str) -> std::result::Result<url::Url, EndpointRejecti
     Ok(parsed)
 }
 
-/// wrangler.toml `[[kv_namespaces]]` binding name for the CIDR list cache.
-const CIDR_CACHE_KV_BINDING: &str = "CIDR_CACHE";
 /// wrangler.toml `[durable_objects]` binding name for the Correlator.
 const CORRELATOR_BINDING: &str = "CORRELATOR";
 
@@ -180,9 +178,7 @@ const UNVERIFIABLE_RETRY_AFTER_SECONDS: &str = "60";
 async fn reject_unless_telegram_ip(
     leg: &str, client_ip: std::net::IpAddr, deadline: Deadline, ctx: &RouteContext<Context>,
 ) -> Result<Option<Response>> {
-    let kv = ctx.env.kv(CIDR_CACHE_KV_BINDING)?;
-    let fetch_url = telegram_cidrs::cidr_list_url(&ctx.env);
-    match telegram_cidrs::is_telegram_ip(&kv, client_ip, &fetch_url, &ctx.data, deadline).await {
+    match CidrAllowlist::new(&ctx.env)?.is_telegram_ip(client_ip, &ctx.data, deadline).await {
         TelegramIpCheck::Telegram => Ok(None),
         TelegramIpCheck::NotTelegram => {
             console_log!("rejected: leg={leg} reason=ip_not_in_telegram_range ip={client_ip}");
