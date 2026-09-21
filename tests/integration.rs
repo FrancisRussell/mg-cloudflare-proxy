@@ -38,21 +38,33 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often `wait_until_ready()` and Drop's reap loop poll.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const REAP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const CONDITION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How long Drop waits for the killed process to actually be reaped before
 /// giving up (it's already dead at this point; this is just avoiding a
 /// zombie, not waiting for anything uncertain).
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A Telegram IP from data/telegram-cidrs.txt's bootstrap list.
+/// A range the mock CIDR server always serves, and an IP inside it. Every
+/// list the mock serves must include this range: a fetch replaces the cached
+/// list entirely, and scenarios outside the CIDR ones still need
+/// `TELEGRAM_IP` to be recognized.
+const TELEGRAM_CIDR_RANGE: &str = "91.108.56.0/22";
 const TELEGRAM_IP: &str = "91.108.56.1";
 
-/// The compiled-in bootstrap list, for building the mock CIDR server's
-/// response: it must be a superset of this (not just the two mock IPs
-/// appended below), since a successful fetch replaces whatever's cached
-/// entirely -- other scenarios in this same `wrangler dev` run still need
-/// `TELEGRAM_IP` to resolve after `fetches_cidr_list_only_for_unrecognized_ip`
-/// has already cached a fetched list.
-const TELEGRAM_CIDR_BOOTSTRAP: &str = include_str!("../data/telegram-cidrs.txt");
+/// KV keys and binding the Worker caches the CIDR list under. Must match
+/// `CIDR_LIST_KV_KEY`, `CIDR_LIST_FETCHED_AT_KV_KEY` and
+/// `CIDR_CACHE_KV_BINDING` in src/, which this test can't import (the crate
+/// only builds for wasm).
+const CIDR_CACHE_BINDING: &str = "CIDR_CACHE";
+const CIDR_LIST_KV_KEY: &str = "telegram_cidrs";
+const CIDR_LIST_FETCHED_AT_KV_KEY: &str = "telegram_cidrs_fetched_at";
+
+/// Cache ages used to force each freshness class deterministically. The
+/// Worker treats a list as stale past 24h, and as very stale past somewhere
+/// between 29 and 30 days (a 30-day threshold shortened by up to 24h of
+/// jitter), so these sit comfortably inside their bands.
+const STALE_CACHE_AGE: Duration = Duration::from_hours(2 * 24);
+const VERY_STALE_CACHE_AGE: Duration = Duration::from_hours(31 * 24);
 
 /// PGID of the currently-running `wrangler dev` process group, or 0 if none.
 /// Shared with the SIGINT handler installed in `integration_test`: a signal
@@ -138,13 +150,9 @@ fn spawn_output_reader(mut pipe: impl Read + Send + 'static, output: Arc<Mutex<V
 impl WranglerDev {
     /// `cidr_list_url` overrides wrangler.toml's own `CIDR_LIST_URL` default
     /// (Telegram's real endpoint) for the whole run, so the CIDR-fetch
-    /// scenario can point it at a local mock server instead.
-    /// `bootstrap_last_checked`
-    /// overrides `TELEGRAM_CIDR_BOOTSTRAP_LAST_CHECKED` -- the real, checked-in
-    /// value is always recent in a healthy repo, which would make "the
-    /// bootstrap is stale enough to fetch" undemonstrable and date-dependent
-    /// otherwise.
-    fn start(cidr_list_url: &str, bootstrap_last_checked: &str) -> Self {
+    /// scenarios can point it at a local mock server instead. The local KV
+    /// namespace starts empty; see `seed_cidr_cache`.
+    fn start(cidr_list_url: &str) -> Self {
         // Matches wrangler.toml's own [build] command: install (a no-op if
         // already present) rather than requiring a separate manual step.
         let status = Command::new("cargo")
@@ -172,8 +180,6 @@ impl WranglerDev {
                 &port.to_string(),
                 "--var",
                 &format!("CIDR_LIST_URL:{cidr_list_url}"),
-                "--var",
-                &format!("CIDR_LIST_BOOTSTRAP_LAST_CHECKED:{bootstrap_last_checked}"),
                 "--persist-to",
                 persist_dir.to_str().expect("temp dir path must be valid UTF-8"),
             ])
@@ -218,6 +224,59 @@ impl WranglerDev {
             assert!(Instant::now() < deadline, "wrangler dev did not become ready within {READY_TIMEOUT:?}");
             std::thread::sleep(POLL_INTERVAL);
         }
+    }
+
+    /// Runs the deploy-time seed script (scripts/seed-cidr-cache.sh) against
+    /// this run's local KV namespace, fetching from `cidr_list_url`.
+    fn seed_cidr_cache(&self, cidr_list_url: &str) {
+        let mut cmd = Command::new("bash");
+        cmd.arg("scripts/seed-cidr-cache.sh")
+            .env("CIDR_LIST_URL", cidr_list_url)
+            .env("CIDR_CACHE_DIR", self.persist_dir.join("cidr-cache-dir"));
+        self.run_against_local_kv(cmd, "seed-cidr-cache.sh");
+    }
+
+    /// The raw value currently stored under `key`.
+    fn kv_get(&self, key: &str) -> String {
+        let mut cmd = Command::new("npx");
+        cmd.args(["wrangler", "kv", "key", "get", "--binding", CIDR_CACHE_BINDING, key]);
+        self.run_against_local_kv(cmd, "wrangler kv key get")
+    }
+
+    /// Writes a raw value straight into the local CIDR cache namespace, to
+    /// put it in states (e.g. an old timestamp) that can't be reached by
+    /// waiting.
+    fn kv_put(&self, key: &str, value: &str) {
+        let mut cmd = Command::new("npx");
+        cmd.args(["wrangler", "kv", "key", "put", "--binding", CIDR_CACHE_BINDING, key, value]);
+        self.run_against_local_kv(cmd, "wrangler kv key put");
+    }
+
+    fn kv_delete(&self, key: &str) {
+        let mut cmd = Command::new("npx");
+        cmd.args(["wrangler", "kv", "key", "delete", "--binding", CIDR_CACHE_BINDING, key]);
+        self.run_against_local_kv(cmd, "wrangler kv key delete");
+    }
+
+    /// Runs `cmd` with the flags that point wrangler's KV commands at the
+    /// namespace this `wrangler dev` reads (`--local --preview`, under this
+    /// run's `--persist-to` directory), returning its stdout and panicking
+    /// with its output if it fails.
+    fn run_against_local_kv(&self, mut cmd: Command, what: &str) -> String {
+        let output = cmd
+            .args(["--local", "--preview", "--persist-to"])
+            .arg(&self.persist_dir)
+            .current_dir(PROJECT_DIR)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run {what}: {e}"));
+        assert!(
+            output.status.success(),
+            "{what} failed with {}:\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
     }
 }
 
@@ -320,16 +379,11 @@ impl MockDistributor {
 }
 
 /// A minimal HTTP server standing in for Telegram's CIDR list endpoint,
-/// always serving the same fixed body and recording how many times it was
-/// hit and the `If-Modified-Since` (if any) each request carried -- used to
-/// verify the relay only fetches when it actually needs to, and does so
-/// conditionally (see the doc comment on `is_telegram_ip` in src/lib.rs).
-///
-/// Realistic tests of the actual conditional-refetch/304 path would need to
-/// force the 24h staleness window, which isn't practical to simulate here
-/// (no way to fast-forward the Worker's own clock) -- what's checked
-/// instead is that the very first-ever fetch, with nothing cached yet,
-/// sends no conditional header at all.
+/// serving a body that tests can change, and recording how many times it was
+/// hit and the `If-Modified-Since` (if any) the latest request carried --
+/// used to verify the relay only fetches when it actually needs to, and
+/// sends a conditional header only when it has a genuine fetch to refer to.
+/// Never answers 304.
 ///
 /// Same leaked-background-thread caveat as `MockDistributor` above: fine for
 /// this file's single `#[test] fn`, but would need explicit teardown if a
@@ -338,6 +392,7 @@ struct MockCidrServer {
     port: u16,
     request_count: Arc<AtomicUsize>,
     last_if_modified_since: Arc<Mutex<Option<String>>>,
+    body: Arc<Mutex<String>>,
 }
 
 impl MockCidrServer {
@@ -347,8 +402,11 @@ impl MockCidrServer {
         let request_count = Arc::new(AtomicUsize::new(0));
         let last_if_modified_since = Arc::new(Mutex::new(None));
 
+        let body = Arc::new(Mutex::new(body));
+
         let count = Arc::clone(&request_count);
         let if_modified_since_store = Arc::clone(&last_if_modified_since);
+        let body_store = Arc::clone(&body);
         std::thread::spawn(move || {
             for request in server.incoming_requests() {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -359,12 +417,15 @@ impl MockCidrServer {
                     .map(|h| h.value.as_str().to_string());
                 *if_modified_since_store.lock().unwrap() = seen;
 
-                let _ = request.respond(Response::from_string(body.clone()));
+                let body = body_store.lock().unwrap().clone();
+                let _ = request.respond(Response::from_string(body));
             }
         });
 
-        Self { port, request_count, last_if_modified_since }
+        Self { port, request_count, last_if_modified_since, body }
     }
+
+    fn set_body(&self, body: String) { *self.body.lock().unwrap() = body; }
 
     /// A hostname, not a literal IP, for the same reason as
     /// `MockDistributor::url` -- see its doc comment.
@@ -390,10 +451,8 @@ fn status_of(result: Result<ureq::Response, ureq::Error>) -> u16 {
 }
 
 /// IPv4 addresses from the RFC 5737 documentation range -- guaranteed not to
-/// appear in Telegram's real bootstrap list. `_A`/`_B` are included in the
-/// mock CIDR server's list (see `integration_test`), so they become
-/// recognized once that's been fetched; `_UNKNOWN` never is, so it stays
-/// unrecognized even after a fetch.
+/// be in any real Telegram range. The mock CIDR server's first list includes
+/// `_A` only, and its second list adds `_B`; `_UNKNOWN` is never listed.
 const MOCK_CIDR_IP_A: &str = "192.0.2.5";
 const MOCK_CIDR_IP_B: &str = "192.0.2.10";
 const MOCK_CIDR_IP_UNKNOWN: &str = "192.0.2.99";
@@ -402,22 +461,20 @@ const MOCK_CIDR_IP_UNKNOWN: &str = "192.0.2.99";
 fn integration_test() {
     install_sigint_cleanup();
 
-    // A superset of the real bootstrap list (see TELEGRAM_CIDR_BOOTSTRAP's
-    // doc comment) plus the two mock-only IPs above.
-    let mock_cidr_list = format!("{TELEGRAM_CIDR_BOOTSTRAP}\n{MOCK_CIDR_IP_A}\n{MOCK_CIDR_IP_B}");
-    let cidr_server = MockCidrServer::start(mock_cidr_list);
-    // Deliberately stale (well past CIDR_LIST_MAX_AGE's 24h, well short of
-    // CIDR_LIST_FORCE_REFETCH_MAX_AGE's 30 days) so the "bootstrap is stale
-    // enough to fetch" scenario is deterministic regardless of how recently
-    // data/telegram-cidrs.txt.last-checked's real value happens to have been
-    // updated.
-    let stale_bootstrap_last_checked = (chrono::Utc::now() - chrono::Duration::days(2)).to_rfc2822();
-    let dev = WranglerDev::start(&cidr_server.url(), &stale_bootstrap_last_checked);
+    let initial_cidr_list = format!("{TELEGRAM_CIDR_RANGE}\n{MOCK_CIDR_IP_A}");
+    let cidr_server = MockCidrServer::start(initial_cidr_list);
+    let dev = WranglerDev::start(&cidr_server.url());
     let port = dev.port;
 
-    // Must run before any other scenario: it depends on the CIDR cache
-    // still being empty (nothing fetched yet) at the start.
-    fetches_cidr_list_only_for_unrecognized_ip(port, &cidr_server);
+    // These share one CIDR cache, and each leaves it in the state the next
+    // relies on, so they must run in this order and before the scenarios
+    // below (which need `TELEGRAM_IP` recognized).
+    seeding_makes_recognized_ips_need_no_fetch(port, &dev, &cidr_server);
+    unrecognized_ip_against_fresh_cache_does_not_fetch(port, &cidr_server);
+    unrecognized_ip_against_stale_cache_fetches(port, &dev, &cidr_server);
+    recognized_ip_against_very_stale_cache_refetches_in_background(port, &dev, &cidr_server);
+    unrecognized_ip_against_empty_cache_fetches_unconditionally(port, &dev, &cidr_server);
+    seeding_does_not_overwrite_newer_cache(&dev, &cidr_server);
 
     rejects_absent_cf_connecting_ip(port);
     rejects_non_telegram_ip(port);
@@ -427,58 +484,130 @@ fn integration_test() {
     post_suppresses_following_put(port);
 }
 
-/// An unrecognized IP against a never-fetched cache triggers exactly one
-/// blocking fetch (and is still correctly rejected if it's genuinely not in
-/// the fetched list either); once that fetch has populated the cache,
-/// further requests -- whether from a bootstrap-only IP or one only the
-/// fetch itself revealed -- are all accepted without triggering another
-/// fetch. See `is_telegram_ip` in src/lib.rs.
-///
-/// Doesn't cover the separate `CidrListFreshness::VeryStale` background
-/// re-fetch (a recognized-but-never-confirmed IP still kicks off a
-/// `ctx.wait_until` refresh) -- there's no way to deterministically observe
-/// a `wait_until` task's completion from outside the Worker, and forcing the
-/// real trigger for it (the cache exceeding
-/// `CIDR_LIST_FORCE_REFETCH_MAX_AGE_MS`, 30 days) isn't practical here either.
-/// That threshold classification is covered at the unit level instead (see
-/// `test_is_cidr_list_fresh_*` in src/lib.rs).
-fn fetches_cidr_list_only_for_unrecognized_ip(port: u16, cidr_server: &MockCidrServer) {
+/// PUTs to a throwaway distributor from `client_ip`, returning the relay's
+/// status. What the distributor does with it doesn't matter to the CIDR
+/// scenarios, only whether the relay let the request through.
+fn put_from(port: u16, client_ip: &str) -> u16 {
     let distributor = MockDistributor::start(None);
-    let target = encode(&distributor.url());
-
-    let resp = ureq::put(&worker_url(port, &format!("/{target}")))
-        .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
+    let resp = ureq::put(&worker_url(port, &format!("/{}", encode(&distributor.url()))))
+        .set("CF-Connecting-IP", client_ip)
         .timeout(REQUEST_TIMEOUT)
         .send_string("body");
-    assert_eq!(status_of(resp), 403, "an IP absent from even the freshly-fetched list should stay rejected");
-    assert_eq!(cidr_server.request_count(), 1, "an unrecognized IP with no prior fetch should trigger exactly one");
+    status_of(resp)
+}
+
+/// A timestamp `age` ago, in the millisecond-string form the Worker stores.
+fn fetched_at_value(age: Duration) -> String {
+    let fetched_at = std::time::SystemTime::now() - age;
+    fetched_at.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis().to_string()
+}
+
+/// Polls until `condition` holds, for observing effects of a `ctx.wait_until`
+/// task, which finishes after the response has already been sent.
+fn wait_for(what: &str, condition: impl Fn() -> bool) {
+    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    while !condition() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(CONDITION_POLL_INTERVAL);
+    }
+}
+
+/// After the deploy-time seed script has run, IPs from the seeded list are
+/// accepted with no fetch by the Worker itself.
+fn seeding_makes_recognized_ips_need_no_fetch(port: u16, dev: &WranglerDev, cidr_server: &MockCidrServer) {
+    dev.seed_cidr_cache(&cidr_server.url());
+    let fetches_after_seed = cidr_server.request_count();
+    assert_eq!(fetches_after_seed, 1, "the seed script should fetch the list once");
+
+    assert_eq!(put_from(port, TELEGRAM_IP), 201);
+    assert_eq!(put_from(port, MOCK_CIDR_IP_A), 201);
+    assert_eq!(cidr_server.request_count(), fetches_after_seed, "recognized IPs shouldn't trigger a fetch");
+
+    dev.seed_cidr_cache(&cidr_server.url());
+    assert_eq!(
+        cidr_server.request_count(),
+        fetches_after_seed,
+        "re-seeding with a recent local copy shouldn't refetch"
+    );
+}
+
+/// An IP missing from a fresh cache is rejected without asking Telegram
+/// again: a flood of unrecognized IPs mustn't turn into a flood of fetches.
+fn unrecognized_ip_against_fresh_cache_does_not_fetch(port: u16, cidr_server: &MockCidrServer) {
+    let fetches_before = cidr_server.request_count();
+    assert_eq!(put_from(port, MOCK_CIDR_IP_B), 403);
+    assert_eq!(cidr_server.request_count(), fetches_before);
+}
+
+/// Once the cache has gone stale, an unrecognized IP triggers a blocking,
+/// conditional fetch, and is accepted if the refreshed list now contains it.
+fn unrecognized_ip_against_stale_cache_fetches(port: u16, dev: &WranglerDev, cidr_server: &MockCidrServer) {
+    cidr_server.set_body(format!("{TELEGRAM_CIDR_RANGE}\n{MOCK_CIDR_IP_A}\n{MOCK_CIDR_IP_B}"));
+    dev.kv_put(CIDR_LIST_FETCHED_AT_KV_KEY, &fetched_at_value(STALE_CACHE_AGE));
+    let fetches_before = cidr_server.request_count();
+
+    assert_eq!(put_from(port, MOCK_CIDR_IP_B), 201, "an IP only the refreshed list contains should be accepted");
+    assert_eq!(cidr_server.request_count(), fetches_before + 1);
     assert!(
         cidr_server.last_if_modified_since().is_some(),
-        "even the very first-ever fetch should send If-Modified-Since: current_cidr_list synthesizes and \
-         persists a backdated timestamp before fetch_fresh_cidr_list ever runs (see its doc comment in \
-         src/lib.rs), specifically so a never-fetched cache still participates in conditional GET"
+        "a refresh of a cache with a real fetch time should be conditional"
     );
 
-    let resp = ureq::put(&worker_url(port, &format!("/{target}")))
-        .set("CF-Connecting-IP", TELEGRAM_IP)
-        .timeout(REQUEST_TIMEOUT)
-        .send_string("body");
-    assert_eq!(status_of(resp), 201, "a bootstrap-list IP should be accepted");
-    assert_eq!(cidr_server.request_count(), 1, "a recognized IP against a now-fresh cache shouldn't trigger a fetch");
+    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403, "an IP in neither list should stay rejected");
+    assert_eq!(cidr_server.request_count(), fetches_before + 1, "the refresh should have made the cache fresh again");
+}
 
-    let resp = ureq::put(&worker_url(port, &format!("/{target}")))
-        .set("CF-Connecting-IP", MOCK_CIDR_IP_A)
-        .timeout(REQUEST_TIMEOUT)
-        .send_string("body");
-    assert_eq!(status_of(resp), 201, "an IP only the fetched list (not bootstrap) recognizes should be accepted");
-    assert_eq!(cidr_server.request_count(), 1, "still no further fetch");
+/// A recognized IP is answered immediately even when the cache is very
+/// stale, but still prompts a refresh, so a reassigned Telegram range can't
+/// stay trusted indefinitely.
+fn recognized_ip_against_very_stale_cache_refetches_in_background(
+    port: u16, dev: &WranglerDev, cidr_server: &MockCidrServer,
+) {
+    dev.kv_put(CIDR_LIST_FETCHED_AT_KV_KEY, &fetched_at_value(VERY_STALE_CACHE_AGE));
+    let fetches_before = cidr_server.request_count();
 
-    let resp = ureq::put(&worker_url(port, &format!("/{target}")))
-        .set("CF-Connecting-IP", MOCK_CIDR_IP_B)
-        .timeout(REQUEST_TIMEOUT)
-        .send_string("body");
-    assert_eq!(status_of(resp), 201, "a different IP already in the now-cached list should be accepted");
-    assert_eq!(cidr_server.request_count(), 1, "still no further fetch");
+    assert_eq!(put_from(port, TELEGRAM_IP), 201);
+    wait_for("the background refetch", || cidr_server.request_count() > fetches_before);
+    assert_eq!(cidr_server.request_count(), fetches_before + 1);
+
+    assert_eq!(put_from(port, TELEGRAM_IP), 201);
+    assert_eq!(
+        cidr_server.request_count(),
+        fetches_before + 1,
+        "the background refetch should have made the cache fresh again"
+    );
+}
+
+/// With nothing cached (e.g. the seed step was skipped), an unrecognized IP
+/// still gets a correct answer via a fetch -- unconditional, since there's
+/// no earlier fetch to refer to -- and that fetch populates the cache.
+fn unrecognized_ip_against_empty_cache_fetches_unconditionally(
+    port: u16, dev: &WranglerDev, cidr_server: &MockCidrServer,
+) {
+    dev.kv_delete(CIDR_LIST_KV_KEY);
+    dev.kv_delete(CIDR_LIST_FETCHED_AT_KV_KEY);
+    let fetches_before = cidr_server.request_count();
+
+    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403);
+    assert_eq!(cidr_server.request_count(), fetches_before + 1);
+    assert_eq!(cidr_server.last_if_modified_since(), None, "with nothing cached, there's no fetch to condition on");
+
+    assert_eq!(put_from(port, TELEGRAM_IP), 201, "the fetch should have populated the cache");
+    assert_eq!(cidr_server.request_count(), fetches_before + 1);
+}
+
+/// By now the Worker has refreshed the cache itself, more recently than the
+/// seed script's local copy was fetched; re-seeding mustn't replace that with
+/// the older list.
+fn seeding_does_not_overwrite_newer_cache(dev: &WranglerDev, cidr_server: &MockCidrServer) {
+    let list_before = dev.kv_get(CIDR_LIST_KV_KEY);
+    assert!(list_before.contains(MOCK_CIDR_IP_B), "test precondition: the cached list is the Worker's newer fetch");
+    let fetches_before = cidr_server.request_count();
+
+    dev.seed_cidr_cache(&cidr_server.url());
+
+    assert_eq!(dev.kv_get(CIDR_LIST_KV_KEY), list_before);
+    assert_eq!(cidr_server.request_count(), fetches_before, "the local copy is still recent, so no fetch");
 }
 
 /// Doesn't set `CF-Connecting-IP` at all -- but this can't actually verify

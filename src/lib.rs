@@ -233,8 +233,7 @@ async fn handle_aesgcm(mut req: Request, ctx: RouteContext<Context>) -> Result<R
 
     let kv = ctx.env.kv(CIDR_CACHE_KV_BINDING)?;
     let fetch_url = telegram_cidrs::cidr_list_url(&ctx.env);
-    let bootstrap_last_checked = telegram_cidrs::bootstrap_last_checked_raw(&ctx.env);
-    if !telegram_cidrs::is_telegram_ip(&kv, client_ip, &fetch_url, &bootstrap_last_checked, &ctx.data).await {
+    if !telegram_cidrs::is_telegram_ip(&kv, client_ip, &fetch_url, &ctx.data).await {
         console_log!("rejected: leg=aesgcm reason=ip_not_in_telegram_range ip={client_ip}");
         return error_response(StatusCode::FORBIDDEN);
     }
@@ -282,8 +281,7 @@ async fn handle_put(mut req: Request, ctx: RouteContext<Context>) -> Result<Resp
 
     let kv = ctx.env.kv(CIDR_CACHE_KV_BINDING)?;
     let fetch_url = telegram_cidrs::cidr_list_url(&ctx.env);
-    let bootstrap_last_checked = telegram_cidrs::bootstrap_last_checked_raw(&ctx.env);
-    if !telegram_cidrs::is_telegram_ip(&kv, client_ip, &fetch_url, &bootstrap_last_checked, &ctx.data).await {
+    if !telegram_cidrs::is_telegram_ip(&kv, client_ip, &fetch_url, &ctx.data).await {
         console_log!("rejected: leg=put reason=ip_not_in_telegram_range ip={client_ip}");
         return error_response(StatusCode::FORBIDDEN);
     }

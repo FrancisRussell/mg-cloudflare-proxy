@@ -45,32 +45,39 @@ id = "your-namespace-id-here"
 preview_id = "your-preview-namespace-id-here"
 ```
 
-Then deploy:
+Then install dependencies and log in:
 
 ```sh
 npm install
 npx wrangler login
+```
+
+### 3. Seed the Telegram CIDR cache
+
+The relay only accepts requests from Telegram's published IP ranges, cached
+in the `CIDR_CACHE` namespace. Fill it before the first deploy so the Worker
+starts with a warm cache rather than every early request fetching the list
+at once:
+
+```sh
+npm run seed-cidr
+```
+
+This fetches the list from Telegram (needs network access) into
+`~/.cache/mg-cloudflare-relay/` (`$XDG_CACHE_HOME` if set) and uploads it,
+with its fetch time, to the namespace. Repeated runs reuse the local copy for a day rather than hitting Telegram again, and
+skip the upload if the namespace already holds a list at least as new. Delete
+that directory to force a fresh fetch. The namespace outlives redeploys, so the
+seed is a one-off; the Worker keeps the cache current itself from then on
+(see Security notes).
+
+### 4. Deploy
+
+```sh
 npx wrangler deploy
 ```
 
-`data/telegram-cidrs.txt` is the bootstrap Telegram CIDR list baked into the
-build via `include_str!`, letting a freshly-deployed Worker recognize
-Telegram's own IP ranges immediately, with no fetch needed. Every build
-(`wrangler dev` or `deploy`, however invoked) runs
-`scripts/verify-cidr-freshness.sh` first and fails loudly if that file
-hasn't been checked in the last 14 days — a build step reaching out to
-Telegram's servers on its own would be fragile, so refreshing it is a
-separate, deliberate step: run `npm run check-cidr` (needs network access)
-to do a conditional fetch and update the file in place if Telegram's list
-has changed. Worth running periodically (manually, or via a scheduled CI
-job) rather than only when the build starts complaining.
-
-The `CIDR_CACHE` KV namespace persists independently of the Worker's code,
-so a redeploy inherits whatever's already cached rather than starting cold
-again — the bootstrap only matters for the very first deploy against a
-genuinely empty namespace.
-
-### 3. Configure Mercurygram
+### 5. Configure Mercurygram
 
 Point Mercurygram (Settings → Mercurygram → Notifications → UnifiedPush) at
 your chosen distributor, then set the gateway URL to your deployed Worker's
@@ -110,19 +117,30 @@ a plain `cargo test` doesn't build or run it at all.
 Unix-only (process groups aren't portable); compiles to an empty, harmless
 test binary on other platforms.
 
-Start the dev server for manual testing:
+Start the dev server for manual testing, seeding its local cache first
+(`--preview` is the namespace `wrangler dev` reads):
 
 ```sh
+npm run seed-cidr -- --local --preview
 npx wrangler dev
 ```
 
 ## Security notes
 
 The relay validates all inbound requests against Telegram's published CIDR
-ranges before forwarding anything (a recognized IP never triggers a fetch;
-an unrecognized one triggers at most one re-fetch attempt per day); requests
-from non-Telegram IPs are rejected at the edge, before any Durable Object is
-even addressed.
+ranges before forwarding anything; requests from non-Telegram IPs are
+rejected at the edge, before any Durable Object is even addressed. The list
+is kept current on demand:
+
+- A recognized IP is accepted without any fetch.
+- An unrecognized IP against a list more than a day old triggers a fetch, so
+  a newly added Telegram range is picked up promptly; at most one such fetch
+  per day.
+- A recognized IP against a list about a month old (with some random
+  early jitter) still gets an immediate answer, but triggers a background
+  fetch, so a range Telegram has dropped can't stay trusted indefinitely.
+- If the cache is empty (the seed step was skipped), the first unrecognized
+  IP simply fetches the list.
 
 Mitigations in place against a few specific threats:
 

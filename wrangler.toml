@@ -3,7 +3,7 @@ main = "build/worker/shim.mjs"
 compatibility_date = "2026-09-01"
 
 [build]
-command = "bash scripts/verify-cidr-freshness.sh && cargo install -q worker-build && worker-build --release"
+command = "cargo install -q worker-build && worker-build --release"
 
 [[kv_namespaces]]
 binding = "CIDR_CACHE"

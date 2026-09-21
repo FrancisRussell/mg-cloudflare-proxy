@@ -9,7 +9,6 @@ description = "Mercurygram legacy WebPush (aesgcm Draft-04) to UnifiedPush relay
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-chrono = { version = "0.4.41", default-features = false, features = ["std"] }
 console_error_panic_hook = "0.1"
 http = "1"
 ipnetwork = "0.20"
@@ -19,7 +18,6 @@ url = "2"
 worker = "0.8"
 
 [dev-dependencies]
-chrono = { version = "*", features = ["clock"] }
 ctrlc = "3.5.2"
 nix = { version = "0.31.3", features = ["signal"] }
 tiny_http = "0.12"

@@ -5,8 +5,7 @@
   "description": "Mercurygram legacy WebPush (aesgcm Draft-04) to UnifiedPush relay, deployed as a Cloudflare Worker.",
   "scripts": {
     "dev": "wrangler dev",
-    "check-cidr": "bash scripts/check-cidr.sh",
-    "predeploy": "npm run check-cidr",
+    "seed-cidr": "bash scripts/seed-cidr-cache.sh",
     "deploy": "wrangler deploy"
   },
   "devDependencies": {
