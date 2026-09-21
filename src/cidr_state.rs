@@ -32,6 +32,9 @@ const CIDR_LIST_FORCE_REFETCH_MAX_AGE: Duration = Duration::from_hours(30 * 24);
 /// at the same instant.
 const CIDR_LIST_FORCE_REFETCH_JITTER: Duration = Duration::from_hours(12);
 
+/// Marks a line of the CIDR list as a comment.
+const COMMENT_PREFIX: char = '#';
+
 /// Why a fetched CIDR list can't be used. The messages double as the reason
 /// logged for it, so they stay short and free of spaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -45,14 +48,14 @@ pub(crate) enum CidrListError {
     Malformed,
 }
 
-/// The networks in a fetched CIDR list, one per line. Empty lines are skipped,
-/// and a plain IP address counts as a single-address network. Any malformed
-/// line rejects the whole list.
+/// The networks in a fetched CIDR list, one per line. Blank lines and `#`
+/// comment lines are skipped, and a plain IP address counts as a
+/// single-address network. Any malformed line rejects the whole list.
 pub(crate) fn parse_cidr_list(content: &str) -> Result<Vec<IpNetwork>, CidrListError> {
     let networks = content
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
+        .filter(|line| !line.is_empty() && !line.starts_with(COMMENT_PREFIX))
         .map(|line| line.parse().map_err(|_| CidrListError::Malformed))
         .collect::<Result<Vec<_>, _>>()?;
     if networks.is_empty() {
@@ -286,6 +289,17 @@ mod tests {
         let networks = parse_cidr_list("91.108.56.0/22\n\n91.108.4.0/22\n1.2.3.4").expect("the test list is valid");
         assert_eq!(networks, parse_networks("91.108.56.0/22\n91.108.4.0/22\n1.2.3.4"));
         assert_eq!(networks.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_cidr_list_skips_comment_and_whitespace_lines() {
+        let list = "# Telegram ranges\n91.108.56.0/22\n   \n\t# indented comment\n1.2.3.4\n";
+        assert_eq!(parse_cidr_list(list), Ok(parse_networks("91.108.56.0/22\n1.2.3.4")));
+    }
+
+    #[test]
+    fn test_parse_cidr_list_with_only_comments_is_empty() {
+        assert_eq!(parse_cidr_list("# nothing here\n\n# still nothing"), Err(CidrListError::Empty));
     }
 
     #[test]
