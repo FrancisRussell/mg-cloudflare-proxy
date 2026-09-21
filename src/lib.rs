@@ -212,15 +212,17 @@ fn is_ip_safe(ip: std::net::IpAddr) -> bool {
 ///   Crypto-Key: <value>\n
 ///   <original binary ciphertext>
 fn fold_aesgcm_body(encryption: &str, crypto_key: &str, body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(24 + encryption.len() + crypto_key.len() + body.len());
-    out.extend_from_slice(b"aesgcm\nEncryption: ");
-    out.extend_from_slice(encryption.as_bytes());
-    out.push(b'\n');
-    out.extend_from_slice(b"Crypto-Key: ");
-    out.extend_from_slice(crypto_key.as_bytes());
-    out.push(b'\n');
-    out.extend_from_slice(body);
-    out
+    [b"aesgcm\nEncryption: ", encryption.as_bytes(), b"\nCrypto-Key: ", crypto_key.as_bytes(), b"\n", body].concat()
+}
+
+/// `value` if it can be folded into the body: aesgcm (draft-ietf-webpush-
+/// encryption-04) needs both the `Encryption` header (the salt) and the
+/// `Crypto-Key` header (the sender's key) to decrypt, so a missing or empty
+/// one makes the notification undecryptable. A value with a control
+/// character is refused too, since the folded body is line-based and it could
+/// add lines of its own.
+fn folding_header_value(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.is_empty() && !v.chars().any(char::is_control))
 }
 
 /// Look up the endpoint's Correlator instance and hand it a pre-shaped
@@ -272,8 +274,13 @@ async fn handle_aesgcm(mut req: Request, ctx: RouteContext<Context>) -> Result<R
         return error_response(StatusCode::FORBIDDEN);
     };
 
-    let encryption = req.headers().get(header_names::ENCRYPTION.as_str())?.unwrap_or_default();
-    let crypto_key = req.headers().get(header_names::CRYPTO_KEY.as_str())?.unwrap_or_default();
+    let (Some(encryption), Some(crypto_key)) = (
+        folding_header_value(req.headers().get(header_names::ENCRYPTION.as_str())?),
+        folding_header_value(req.headers().get(header_names::CRYPTO_KEY.as_str())?),
+    ) else {
+        console_log!("rejected: leg=aesgcm reason=missing_or_invalid_encryption_headers ip={client_ip}");
+        return error_response(StatusCode::BAD_REQUEST);
+    };
     let Some(body) = read_capped_body(&mut req).await? else {
         console_log!(
             "rejected: leg=aesgcm reason=payload_too_large ip={client_ip} host={}",
@@ -432,13 +439,26 @@ mod tests {
         let crypto_key = "dh=xyz";
         let body = b"ciphertext";
 
-        let result = fold_aesgcm_body(encryption, crypto_key, body);
-        let s = String::from_utf8_lossy(&result);
+        assert_eq!(
+            fold_aesgcm_body(encryption, crypto_key, body),
+            b"aesgcm\nEncryption: salt=abc\nCrypto-Key: dh=xyz\nciphertext"
+        );
+    }
 
-        assert!(s.starts_with("aesgcm\n"));
-        assert!(s.contains("Encryption: salt=abc\n"));
-        assert!(s.contains("Crypto-Key: dh=xyz\n"));
-        assert!(s.ends_with("ciphertext"));
+    #[test]
+    fn test_folding_header_value() {
+        let cases = [
+            (Some("salt=abc"), true),
+            (Some("dh=xyz; p256ecdsa=abc"), true),
+            (None, false),
+            (Some(""), false),
+            (Some("salt=abc\nCrypto-Key: dh=evil"), false), // would add a line to the folded body
+            (Some("salt=abc\r"), false),
+            (Some("salt=\u{0}abc"), false),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(folding_header_value(input.map(String::from)).is_some(), expected, "input: {input:?}");
+        }
     }
 
     #[test]

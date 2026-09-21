@@ -607,6 +607,12 @@ fn invalid_requests_from_unrecognized_ip_do_not_fetch(port: u16, dev: &WranglerD
         .send_string("body");
     assert_eq!(status_of(resp), 403, "a PUT with an invalid endpoint should be rejected");
 
+    let resp = ureq::post(&worker_url(port, &format!("/aesgcm?e={target}")))
+        .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
+        .timeout(REQUEST_TIMEOUT)
+        .send_string("ciphertext");
+    assert_eq!(status_of(resp), 400, "a POST without the aesgcm headers should be rejected");
+
     let resp = ureq::put(&worker_url(port, &format!("/{target}")))
         .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
         .timeout(REQUEST_TIMEOUT)
