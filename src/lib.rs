@@ -65,26 +65,48 @@ async fn read_capped_body(req: &mut Request) -> Result<Option<Vec<u8>>> {
     Ok(Some(body))
 }
 
+/// Why a forwarding target was refused. Logged, never sent to the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointRejection {
+    Unparseable,
+    UnsupportedScheme,
+    HasCredentials,
+    NoHost,
+    NonPublicIp,
+}
+
+impl std::fmt::Display for EndpointRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Unparseable => "unparseable",
+            Self::UnsupportedScheme => "unsupported_scheme",
+            Self::HasCredentials => "has_credentials",
+            Self::NoHost => "no_host",
+            Self::NonPublicIp => "non_public_ip",
+        })
+    }
+}
+
 /// Rejects anything that isn't a plain http(s) URL with a host and no
 /// embedded credentials. Literal private/loopback IPs are rejected below;
 /// a domain name that merely resolves to one is not caught, since Workers'
 /// `fetch()` gives no hook into DNS resolution to check that at connect time.
-fn validate_endpoint(raw: &str) -> Result<url::Url> {
-    let parsed = url::Url::parse(raw).map_err(|e| Error::RustError(format!("invalid url: {e}")))?;
+fn validate_endpoint(raw: &str) -> std::result::Result<url::Url, EndpointRejection> {
+    let parsed = url::Url::parse(raw).map_err(|_| EndpointRejection::Unparseable)?;
 
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
-        return Err(Error::RustError("scheme must be http or https".into()));
+        return Err(EndpointRejection::UnsupportedScheme);
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(Error::RustError("url must not contain credentials".into()));
+        return Err(EndpointRejection::HasCredentials);
     }
     match parsed.host() {
-        None => return Err(Error::RustError("url has no host".into())),
+        None => return Err(EndpointRejection::NoHost),
         Some(url::Host::Ipv4(ip)) if !is_ip_safe(std::net::IpAddr::V4(ip)) => {
-            return Err(Error::RustError("literal IP is not public".into()));
+            return Err(EndpointRejection::NonPublicIp);
         }
         Some(url::Host::Ipv6(ip)) if !is_ip_safe(std::net::IpAddr::V6(ip)) => {
-            return Err(Error::RustError("literal IP is not public".into()));
+            return Err(EndpointRejection::NonPublicIp);
         }
         _ => {}
     }
@@ -282,9 +304,12 @@ async fn handle_aesgcm(mut req: Request, ctx: RouteContext<Context>) -> Result<R
         return Response::error("missing ?e= parameter", StatusCode::BAD_REQUEST.as_u16());
     };
     let endpoint_raw = endpoint_raw.into_owned();
-    let Ok(endpoint) = validate_endpoint(&endpoint_raw) else {
-        console_log!("rejected: leg=aesgcm reason=invalid_endpoint ip={client_ip}");
-        return error_response(StatusCode::FORBIDDEN);
+    let endpoint = match validate_endpoint(&endpoint_raw) {
+        Ok(endpoint) => endpoint,
+        Err(rejection) => {
+            console_log!("rejected: leg=aesgcm reason=invalid_endpoint detail={rejection} ip={client_ip}");
+            return error_response(StatusCode::FORBIDDEN);
+        }
     };
 
     let (Some(encryption), Some(crypto_key)) = (
@@ -329,14 +354,17 @@ async fn handle_put(mut req: Request, ctx: RouteContext<Context>) -> Result<Resp
 
     let path = req.path();
     let encoded = path.strip_prefix('/').unwrap_or(&path);
-    let Ok(decoded) = percent_decode(encoded) else {
+    let Some(decoded) = percent_decode(encoded) else {
         console_log!("rejected: leg=put reason=invalid_percent_encoding ip={client_ip}");
         return error_response(StatusCode::FORBIDDEN);
     };
 
-    let Ok(endpoint) = validate_endpoint(&decoded) else {
-        console_log!("rejected: leg=put reason=invalid_endpoint ip={client_ip}");
-        return error_response(StatusCode::FORBIDDEN);
+    let endpoint = match validate_endpoint(&decoded) {
+        Ok(endpoint) => endpoint,
+        Err(rejection) => {
+            console_log!("rejected: leg=put reason=invalid_endpoint detail={rejection} ip={client_ip}");
+            return error_response(StatusCode::FORBIDDEN);
+        }
     };
 
     let Some(body) = read_capped_body(&mut req).await? else {
@@ -361,11 +389,8 @@ async fn handle_put(mut req: Request, ctx: RouteContext<Context>) -> Result<Resp
 /// valid UTF-8 mean the path was malformed, not something to paper over —
 /// reject it rather than substituting replacement characters and feeding
 /// mangled input into URL parsing.
-fn percent_decode(s: &str) -> Result<String> {
-    percent_encoding::percent_decode_str(s)
-        .decode_utf8()
-        .map(std::borrow::Cow::into_owned)
-        .map_err(|e| Error::RustError(format!("invalid percent-encoded UTF-8: {e}")))
+fn percent_decode(s: &str) -> Option<String> {
+    percent_encoding::percent_decode_str(s).decode_utf8().ok().map(std::borrow::Cow::into_owned)
 }
 
 /// The Worker's fetch entry point: routes Telegram's POST and PUT requests.
@@ -491,7 +516,7 @@ mod tests {
     #[test]
     fn test_percent_decode_rejects_invalid_utf8() {
         // %C3 alone is an incomplete 2-byte UTF-8 sequence.
-        assert!(percent_decode("%C3").is_err());
+        assert!(percent_decode("%C3").is_none());
     }
 
     #[test]
@@ -519,6 +544,24 @@ mod tests {
         ];
         for (input, expected) in cases {
             assert_eq!(folding_header_value(input.map(String::from)).is_some(), expected, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_endpoint_rejection_reasons() {
+        let cases = [
+            ("not a url", EndpointRejection::Unparseable),
+            ("ftp://example.com", EndpointRejection::UnsupportedScheme),
+            ("http://user:pass@example.com", EndpointRejection::HasCredentials),
+            ("http://127.0.0.1", EndpointRejection::NonPublicIp),
+            ("http://[::1]", EndpointRejection::NonPublicIp),
+        ];
+        for (endpoint, expected) in cases {
+            assert_eq!(
+                validate_endpoint(endpoint).expect_err("the endpoint is refused"),
+                expected,
+                "endpoint: {endpoint}"
+            );
         }
     }
 
