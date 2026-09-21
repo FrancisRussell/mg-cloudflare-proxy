@@ -14,8 +14,10 @@
 // here is worth persisting across a restart.
 
 use std::cell::Cell;
+use std::pin::pin;
 use std::time::{Duration, SystemTime};
 
+use futures_util::future::{select, Either};
 use http::StatusCode;
 use worker::*;
 
@@ -53,6 +55,11 @@ const CONTENT_ENCODING_AES128GCM: &str = "aes128gcm";
 /// How long a successful POST's timestamp counts as "recent" when a PUT for
 /// the same endpoint checks in.
 const RECENT_POST_WINDOW: Duration = Duration::from_secs(2);
+
+/// How long a push server gets to answer a forwarded push before it's given
+/// up on. Bounds a server that accepts the connection and then never replies,
+/// which would otherwise hold the request open indefinitely.
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the PUT handler waits for a same-endpoint POST to land before
 /// giving up and forwarding a synthetic wake-up. Nothing documents how far
@@ -226,7 +233,13 @@ async fn forward(target: &url::Url, body: Vec<u8>) -> Result<Response> {
     let host = target.host_str().unwrap_or("?");
 
     let req = Request::new_with_init(target.as_str(), &init)?;
-    let resp = Fetch::Request(req).send().await?;
+    let resp = match send_with_timeout(req).await {
+        Ok(resp) => resp,
+        Err(failure) => {
+            console_error!("forward failed: host={host} reason={failure}");
+            return crate::error_response(failure.status());
+        }
+    };
     let distributor_status = resp.status_code();
 
     // A distributor that redirects is rejected outright rather than relayed:
@@ -261,6 +274,63 @@ async fn forward(target: &url::Url, body: Vec<u8>) -> Result<Response> {
         response.status_code()
     );
     Ok(response)
+}
+
+/// Why a push server gave no answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardFailure {
+    TimedOut,
+    /// The host name didn't resolve.
+    Dns,
+    /// Refused, reset, closed early, or an unparseable reply.
+    Connection,
+}
+
+impl ForwardFailure {
+    /// The status to answer the caller with: a gateway timeout if the push
+    /// server was too slow, otherwise a bad gateway.
+    fn status(self) -> StatusCode {
+        match self {
+            Self::TimedOut => StatusCode::GATEWAY_TIMEOUT,
+            Self::Dns | Self::Connection => StatusCode::BAD_GATEWAY,
+        }
+    }
+
+    /// Classifies a failed fetch by the runtime's error text, falling back to a
+    /// generic connection failure.
+    fn from_fetch_error(error: &Error) -> Self {
+        if error.to_string().contains("DNS lookup failed") {
+            Self::Dns
+        } else {
+            Self::Connection
+        }
+    }
+}
+
+impl std::fmt::Display for ForwardFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::TimedOut => "timeout",
+            Self::Dns => "dns",
+            Self::Connection => "connection",
+        })
+    }
+}
+
+/// Sends `req`, giving up after `FORWARD_TIMEOUT`.
+async fn send_with_timeout(req: Request) -> std::result::Result<Response, ForwardFailure> {
+    let controller = AbortController::default();
+    let signal = controller.signal();
+    let fetch = Fetch::Request(req);
+    let send = pin!(fetch.send_with_signal(&signal));
+    let timeout = pin!(Delay::from(FORWARD_TIMEOUT));
+    match select(send, timeout).await {
+        Either::Left((result, _)) => result.map_err(|e| ForwardFailure::from_fetch_error(&e)),
+        Either::Right(..) => {
+            controller.abort();
+            Err(ForwardFailure::TimedOut)
+        }
+    }
 }
 
 /// How `forward` answers the caller once the push server has answered.
@@ -332,6 +402,20 @@ mod tests {
     #[test]
     fn test_is_post_recent_no_prior_post() {
         assert!(!is_post_recent(UNIX_EPOCH + Duration::from_secs(1), None, RECENT_POST_WINDOW));
+    }
+
+    #[test]
+    fn test_forward_failure_status() {
+        assert_eq!(ForwardFailure::TimedOut.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(ForwardFailure::Dns.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(ForwardFailure::Connection.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_forward_failure_reasons() {
+        assert_eq!(ForwardFailure::TimedOut.to_string(), "timeout");
+        assert_eq!(ForwardFailure::Dns.to_string(), "dns");
+        assert_eq!(ForwardFailure::Connection.to_string(), "connection");
     }
 
     #[test]

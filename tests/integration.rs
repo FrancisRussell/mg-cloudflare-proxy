@@ -595,6 +595,8 @@ fn integration_test() {
     put_waits_for_a_slow_post_and_is_suppressed_when_it_succeeds(port);
     put_forwards_after_a_slow_post_that_fails(port);
     refusal_passes_on_only_status_and_retry_after(port);
+    unreachable_push_server_answers_bad_gateway(port);
+    unanswering_push_server_answers_gateway_timeout(port);
 }
 
 /// PUTs to a throwaway distributor from `client_ip`, returning the proxy's
@@ -989,4 +991,45 @@ fn refusal_passes_on_only_status_and_retry_after(port: u16) {
     assert_eq!(status, 429);
     assert_eq!(resp.header("Retry-After"), Some(RETRY_AFTER_SECONDS));
     assert_eq!(resp.into_string().expect("the response body is readable"), "", "the push server's body isn't relayed");
+}
+
+/// PUTs to `endpoint` from a Telegram IP, returning the proxy's status.
+/// `timeout` is how long the test client itself waits.
+fn put_to_endpoint(port: u16, endpoint: &str, timeout: Duration) -> u16 {
+    status_of(
+        ureq::put(&worker_url(port, &format!("/{}", encode(endpoint))))
+            .set("CF-Connecting-IP", TELEGRAM_IP)
+            .timeout(timeout)
+            .send_string("wake-up-body"),
+    )
+}
+
+/// A push server that can't be reached is the gateway's problem to report,
+/// not an internal error: a host name that doesn't exist, and a port nothing
+/// listens on, both answer 502.
+fn unreachable_push_server_answers_bad_gateway(port: u16) {
+    // `.invalid` is reserved (RFC 2606) and never resolves.
+    assert_eq!(put_to_endpoint(port, "http://no-such-host.invalid/push", REQUEST_TIMEOUT), 502);
+    // Port 1 is not expected to have a listener.
+    assert_eq!(put_to_endpoint(port, "http://localhost:1/push", REQUEST_TIMEOUT), 502);
+}
+
+/// A push server that accepts the connection and never answers is given up on
+/// after the Worker's forward timeout, rather than holding the request open.
+fn unanswering_push_server_answers_gateway_timeout(port: u16) {
+    /// Longer than the Worker's forward timeout, so the Worker's answer is the
+    /// one seen.
+    const CLIENT_PATIENCE: Duration = Duration::from_secs(30);
+
+    let silent = TcpListener::bind("127.0.0.1:0").expect("failed to bind the silent push server");
+    let silent_port = silent.local_addr().expect("a bound listener has an address").port();
+    std::thread::spawn(move || {
+        // Holds every connection open without ever answering.
+        let held: Vec<_> = silent.incoming().collect();
+        drop(held);
+    });
+
+    let started = Instant::now();
+    assert_eq!(put_to_endpoint(port, &format!("http://localhost:{silent_port}/push"), CLIENT_PATIENCE), 504);
+    assert!(started.elapsed() < CLIENT_PATIENCE, "the Worker should answer well before the client gives up");
 }
