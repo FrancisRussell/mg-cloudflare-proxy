@@ -15,6 +15,7 @@
 // binary rather than failing to build.
 #![cfg(unix)]
 
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::process::CommandExt;
@@ -54,11 +55,10 @@ const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const TELEGRAM_CIDR_RANGE: &str = "91.108.56.0/22";
 const TELEGRAM_IP: &str = "91.108.56.1";
 
-/// KV keys and binding the Worker caches the CIDR list under. Must match
-/// `CIDR_LIST_KV_KEY`, `CIDR_LIST_FETCHED_AT_KV_KEY`,
-/// `CIDR_LIST_FAILED_AT_KV_KEY` and `CIDR_CACHE_KV_BINDING` in src/, which
-/// this test can't import (the crate only builds for wasm).
-const CIDR_CACHE_BINDING: &str = "CIDR_CACHE";
+/// KV keys the Worker caches the CIDR list under. Must match
+/// `CIDR_LIST_KV_KEY`, `CIDR_LIST_FETCHED_AT_KV_KEY` and
+/// `CIDR_LIST_FAILED_AT_KV_KEY` in src/, which this test can't import (the
+/// crate only builds for wasm).
 const CIDR_LIST_KV_KEY: &str = "telegram_cidrs";
 const CIDR_LIST_FETCHED_AT_KV_KEY: &str = "telegram_cidrs_fetched_at";
 const CIDR_LIST_FAILED_AT_KV_KEY: &str = "telegram_cidrs_failed_at";
@@ -136,6 +136,12 @@ struct WranglerDev {
     port: u16,
     /// The `CIDR_LIST_URL` the Worker was started with, so a restart reuses it.
     cidr_list_url: String,
+    /// The copy of wrangler.toml `wrangler dev` runs from; see
+    /// `write_test_wrangler_config`.
+    config_path: std::path::PathBuf,
+    /// The id of the CIDR cache KV namespace, as `wrangler dev`'s local
+    /// explorer API knows it.
+    kv_namespace_id: String,
     /// Captured stdout+stderr, printed only if the test panics (see Drop) --
     /// `cargo test`'s own output capturing doesn't reach a child process's
     /// inherited file descriptors, only the test's own print!/println!
@@ -165,15 +171,46 @@ fn spawn_output_reader(mut pipe: impl Read + Send + 'static, output: Arc<Mutex<V
     });
 }
 
+/// Writes a copy of wrangler.toml for `wrangler dev` to run from, without its
+/// `[build]` section, which would rebuild the Worker on every (re)start when
+/// this test has already built it. `main` is made absolute, since the copy
+/// lives elsewhere.
+fn write_test_wrangler_config(dir: &std::path::Path) -> std::path::PathBuf {
+    let original = std::fs::read_to_string(std::path::Path::new(PROJECT_DIR).join("wrangler.toml"))
+        .expect("failed to read wrangler.toml");
+    let mut copy = String::new();
+    let mut in_build_section = false;
+    for line in original.lines() {
+        if line.starts_with('[') {
+            in_build_section = line.trim() == "[build]";
+        }
+        if in_build_section {
+            continue;
+        }
+        if let Some(main) = line.strip_prefix("main = \"") {
+            writeln!(copy, "main = \"{PROJECT_DIR}/{main}").expect("writing to a String can't fail");
+        } else {
+            copy.push_str(line);
+            copy.push('\n');
+        }
+    }
+    let path = dir.join("wrangler.test.toml");
+    std::fs::write(&path, copy).expect("failed to write the test wrangler config");
+    path
+}
+
 /// Spawns `npx wrangler dev` in its own process group, feeding its output
 /// into `output`.
 fn spawn_wrangler_dev(
-    port: u16, cidr_list_url: &str, persist_dir: &std::path::Path, output: &Arc<Mutex<Vec<u8>>>,
+    port: u16, cidr_list_url: &str, persist_dir: &std::path::Path, config_path: &std::path::Path,
+    output: &Arc<Mutex<Vec<u8>>>,
 ) -> Child {
     let mut child = Command::new("npx")
         .args([
             "wrangler",
             "dev",
+            "--config",
+            config_path.to_str().expect("temp dir path must be valid UTF-8"),
             "--port",
             &port.to_string(),
             "--var",
@@ -225,11 +262,22 @@ impl WranglerDev {
         let persist_dir = std::env::temp_dir().join(format!("mg-cloudflare-proxy-test-{}", std::process::id()));
         std::fs::create_dir_all(&persist_dir).expect("failed to create --persist-to directory");
 
+        let config_path = write_test_wrangler_config(&persist_dir);
+
         let port = pick_free_port();
         let output = Arc::new(Mutex::new(Vec::new()));
-        let child = spawn_wrangler_dev(port, cidr_list_url, &persist_dir, &output);
-        let mut dev = Self { child, port, cidr_list_url: cidr_list_url.to_string(), output, persist_dir };
+        let child = spawn_wrangler_dev(port, cidr_list_url, &persist_dir, &config_path, &output);
+        let mut dev = Self {
+            child,
+            port,
+            cidr_list_url: cidr_list_url.to_string(),
+            config_path,
+            kv_namespace_id: String::new(),
+            output,
+            persist_dir,
+        };
         dev.wait_until_ready();
+        dev.kv_namespace_id = dev.find_kv_namespace_id();
         dev
     }
 
@@ -243,7 +291,8 @@ impl WranglerDev {
         while Instant::now() < deadline && !matches!(self.child.try_wait(), Ok(Some(_))) {
             std::thread::sleep(REAP_POLL_INTERVAL);
         }
-        self.child = spawn_wrangler_dev(self.port, &self.cidr_list_url, &self.persist_dir, &self.output);
+        self.child =
+            spawn_wrangler_dev(self.port, &self.cidr_list_url, &self.persist_dir, &self.config_path, &self.output);
         self.wait_until_ready();
     }
 
@@ -278,20 +327,66 @@ impl WranglerDev {
         self.run_against_local_kv(cmd, "seed-cidr-cache.sh");
     }
 
-    /// The raw value currently stored under `key`.
+    /// The base URL of `wrangler dev`'s local explorer API for this run's KV
+    /// namespace. Going through the running Worker's own storage is far quicker
+    /// than a `wrangler kv` command, which pays Node's whole startup each time.
+    fn kv_api_url(&self) -> String {
+        format!(
+            "http://127.0.0.1:{}/cdn-cgi/local/explorer/api/storage/kv/namespaces/{}",
+            self.port, self.kv_namespace_id
+        )
+    }
+
+    /// The id the local explorer API gives the CIDR cache namespace.
+    fn find_kv_namespace_id(&self) -> String {
+        let url = format!("http://127.0.0.1:{}/cdn-cgi/local/explorer/api/storage/kv/namespaces", self.port);
+        let listing = ureq::get(&url)
+            .timeout(REQUEST_TIMEOUT)
+            .call()
+            .unwrap_or_else(|e| panic!("wrangler dev's local explorer API is unavailable ({e}); is wrangler current?"))
+            .into_string()
+            .expect("the namespace listing is readable");
+        let after_id = listing.split_once("\"id\":\"").expect("the namespace listing has an id").1;
+        after_id.split_once('"').expect("the id is quoted").0.to_string()
+    }
+
+    /// The raw value currently stored under `key`, or an empty string if
+    /// there is none.
     fn kv_get(&self, key: &str) -> String {
-        let mut cmd = Command::new("npx");
-        cmd.args(["wrangler", "kv", "key", "get", "--binding", CIDR_CACHE_BINDING, key]);
-        self.run_against_local_kv(cmd, "wrangler kv key get")
+        match ureq::get(&format!("{}/values/{key}", self.kv_api_url())).timeout(REQUEST_TIMEOUT).call() {
+            Ok(resp) => resp.into_string().expect("the value is readable"),
+            Err(ureq::Error::Status(404, _)) => String::new(),
+            Err(e) => panic!("reading {key} from KV failed: {e}"),
+        }
     }
 
     /// Writes a raw value straight into the local CIDR cache namespace, to
     /// put it in states (e.g. an old timestamp) that can't be reached by
     /// waiting.
     fn kv_put(&self, key: &str, value: &str) {
-        let mut cmd = Command::new("npx");
-        cmd.args(["wrangler", "kv", "key", "put", "--binding", CIDR_CACHE_BINDING, key, value]);
-        self.run_against_local_kv(cmd, "wrangler kv key put");
+        ureq::put(&format!("{}/values/{key}", self.kv_api_url()))
+            .timeout(REQUEST_TIMEOUT)
+            .send_string(value)
+            .unwrap_or_else(|e| panic!("writing {key} to KV failed: {e}"));
+    }
+
+    fn kv_delete(&self, key: &str) {
+        ureq::delete(&format!("{}/values/{key}", self.kv_api_url()))
+            .timeout(REQUEST_TIMEOUT)
+            .call()
+            .unwrap_or_else(|e| panic!("deleting {key} from KV failed: {e}"));
+    }
+
+    fn kv_put_many(&self, entries: &[(&str, &str)]) {
+        for (key, value) in entries {
+            self.kv_put(key, value);
+        }
+    }
+
+    fn kv_delete_many(&self, keys: &[&str]) {
+        for key in keys {
+            self.kv_delete(key);
+        }
     }
 
     /// Makes the cache look as if Telegram last confirmed the list, and last
@@ -302,49 +397,18 @@ impl WranglerDev {
         self.restart();
     }
 
-    fn kv_delete(&self, key: &str) {
-        let mut cmd = Command::new("npx");
-        cmd.args(["wrangler", "kv", "key", "delete", "--binding", CIDR_CACHE_BINDING, key]);
-        self.run_against_local_kv(cmd, "wrangler kv key delete");
-    }
-
-    /// Writes several keys in one wrangler call. Each call pays wrangler's
-    /// whole startup, so writing keys together is much quicker than a
-    /// `kv_put` apiece.
-    fn kv_put_many(&self, entries: &[(&str, &str)]) {
-        let file = self.persist_dir.join("bulk-put.json");
-        let objects: Vec<String> = entries
-            .iter()
-            .map(|(key, value)| format!("{{\"key\":{},\"value\":{}}}", json_string(key), json_string(value)))
-            .collect();
-        std::fs::write(&file, format!("[{}]", objects.join(","))).expect("failed to write the bulk put file");
-        let mut cmd = Command::new("npx");
-        cmd.args(["wrangler", "kv", "bulk", "put"]).arg(&file).args(["--binding", CIDR_CACHE_BINDING]);
-        self.run_against_local_kv(cmd, "wrangler kv bulk put");
-    }
-
-    /// Deletes several keys in one wrangler call; see `kv_put_many`.
-    fn kv_delete_many(&self, keys: &[&str]) {
-        let file = self.persist_dir.join("bulk-delete.json");
-        let quoted: Vec<String> = keys.iter().map(|key| json_string(key)).collect();
-        std::fs::write(&file, format!("[{}]", quoted.join(","))).expect("failed to write the bulk delete file");
-        let mut cmd = Command::new("npx");
-        cmd.args(["wrangler", "kv", "bulk", "delete"]).arg(&file).args(["--binding", CIDR_CACHE_BINDING, "--force"]);
-        self.run_against_local_kv(cmd, "wrangler kv bulk delete");
-    }
-
     /// Sets when Telegram last confirmed the cached list and when the last
-    /// fetch failed, in one wrangler call. A failure time that isn't later than
-    /// the confirmation counts as no failure, which is how a scenario clears
-    /// one without a separate delete.
+    /// fetch failed. A failure time that isn't later than the confirmation
+    /// counts as no failure, which is how a scenario clears one without a
+    /// separate delete.
     fn set_cidr_times(&self, fetched_at: &str, failed_at: &str) {
         self.kv_put_many(&[(CIDR_LIST_FETCHED_AT_KV_KEY, fetched_at), (CIDR_LIST_FAILED_AT_KV_KEY, failed_at)]);
     }
 
-    /// Runs `cmd` with the flags that point wrangler's KV commands at the
-    /// namespace this `wrangler dev` reads (`--local --preview`, under this
-    /// run's `--persist-to` directory), returning its stdout and panicking
-    /// with its output if it fails.
+    /// Runs the seed script's `cmd` with the flags that point wrangler's KV
+    /// commands at the namespace this `wrangler dev` reads (`--local
+    /// --preview`, under this run's `--persist-to` directory), returning its
+    /// stdout and panicking with its output if it fails.
     fn run_against_local_kv(&self, mut cmd: Command, what: &str) -> String {
         let output = cmd
             .args(["--local", "--preview", "--persist-to"])
@@ -709,27 +773,6 @@ fn put_from(port: u16, client_ip: &str) -> u16 {
 fn fetched_at_value(age: Duration) -> String {
     let fetched_at = std::time::SystemTime::now() - age;
     fetched_at.duration_since(std::time::UNIX_EPOCH).expect("the clock is after the epoch").as_millis().to_string()
-}
-
-/// `value` as a JSON string literal.
-fn json_string(value: &str) -> String {
-    let mut out = String::from("\"");
-    for c in value.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => {
-                use std::fmt::Write as _;
-                write!(out, "\\u{:04x}", u32::from(c)).expect("writing to a String can't fail");
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 /// Polls until `condition` holds, for observing effects of a `ctx.wait_until`
