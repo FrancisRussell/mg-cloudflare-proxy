@@ -29,6 +29,9 @@ use nix::unistd::Pid;
 use tiny_http::Response;
 
 const PROJECT_DIR: &str = env!("CARGO_MANIFEST_DIR");
+/// The `worker-build` version to install, matching wrangler.toml's build
+/// command.
+const WORKER_BUILD_CRATE: &str = "worker-build@0.8.6";
 const READY_TIMEOUT: Duration = Duration::from_secs(45);
 /// Per-request timeout for every HTTP call this test makes. Without this,
 /// ureq blocks with no timeout at all -- a single hung request (e.g. the
@@ -161,7 +164,7 @@ impl WranglerDev {
         // Matches wrangler.toml's own [build] command: install (a no-op if
         // already present) rather than requiring a separate manual step.
         let status = Command::new("cargo")
-            .args(["install", "-q", "worker-build"])
+            .args(["install", "-q", "--locked", WORKER_BUILD_CRATE])
             .status()
             .expect("failed to run `cargo install worker-build` (is cargo installed?)");
         assert!(status.success(), "cargo install worker-build failed");

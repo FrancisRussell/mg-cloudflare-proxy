@@ -3,7 +3,9 @@ main = "build/worker/shim.mjs"
 compatibility_date = "2026-09-01"
 
 [build]
-command = "cargo install -q worker-build && worker-build --release"
+# worker-build is a Rust tool (not an npm package), pinned to the version
+# matching the `worker` crate in Cargo.toml so builds don't drift with releases.
+command = "cargo install -q --locked worker-build@0.8.6 && worker-build --release"
 
 [[kv_namespaces]]
 binding = "CIDR_CACHE"
