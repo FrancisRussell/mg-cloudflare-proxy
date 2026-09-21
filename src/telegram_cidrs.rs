@@ -20,16 +20,6 @@ use crate::cidr_state::{
 use crate::clock::{self, Deadline};
 use crate::outbound::send_with_timeout;
 
-/// Header names used on the outbound CIDR-list fetch.
-mod header_names {
-    use http::HeaderName;
-
-    /// Sent on the outbound CIDR-list fetch, echoing back when Telegram last
-    /// confirmed the cached list, so an unchanged list costs Telegram's
-    /// server a 304 rather than a full body.
-    pub const IF_MODIFIED_SINCE: HeaderName = HeaderName::from_static("if-modified-since");
-}
-
 const CIDR_LIST_KV_KEY: &str = "telegram_cidrs";
 /// When Telegram last confirmed the cached list: a successful fetch or a 304.
 const CIDR_LIST_FETCHED_AT_KV_KEY: &str = "telegram_cidrs_fetched_at";
@@ -294,7 +284,9 @@ async fn request_cidr_list(fetch_url: &str, if_modified_since: Option<&str>) -> 
     let mut init = RequestInit::new();
     if let Some(if_modified_since) = if_modified_since {
         let headers = Headers::new();
-        let _ = headers.set(header_names::IF_MODIFIED_SINCE.as_str(), if_modified_since);
+        // Echoes back when Telegram last confirmed the cached list, so an
+        // unchanged list costs its server a 304 rather than a full body.
+        let _ = headers.set(http::header::IF_MODIFIED_SINCE.as_str(), if_modified_since);
         init.with_headers(headers);
     }
     let Ok(req) = Request::new_with_init(fetch_url, &init) else { return CidrFetchOutcome::Unreachable };

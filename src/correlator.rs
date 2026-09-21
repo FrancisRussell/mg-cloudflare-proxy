@@ -22,7 +22,7 @@ use worker::*;
 use crate::clock::{self, Deadline};
 use crate::outbound::{send_with_timeout, FetchFailure};
 
-/// Header names used when forwarding to the push server.
+/// Push headers from RFC 8030 that the `http` crate has no constant for.
 /// `HeaderName::from_static` is `const fn`, so these are checked and built at
 /// compile time; `worker::Headers` itself only takes `&str`, so callers pass
 /// `NAME.as_str()`.
@@ -33,11 +33,6 @@ mod header_names {
     pub const TTL: HeaderName = HeaderName::from_static("ttl");
     /// RFC 8030 §5.3 delivery priority hint.
     pub const URGENCY: HeaderName = HeaderName::from_static("urgency");
-    /// The `WebPush` payload encoding of the forwarded body.
-    pub const CONTENT_ENCODING: HeaderName = HeaderName::from_static("content-encoding");
-    /// RFC 8030 §5 resource URL for the created push message, on both the
-    /// push server's response and our own normalized one.
-    pub const LOCATION: HeaderName = HeaderName::from_static("location");
 }
 
 /// RFC 8030 §5.2 message lifetime sent on the forwarded push, in seconds --
@@ -224,7 +219,7 @@ async fn forward(target: &url::Url, body: Vec<u8>, deadline: Deadline) -> Result
     let headers = Headers::new();
     headers.set(header_names::TTL.as_str(), &TTL_SECONDS.to_string())?;
     headers.set(header_names::URGENCY.as_str(), URGENCY_HIGH)?;
-    headers.set(header_names::CONTENT_ENCODING.as_str(), CONTENT_ENCODING_AES128GCM)?;
+    headers.set(http::header::CONTENT_ENCODING.as_str(), CONTENT_ENCODING_AES128GCM)?;
 
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
@@ -255,13 +250,13 @@ async fn forward(target: &url::Url, body: Vec<u8>, deadline: Deadline) -> Result
         return crate::error_response(StatusCode::BAD_GATEWAY);
     }
 
-    let location = resp.headers().get(header_names::LOCATION.as_str())?;
+    let location = resp.headers().get(http::header::LOCATION.as_str())?;
     let retry_after = resp.headers().get(http::header::RETRY_AFTER.as_str())?;
     let response = match forward_reply(push_server_status, location.as_deref(), retry_after.as_deref(), target.as_str())
     {
         ForwardReply::Created { location } => {
             let headers = Headers::new();
-            headers.set(header_names::LOCATION.as_str(), &location)?;
+            headers.set(http::header::LOCATION.as_str(), &location)?;
             Response::empty()?.with_status(StatusCode::CREATED.as_u16()).with_headers(headers)
         }
         ForwardReply::Failed { status, retry_after } => {
