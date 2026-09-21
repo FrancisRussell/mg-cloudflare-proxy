@@ -196,12 +196,6 @@ pub(crate) fn unknown_ip_plan(snapshot: &CidrSnapshot, now: SystemTime) -> Unkno
     }
 }
 
-/// True if a refresh has nothing to do: the list was confirmed recently, or a
-/// failed fetch is still waiting out its retry interval.
-pub(crate) fn refresh_unnecessary(snapshot: &CidrSnapshot, now: SystemTime) -> bool {
-    snapshot.confirmed_recently(now) || snapshot.retry_pending(now)
-}
-
 /// What asking Telegram for the CIDR list came to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CidrFetchOutcome {
@@ -451,15 +445,6 @@ mod tests {
             answers.insert(first);
         }
         assert_eq!(answers.len(), 2, "failures at the centre of the band should differ in when their wait ends");
-    }
-
-    #[test]
-    fn test_refresh_unnecessary() {
-        let past_max_age = CIDR_LIST_MAX_AGE + SECOND;
-        assert!(refresh_unnecessary(&snapshot(Some(SECOND), Some(SECOND)), now()));
-        assert!(refresh_unnecessary(&snapshot(Some(past_max_age), Some(SOON_AFTER_ATTEMPT)), now()));
-        assert!(!refresh_unnecessary(&snapshot(Some(past_max_age), Some(LONG_AFTER_ATTEMPT)), now()));
-        assert!(!refresh_unnecessary(&snapshot(Some(past_max_age), Some(past_max_age)), now()));
     }
 
     #[test]

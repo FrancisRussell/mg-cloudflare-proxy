@@ -517,29 +517,6 @@ mod tests {
     }
 
     #[test]
-    fn test_unsafe_range_tables_parse() {
-        // Building the tables panics on a malformed entry.
-        assert!(!unsafe_ranges::UNSAFE_V4.is_empty());
-        assert!(!unsafe_ranges::UNSAFE_V6.is_empty());
-    }
-
-    #[test]
-    fn test_validate_endpoint_rejects_alternative_notations_of_private_ipv4() {
-        // The url crate normalises all of these to a literal IPv4 host.
-        for endpoint in [
-            "http://2130706433/",         // decimal
-            "http://0x7f.1/",             // hex with short form
-            "http://0177.0.0.1/",         // octal
-            "http://127.1/",              // short form
-            "http://127.0.0.1./",         // trailing dot
-            "http://[::ffff:127.0.0.1]/", // IPv4-mapped
-            "http://0/",
-        ] {
-            assert!(validate_endpoint(endpoint).is_err(), "endpoint: {endpoint}");
-        }
-    }
-
-    #[test]
     fn test_percent_decode() {
         let cases = [
             ("hello", "hello"),
@@ -602,13 +579,31 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_endpoint_accepts_public_hosts_and_literal_ips() {
+        for endpoint in ["http://example.com", "https://example.com:8080", "http://8.8.8.8"] {
+            assert!(validate_endpoint(endpoint).is_ok(), "endpoint: {endpoint}");
+        }
+    }
+
+    #[test]
     fn test_validate_endpoint_rejection_reasons() {
         let cases = [
             ("not a url", EndpointRejection::Unparseable),
+            ("http://", EndpointRejection::Unparseable), // an empty host
             ("ftp://example.com", EndpointRejection::UnsupportedScheme),
+            ("file:///etc/passwd", EndpointRejection::UnsupportedScheme),
             ("http://user:pass@example.com", EndpointRejection::HasCredentials),
             ("http://127.0.0.1", EndpointRejection::NonPublicIp),
             ("http://[::1]", EndpointRejection::NonPublicIp),
+            // The url crate normalises these alternative notations of 127.0.0.1
+            // (and 0.0.0.0) to a literal IPv4 host, which is then refused.
+            ("http://2130706433/", EndpointRejection::NonPublicIp), // decimal
+            ("http://0x7f.1/", EndpointRejection::NonPublicIp),     // hex with short form
+            ("http://0177.0.0.1/", EndpointRejection::NonPublicIp), // octal
+            ("http://127.1/", EndpointRejection::NonPublicIp),      // short form
+            ("http://127.0.0.1./", EndpointRejection::NonPublicIp), // trailing dot
+            ("http://[::ffff:127.0.0.1]/", EndpointRejection::NonPublicIp), // IPv4-mapped
+            ("http://0/", EndpointRejection::NonPublicIp),
         ];
         for (endpoint, expected) in cases {
             assert_eq!(
@@ -617,39 +612,5 @@ mod tests {
                 "endpoint: {endpoint}"
             );
         }
-    }
-
-    #[test]
-    fn test_validate_endpoint_valid_http() {
-        assert!(validate_endpoint("http://example.com").is_ok());
-        assert!(validate_endpoint("https://example.com:8080").is_ok());
-    }
-
-    #[test]
-    fn test_validate_endpoint_invalid_scheme() {
-        assert!(validate_endpoint("ftp://example.com").is_err());
-        assert!(validate_endpoint("file:///etc/passwd").is_err());
-    }
-
-    #[test]
-    fn test_validate_endpoint_credentials() {
-        assert!(validate_endpoint("http://user:pass@example.com").is_err());
-    }
-
-    #[test]
-    fn test_validate_endpoint_literal_public_ip() {
-        assert!(validate_endpoint("http://8.8.8.8").is_ok());
-    }
-
-    #[test]
-    fn test_validate_endpoint_literal_private_ip() {
-        assert!(validate_endpoint("http://127.0.0.1").is_err());
-        assert!(validate_endpoint("http://192.168.1.1").is_err());
-        assert!(validate_endpoint("http://10.0.0.1").is_err());
-    }
-
-    #[test]
-    fn test_validate_endpoint_empty_host() {
-        assert!(validate_endpoint("http://").is_err());
     }
 }

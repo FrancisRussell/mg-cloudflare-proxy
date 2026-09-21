@@ -14,8 +14,8 @@ use http::StatusCode;
 use worker::*;
 
 use crate::cidr_state::{
-    background_refresh_due, merge, parse_cidr_list, parse_networks, refresh_unnecessary, unknown_ip_plan,
-    CidrFetchOutcome, CidrSnapshot, UnknownIpPlan,
+    background_refresh_due, merge, parse_cidr_list, parse_networks, unknown_ip_plan, CidrFetchOutcome, CidrSnapshot,
+    UnknownIpPlan,
 };
 use crate::clock::{self, Deadline};
 use crate::outbound::send_with_timeout;
@@ -197,7 +197,8 @@ async fn refresh(kv: KvStore, fetch_url: String) -> Option<CidrSnapshot> {
     };
     let merged = merge(remembered().as_ref(), from_kv);
     remember(merged.clone());
-    if refresh_unnecessary(&merged, clock::now()) {
+    // The plan for an unknown IP is also the answer to whether a fetch is due.
+    if unknown_ip_plan(&merged, clock::now()) != UnknownIpPlan::Refresh {
         return Some(merged);
     }
 

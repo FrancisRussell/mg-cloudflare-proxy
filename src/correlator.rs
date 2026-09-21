@@ -341,21 +341,13 @@ mod tests {
     }
 
     #[test]
-    fn test_is_post_recent_within_window() {
+    fn test_is_post_recent() {
         let last_post = UNIX_EPOCH + Duration::from_secs(1);
-        assert!(is_post_recent(last_post + Duration::from_millis(500), Some(last_post), RECENT_POST_WINDOW));
-    }
-
-    #[test]
-    fn test_is_post_recent_outside_window() {
-        let last_post = UNIX_EPOCH + Duration::from_secs(1);
-        let now = last_post + RECENT_POST_WINDOW + Duration::from_millis(1);
-        assert!(!is_post_recent(now, Some(last_post), RECENT_POST_WINDOW));
-    }
-
-    #[test]
-    fn test_is_post_recent_no_prior_post() {
-        assert!(!is_post_recent(UNIX_EPOCH + Duration::from_secs(1), None, RECENT_POST_WINDOW));
+        let just_inside = last_post + RECENT_POST_WINDOW - Duration::from_millis(1);
+        let just_outside = last_post + RECENT_POST_WINDOW;
+        assert!(is_post_recent(just_inside, Some(last_post), RECENT_POST_WINDOW));
+        assert!(!is_post_recent(just_outside, Some(last_post), RECENT_POST_WINDOW));
+        assert!(!is_post_recent(just_inside, None, RECENT_POST_WINDOW), "no POST has been seen");
     }
 
     #[test]
