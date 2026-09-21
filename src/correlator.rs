@@ -10,10 +10,12 @@
 // here is worth persisting across a restart.
 
 use std::cell::Cell;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use http::StatusCode;
 use worker::*;
+
+use crate::clock;
 
 /// Header names used when forwarding to the distributor.
 /// `HeaderName::from_static` is `const fn`, so these are checked and built at
@@ -46,18 +48,18 @@ const CONTENT_ENCODING_AES128GCM: &str = "aes128gcm";
 
 /// How long a successful POST's timestamp counts as "recent" when a PUT for
 /// the same endpoint checks in.
-const RECENT_POST_WINDOW_MS: f64 = 2_000.0;
+const RECENT_POST_WINDOW: Duration = Duration::from_secs(2);
 
 /// How long the PUT handler waits for a same-endpoint POST to land before
 /// giving up and forwarding a synthetic wake-up. Telegram's docs don't
 /// describe this dual-delivery pattern at all, so there's no documented
 /// timing to derive this from — it's an empirical guess, not a spec value.
-const CORRELATION_WAIT_MS: u64 = 200;
+const CORRELATION_WAIT: Duration = Duration::from_millis(200);
 
 #[durable_object]
 #[derive(Debug)]
 pub struct Correlator {
-    last_post: Cell<Option<f64>>,
+    last_post: Cell<Option<SystemTime>>,
     // A Durable Object's `fetch` takes `&self`, so the runtime can dispatch
     // concurrent requests to the same instance, interleaved at `.await`
     // points. Without this flag, two PUTs arriving close together could
@@ -96,9 +98,7 @@ impl Correlator {
     async fn handle_post(&self, target: &url::Url, body: Vec<u8>) -> Result<Response> {
         let resp = forward(target, body).await?;
         if StatusCode::from_u16(resp.status_code()).is_ok_and(|s| s.is_success()) {
-            // millis-since-epoch fits exactly in f64 until the year 287396.
-            #[allow(clippy::cast_precision_loss)]
-            self.last_post.set(Some(Date::now().as_millis() as f64));
+            self.last_post.set(Some(clock::now()));
         }
         Ok(resp)
     }
@@ -117,7 +117,7 @@ impl Correlator {
             return Response::ok("");
         }
 
-        Delay::from(Duration::from_millis(CORRELATION_WAIT_MS)).await;
+        Delay::from(CORRELATION_WAIT).await;
 
         let should_forward = !self.recent_post();
         self.put_in_flight.set(false);
@@ -129,20 +129,12 @@ impl Correlator {
         }
     }
 
-    fn recent_post(&self) -> bool {
-        // millis-since-epoch fits exactly in f64 until the year 287396.
-        #[allow(clippy::cast_precision_loss)]
-        let now = Date::now().as_millis() as f64;
-        is_post_recent(now, self.last_post.get(), RECENT_POST_WINDOW_MS)
-    }
+    fn recent_post(&self) -> bool { is_post_recent(clock::now(), self.last_post.get(), RECENT_POST_WINDOW) }
 }
 
-/// True if `last_post` (millis since epoch) is within `window_ms` of `now`.
-fn is_post_recent(now: f64, last_post: Option<f64>, window_ms: f64) -> bool {
-    match last_post {
-        Some(t) => (now - t) < window_ms,
-        None => false,
-    }
+/// True if `last_post` is within `window` of `now`.
+fn is_post_recent(now: SystemTime, last_post: Option<SystemTime>, window: Duration) -> bool {
+    last_post.is_some_and(|t| clock::is_within(now, t, window))
 }
 
 /// Forwards `body` to `target` as a WebPush-shaped POST. RFC 8030 §5 expects
@@ -218,23 +210,26 @@ fn wake_up_response_shape(status: u16, location: Option<&str>, target: &str) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::time::UNIX_EPOCH;
+
     use super::*;
 
     #[test]
     fn test_is_post_recent_within_window() {
-        assert!(is_post_recent(1_000.0, Some(500.0), RECENT_POST_WINDOW_MS));
+        let last_post = UNIX_EPOCH + Duration::from_secs(1);
+        assert!(is_post_recent(last_post + Duration::from_millis(500), Some(last_post), RECENT_POST_WINDOW));
     }
 
     #[test]
     fn test_is_post_recent_outside_window() {
-        let last_post = 1_000.0;
-        let now = last_post + RECENT_POST_WINDOW_MS + 1.0;
-        assert!(!is_post_recent(now, Some(last_post), RECENT_POST_WINDOW_MS));
+        let last_post = UNIX_EPOCH + Duration::from_secs(1);
+        let now = last_post + RECENT_POST_WINDOW + Duration::from_millis(1);
+        assert!(!is_post_recent(now, Some(last_post), RECENT_POST_WINDOW));
     }
 
     #[test]
     fn test_is_post_recent_no_prior_post() {
-        assert!(!is_post_recent(1_000.0, None, RECENT_POST_WINDOW_MS));
+        assert!(!is_post_recent(UNIX_EPOCH + Duration::from_secs(1), None, RECENT_POST_WINDOW));
     }
 
     #[test]

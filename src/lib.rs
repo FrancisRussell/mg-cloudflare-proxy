@@ -10,6 +10,7 @@
 // wake-up correlation this depends on. No FCM/VAPID leg — only real
 // UnifiedPush distributors are targeted.
 
+mod clock;
 mod correlator;
 mod telegram_cidrs;
 

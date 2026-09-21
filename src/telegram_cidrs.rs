@@ -9,6 +9,8 @@ use http::StatusCode;
 use ipnetwork::IpNetwork;
 use worker::*;
 
+use crate::clock;
+
 mod header_names {
     use http::HeaderName;
 
@@ -91,13 +93,6 @@ enum CidrListFreshness {
     VeryStale,
 }
 
-/// The Worker runtime's current time. `std::time::SystemTime::now()` isn't
-/// usable here -- `wasm32-unknown-unknown` has no OS clock -- so this goes
-/// through `worker::Date` (backed by the JS host) instead, then converts
-/// into a `SystemTime` so the rest of this module can use ordinary
-/// `Duration`-based arithmetic rather than raw millisecond math.
-fn now() -> SystemTime { UNIX_EPOCH + Duration::from_millis(Date::now().as_millis()) }
-
 /// Milliseconds since the Unix epoch, for storing a `SystemTime` in KV
 /// (which only holds strings) and for handing to `worker::Date`, which
 /// speaks in millis rather than `SystemTime`.
@@ -157,7 +152,7 @@ async fn current_cidr_list(kv: &KvStore) -> CachedCidrList {
         _ => None,
     };
 
-    let freshness = freshness_of(now(), fetched_at, jittered_force_refetch_max_age());
+    let freshness = freshness_of(clock::now(), fetched_at, jittered_force_refetch_max_age());
     let if_modified_since = list.as_ref().and(fetched_at).map(http_date);
     CachedCidrList { list: list.unwrap_or_default(), freshness, if_modified_since }
 }
@@ -166,22 +161,13 @@ async fn current_cidr_list(kv: &KvStore) -> CachedCidrList {
 /// `VeryStale`, so an unseeded or damaged cache fails toward refreshing.
 fn freshness_of(now: SystemTime, fetched_at: Option<SystemTime>, force_refetch_max_age: Duration) -> CidrListFreshness {
     let Some(fetched_at) = fetched_at else { return CidrListFreshness::VeryStale };
-    if is_cidr_list_fresh(now, fetched_at, CIDR_LIST_MAX_AGE) {
+    if clock::is_within(now, fetched_at, CIDR_LIST_MAX_AGE) {
         CidrListFreshness::Fresh
-    } else if is_cidr_list_fresh(now, fetched_at, force_refetch_max_age) {
+    } else if clock::is_within(now, fetched_at, force_refetch_max_age) {
         CidrListFreshness::Stale
     } else {
         CidrListFreshness::VeryStale
     }
-}
-
-/// True if `fetched_at` is within `max_age` of `now` -- i.e. recent enough
-/// to skip re-fetching. Also false if `fetched_at` is somehow later than
-/// `now` (clock skew, a corrupted value): `SystemTime::duration_since`
-/// returns `Err` in that case, treated the same as "not fresh" rather than
-/// trusting a nonsensical value.
-fn is_cidr_list_fresh(now: SystemTime, fetched_at: SystemTime, max_age: Duration) -> bool {
-    now.duration_since(fetched_at).is_ok_and(|age| age < max_age)
 }
 
 /// `CIDR_LIST_FORCE_REFETCH_MAX_AGE` shortened by a random amount up to
@@ -266,7 +252,7 @@ pub(crate) fn cidr_list_url(env: &Env) -> String {
 }
 
 async fn mark_cidr_list_fetched(kv: &KvStore) {
-    kv_put_best_effort(kv, CIDR_LIST_FETCHED_AT_KV_KEY, &millis_since_epoch(now()).to_string()).await;
+    kv_put_best_effort(kv, CIDR_LIST_FETCHED_AT_KV_KEY, &millis_since_epoch(clock::now()).to_string()).await;
 }
 
 /// An HTTP-date string (e.g. for `If-Modified-Since`) for the given point
@@ -351,41 +337,6 @@ mod tests {
     #[test]
     fn test_freshness_of_missing_timestamp_is_very_stale() {
         assert_eq!(freshness_of(UNIX_EPOCH, None, CIDR_LIST_FORCE_REFETCH_MAX_AGE), CidrListFreshness::VeryStale);
-    }
-
-    #[test]
-    fn test_is_cidr_list_fresh_within_max_age() {
-        let fetched_at = UNIX_EPOCH + Duration::from_millis(500);
-        let now = UNIX_EPOCH + Duration::from_millis(1_000);
-        assert!(is_cidr_list_fresh(now, fetched_at, CIDR_LIST_MAX_AGE));
-    }
-
-    #[test]
-    fn test_is_cidr_list_fresh_outside_max_age() {
-        let fetched_at = UNIX_EPOCH + Duration::from_millis(1_000);
-        let now = fetched_at + CIDR_LIST_MAX_AGE + Duration::from_millis(1);
-        assert!(!is_cidr_list_fresh(now, fetched_at, CIDR_LIST_MAX_AGE));
-    }
-
-    #[test]
-    fn test_is_cidr_list_fresh_within_force_refetch_max_age() {
-        let fetched_at = UNIX_EPOCH + Duration::from_millis(500);
-        let now = UNIX_EPOCH + Duration::from_millis(1_000);
-        assert!(is_cidr_list_fresh(now, fetched_at, CIDR_LIST_FORCE_REFETCH_MAX_AGE));
-    }
-
-    #[test]
-    fn test_is_cidr_list_fresh_outside_force_refetch_max_age() {
-        let fetched_at = UNIX_EPOCH + Duration::from_millis(1_000);
-        let now = fetched_at + CIDR_LIST_FORCE_REFETCH_MAX_AGE + Duration::from_millis(1);
-        assert!(!is_cidr_list_fresh(now, fetched_at, CIDR_LIST_FORCE_REFETCH_MAX_AGE));
-    }
-
-    #[test]
-    fn test_is_cidr_list_fresh_fetched_at_in_future_is_not_fresh() {
-        let now = UNIX_EPOCH + Duration::from_millis(1_000);
-        let fetched_at = UNIX_EPOCH + Duration::from_millis(2_000);
-        assert!(!is_cidr_list_fresh(now, fetched_at, CIDR_LIST_MAX_AGE));
     }
 
     #[test]
