@@ -353,6 +353,17 @@ impl MockDistributor {
     /// `MockDistributor` from every test would then leak for the remainder
     /// of the whole `cargo test` run rather than being scoped to just one.
     fn start(redirect_to: Option<&'static str>) -> Self {
+        Self::start_with(redirect_to, Duration::ZERO, StatusCode::OK)
+    }
+
+    /// A distributor that waits `response_delay` before answering every
+    /// request with `status`, for exercising requests that are still being
+    /// forwarded when another arrives.
+    fn start_slow(response_delay: Duration, status: StatusCode) -> Self {
+        Self::start_with(None, response_delay, status)
+    }
+
+    fn start_with(redirect_to: Option<&'static str>, response_delay: Duration, status: StatusCode) -> Self {
         let port = pick_free_port();
         let server = tiny_http::Server::http(("127.0.0.1", port)).expect("failed to start mock distributor");
         let request_count = Arc::new(AtomicUsize::new(0));
@@ -367,7 +378,8 @@ impl MockDistributor {
                 let _ = request.as_reader().read_to_end(&mut body);
                 *body_store.lock().unwrap() = Some(body);
 
-                let status = if redirect_to.is_some() { StatusCode::FOUND } else { StatusCode::OK };
+                std::thread::sleep(response_delay);
+                let status = if redirect_to.is_some() { StatusCode::FOUND } else { status };
                 let response = Response::from_string("").with_status_code(status.as_u16());
                 let response = match redirect_to {
                     Some(location) => response
@@ -506,6 +518,8 @@ fn integration_test() {
     forwards_put_to_valid_target(port);
     rejects_redirecting_distributor(port);
     post_suppresses_following_put(port);
+    put_waits_for_a_slow_post_and_is_suppressed_when_it_succeeds(port);
+    put_forwards_after_a_slow_post_that_fails(port);
 }
 
 /// PUTs to a throwaway distributor from `client_ip`, returning the proxy's
@@ -804,4 +818,61 @@ fn post_suppresses_following_put(port: u16) {
         1,
         "only the POST's content should reach the distributor, not a duplicate wake-up"
     );
+}
+
+/// A push server slower to answer than the correlation wait, so the POST is
+/// still being forwarded when its PUT has finished waiting.
+const SLOW_PUSH_SERVER_DELAY: Duration = Duration::from_millis(700);
+/// How long after starting the POST the PUT is sent: after the POST has
+/// reached the correlator, well inside the push server's delay.
+const PUT_SENT_AFTER_POST: Duration = Duration::from_millis(100);
+
+/// Sends a POST and, shortly after, the PUT for the same endpoint, returning
+/// the PUT's status and the POST's status.
+fn post_then_put_while_post_in_flight(port: u16, target: &str) -> (u16, u16) {
+    let post_thread = {
+        let target_for_post = target.to_string();
+        std::thread::spawn(move || {
+            status_of(
+                ureq::post(&worker_url(port, &format!("/aesgcm?e={target_for_post}")))
+                    .set("CF-Connecting-IP", TELEGRAM_IP)
+                    .set("Encryption", "salt=abc")
+                    .set("Crypto-Key", "dh=xyz")
+                    .timeout(REQUEST_TIMEOUT)
+                    .send_string("ciphertext"),
+            )
+        })
+    };
+    std::thread::sleep(PUT_SENT_AFTER_POST);
+    let put_status = status_of(
+        ureq::put(&worker_url(port, &format!("/{target}")))
+            .set("CF-Connecting-IP", TELEGRAM_IP)
+            .timeout(REQUEST_TIMEOUT)
+            .send_string("wake-up-body"),
+    );
+    (put_status, post_thread.join().expect("POST thread panicked"))
+}
+
+/// The PUT's own wait ends while the POST is still being forwarded. It must
+/// keep waiting for that POST rather than forwarding a duplicate wake-up.
+fn put_waits_for_a_slow_post_and_is_suppressed_when_it_succeeds(port: u16) {
+    let distributor = MockDistributor::start_slow(SLOW_PUSH_SERVER_DELAY, StatusCode::OK);
+
+    let (put_answer, post_answer) = post_then_put_while_post_in_flight(port, &encode(&distributor.url()));
+
+    assert_eq!(post_answer, 201, "the POST should forward successfully, just slowly");
+    assert_eq!(put_answer, 200, "the PUT should be suppressed once its POST succeeds");
+    assert_eq!(distributor.request_count(), 1, "only the POST should reach the push server");
+}
+
+/// A POST that fails records nothing, so waiting on it must not suppress the
+/// PUT: the wake-up is then the only notification that gets through.
+fn put_forwards_after_a_slow_post_that_fails(port: u16) {
+    let distributor = MockDistributor::start_slow(SLOW_PUSH_SERVER_DELAY, StatusCode::INTERNAL_SERVER_ERROR);
+
+    let (put_answer, post_answer) = post_then_put_while_post_in_flight(port, &encode(&distributor.url()));
+
+    assert_eq!(post_answer, 500, "the push server's failure is passed back to the POST");
+    assert_eq!(put_answer, 500, "the PUT was forwarded, so it gets the push server's answer");
+    assert_eq!(distributor.request_count(), 2, "the failed POST must not have suppressed the PUT");
 }

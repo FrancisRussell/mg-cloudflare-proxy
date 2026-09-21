@@ -60,10 +60,22 @@ const RECENT_POST_WINDOW: Duration = Duration::from_secs(2);
 /// timing to derive this from — it's an empirical guess, not a spec value.
 const CORRELATION_WAIT: Duration = Duration::from_millis(200);
 
+/// The longest a PUT keeps waiting for POSTs that are still being forwarded
+/// once `CORRELATION_WAIT` is over. Past it the PUT stops waiting and
+/// forwards, accepting a possible duplicate over holding the wake-up up
+/// behind a slow push server.
+const POST_IN_FLIGHT_MAX_WAIT: Duration = Duration::from_secs(5);
+/// How often that wait checks whether the POSTs have finished.
+const POST_IN_FLIGHT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 #[durable_object]
 #[derive(Debug)]
 pub struct Correlator {
     last_post: Cell<Option<SystemTime>>,
+    /// POSTs currently being forwarded. Each one is unrecorded in `last_post`
+    /// until its forward succeeds, so a PUT that only looked at `last_post`
+    /// could forward a wake-up while its own POST was still on the way.
+    posts_in_flight: Cell<u32>,
     // A Durable Object's `fetch` takes `&self`, so the runtime can dispatch
     // concurrent requests to the same instance, interleaved at `.await`
     // points. Without this flag, two PUTs arriving close together could
@@ -78,7 +90,9 @@ impl DurableObject for Correlator {
     // Neither `State` nor `Env` is needed: correlation state lives purely in
     // `last_post`/`put_in_flight` (see module doc — deliberately not
     // `state.storage()`), and forwarding needs no bindings.
-    fn new(_state: State, _env: Env) -> Self { Self { last_post: Cell::new(None), put_in_flight: Cell::new(false) } }
+    fn new(_state: State, _env: Env) -> Self {
+        Self { last_post: Cell::new(None), posts_in_flight: Cell::new(0), put_in_flight: Cell::new(false) }
+    }
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
         let Some(target) = req.headers().get(crate::header_names::X_RELAY_TARGET.as_str())? else {
@@ -100,6 +114,7 @@ impl Correlator {
     /// record that this endpoint just received real content, so a PUT
     /// arriving shortly after knows to suppress its wake-up.
     async fn handle_post(&self, target: &url::Url, body: Vec<u8>) -> Result<Response> {
+        let _in_flight = PostInFlight::begin(&self.posts_in_flight);
         let resp = forward(target, body).await?;
         if StatusCode::from_u16(resp.status_code()).is_ok_and(|s| s.is_success()) {
             self.last_post.set(Some(clock::now()));
@@ -120,6 +135,7 @@ impl Correlator {
         let Some(claim) = PutInFlight::claim(&self.put_in_flight) else { return Response::ok("") };
 
         Delay::from(CORRELATION_WAIT).await;
+        self.wait_for_posts_in_flight().await;
 
         let should_forward = !self.recent_post();
         drop(claim);
@@ -131,7 +147,32 @@ impl Correlator {
         }
     }
 
+    /// Waits, up to `POST_IN_FLIGHT_MAX_WAIT`, for POSTs still being forwarded:
+    /// one may yet succeed and make this PUT redundant. A POST that fails
+    /// records nothing, so the PUT still forwards after it.
+    async fn wait_for_posts_in_flight(&self) {
+        let deadline = clock::now() + POST_IN_FLIGHT_MAX_WAIT;
+        while self.posts_in_flight.get() > 0 && clock::now() < deadline {
+            Delay::from(POST_IN_FLIGHT_POLL_INTERVAL).await;
+        }
+    }
+
     fn recent_post(&self) -> bool { is_post_recent(clock::now(), self.last_post.get(), RECENT_POST_WINDOW) }
+}
+
+/// Counts a POST as in flight for as long as it lives, including if it is
+/// cancelled or fails.
+struct PostInFlight<'a>(&'a Cell<u32>);
+
+impl<'a> PostInFlight<'a> {
+    fn begin(counter: &'a Cell<u32>) -> Self {
+        counter.set(counter.get() + 1);
+        Self(counter)
+    }
+}
+
+impl Drop for PostInFlight<'_> {
+    fn drop(&mut self) { self.0.set(self.0.get() - 1); }
 }
 
 /// Holds `Correlator::put_in_flight` for as long as it lives. Releasing on
@@ -235,6 +276,18 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     use super::*;
+
+    #[test]
+    fn test_post_in_flight_counts_overlapping_posts_until_dropped() {
+        let counter = Cell::new(0);
+        let first = PostInFlight::begin(&counter);
+        let second = PostInFlight::begin(&counter);
+        assert_eq!(counter.get(), 2);
+        drop(first);
+        assert_eq!(counter.get(), 1);
+        drop(second);
+        assert_eq!(counter.get(), 0);
+    }
 
     #[test]
     fn test_put_in_flight_is_exclusive_until_dropped() {
