@@ -22,6 +22,8 @@ bindings = [
   { name = "CORRELATOR", class_name = "Correlator" }
 ]
 
+# SQLite-backed, the only kind Workers Free and new accounts can create. The
+# Correlator keeps its state in memory and never touches storage.
 [[migrations]]
 tag = "v1"
-new_classes = ["Correlator"]
+new_sqlite_classes = ["Correlator"]
