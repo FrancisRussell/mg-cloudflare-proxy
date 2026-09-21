@@ -38,6 +38,7 @@ MILLIS_PER_SECOND=1000
 LOCAL_MAX_AGE_SECONDS=$((24 * 60 * 60)) # Matches the Worker's own CIDR_LIST_MAX_AGE.
 FETCH_TIMEOUT_SECONDS=30
 HTTP_NOT_MODIFIED=304
+CIDR_LINE_REGEX='^[0-9a-fA-F:.]+(/[0-9]+)?$'
 
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
@@ -52,8 +53,7 @@ local_fetched_at() {
 
 # Sanity check only; the Worker re-validates on every fetch it does itself.
 looks_like_cidr_list() {
-  grep -qE '^[0-9a-fA-F:.]+(/[0-9]+)?$' "$1" \
-    && ! grep -vE '^[[:space:]]*$|^[0-9a-fA-F:.]+(/[0-9]+)?$' "$1" | grep -q .
+  grep -qE "$CIDR_LINE_REGEX" "$1" && ! grep -qvE "^[[:space:]]*\$|$CIDR_LINE_REGEX" "$1"
 }
 
 # Refreshes the local copy unless it's recent enough.
@@ -116,4 +116,4 @@ fi
 npx wrangler kv key put --binding "$KV_BINDING" "$LIST_KEY" --path "$LOCAL_LIST" "$@"
 npx wrangler kv key put --binding "$KV_BINDING" "$FETCHED_AT_KEY" "$local_at" "$@"
 
-echo "✓ Seeded $KV_BINDING with $(grep -cE '^[0-9a-fA-F:.]+' "$LOCAL_LIST") ranges from $FETCH_URL."
+echo "✓ Seeded $KV_BINDING with $(grep -cE "$CIDR_LINE_REGEX" "$LOCAL_LIST") ranges from $FETCH_URL."
