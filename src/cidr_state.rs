@@ -6,6 +6,7 @@ use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
 
 use ipnetwork::IpNetwork;
+use thiserror::Error;
 use worker::js_sys;
 
 use crate::clock;
@@ -31,36 +32,33 @@ const CIDR_LIST_FORCE_REFETCH_MAX_AGE: Duration = Duration::from_hours(30 * 24);
 /// at the same instant.
 const CIDR_LIST_FORCE_REFETCH_JITTER: Duration = Duration::from_hours(12);
 
-/// Validate a CIDR block or plain IP string. Returns true if parseable.
-/// Plain IPs (no "/") are valid and treated as /32 (IPv4) or /128 (IPv6).
-fn validate_cidr_line(line: &str) -> bool {
-    if line.is_empty() {
-        return false;
-    }
-    line.parse::<IpNetwork>().is_ok()
+/// Why a fetched CIDR list can't be used. The messages double as the reason
+/// logged for it, so they stay short and free of spaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(crate) enum CidrListError {
+    /// The list has no entries, so it would reject every request
+    #[error("empty_list")]
+    Empty,
+
+    /// At least one non-empty line isn't a CIDR block or IP address
+    #[error("malformed_list")]
+    Malformed,
 }
 
-/// Parse and validate CIDR list, returning only the validated entries.
-/// Skips empty lines; returns None if any non-empty line is malformed or if
-/// list is empty.
-pub(crate) fn parse_cidr_list(content: &str) -> Option<String> {
-    let mut entries = Vec::new();
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if !validate_cidr_line(trimmed) {
-            return None; // Any malformed line rejects entire list
-        }
-        entries.push(trimmed);
+/// The networks in a fetched CIDR list, one per line. Empty lines are skipped,
+/// and a plain IP address counts as a single-address network. Any malformed
+/// line rejects the whole list.
+pub(crate) fn parse_cidr_list(content: &str) -> Result<Vec<IpNetwork>, CidrListError> {
+    let networks = content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| line.parse().map_err(|_| CidrListError::Malformed))
+        .collect::<Result<Vec<_>, _>>()?;
+    if networks.is_empty() {
+        return Err(CidrListError::Empty);
     }
-
-    if entries.is_empty() {
-        return None;
-    }
-
-    Some(entries.join("\n"))
+    Ok(networks)
 }
 
 /// The networks in `list`, skipping any line that doesn't parse.
@@ -125,8 +123,8 @@ impl CidrSnapshot {
     pub(crate) fn after(&self, outcome: &CidrFetchOutcome, now: SystemTime) -> Self {
         let mut updated = self.clone();
         match outcome {
-            CidrFetchOutcome::Updated(list) => {
-                updated.networks = parse_networks(list);
+            CidrFetchOutcome::Updated { networks, .. } => {
+                updated.networks.clone_from(networks);
                 updated.fetched_at = Some(now);
                 updated.failed_at = None;
             }
@@ -217,8 +215,9 @@ pub(crate) enum UnknownIpPlan {
 /// What asking Telegram for the CIDR list came to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CidrFetchOutcome {
-    /// Telegram sent a valid list.
-    Updated(String),
+    /// Telegram sent a valid list: its text as received, and the networks
+    /// parsed from it.
+    Updated { body: String, networks: Vec<IpNetwork> },
     /// Telegram confirmed the cached list is current.
     NotModified,
     /// Telegram answered, but not with a usable list.
@@ -268,49 +267,39 @@ mod tests {
     const SECOND: Duration = Duration::from_secs(1);
 
     #[test]
-    fn test_validate_cidr_line() {
-        let cases = [
-            ("91.108.56.0/22", true),
-            ("0.0.0.0/0", true),
-            ("192.168.1.0/24", true),
-            ("2001:b28:f23d::/48", true),
-            ("::/0", true),
-            ("fe80::/10", true),
-            ("1.2.3.4", true),     // plain IPv4
-            ("2001:db8::1", true), // plain IPv6
-            ("", false),
-            ("not-an-ip", false),
-            ("1.2.3.4/33", false),     // IPv4 prefix too large
-            ("2001:db8::/129", false), // IPv6 prefix too large
-            ("1.2.3.4/abc", false),    // invalid prefix
-        ];
-        for (input, expected) in cases {
-            assert_eq!(validate_cidr_line(input), expected, "input: {input}");
+    fn test_parse_cidr_list_accepts_blocks_and_plain_addresses() {
+        for line in ["91.108.56.0/22", "0.0.0.0/0", "2001:b28:f23d::/48", "::/0", "fe80::/10", "1.2.3.4", "2001:db8::1"]
+        {
+            assert!(parse_cidr_list(line).is_ok(), "input: {line}");
         }
     }
 
     #[test]
-    fn test_parse_cidr_list_valid() {
-        let list = "91.108.56.0/22\n\n91.108.4.0/22\n1.2.3.4";
-        let result = parse_cidr_list(list).expect("the test list is valid");
-        assert!(result.contains("91.108.56.0/22"));
-        assert!(result.contains("1.2.3.4"));
-        assert_eq!(result.lines().count(), 3, "empty line should be skipped");
+    fn test_parse_cidr_list_rejects_invalid_lines() {
+        for line in ["not-an-ip", "1.2.3.4/33", "2001:db8::/129", "1.2.3.4/abc"] {
+            assert_eq!(parse_cidr_list(line), Err(CidrListError::Malformed), "input: {line}");
+        }
     }
 
     #[test]
-    fn test_parse_cidr_list_rejects_malformed() {
-        let list = "91.108.56.0/22\ninvalid-cidr\n91.108.4.0/22";
-        assert!(parse_cidr_list(list).is_none());
+    fn test_parse_cidr_list_skips_empty_lines() {
+        let networks = parse_cidr_list("91.108.56.0/22\n\n91.108.4.0/22\n1.2.3.4").expect("the test list is valid");
+        assert_eq!(networks, parse_networks("91.108.56.0/22\n91.108.4.0/22\n1.2.3.4"));
+        assert_eq!(networks.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_cidr_list_rejects_a_list_with_any_malformed_line() {
+        assert_eq!(parse_cidr_list("91.108.56.0/22\ninvalid-cidr\n91.108.4.0/22"), Err(CidrListError::Malformed));
     }
 
     #[test]
     fn test_parse_cidr_list_empty() {
         // A list with no entries can't be cached: it would reject every
         // request.
-        assert!(parse_cidr_list("").is_none());
-        assert!(parse_cidr_list("\n\n").is_none());
-        assert!(parse_cidr_list("  \n\t\n").is_none());
+        for content in ["", "\n\n", "  \n\t\n"] {
+            assert_eq!(parse_cidr_list(content), Err(CidrListError::Empty), "input: {content:?}");
+        }
     }
 
     #[test]
@@ -430,7 +419,10 @@ mod tests {
     fn test_after_updated_replaces_the_list_and_clears_a_failure() {
         let before = snapshot(Some(CIDR_LIST_MAX_AGE * 2), Some(SOON_AFTER_ATTEMPT));
         assert!(before.failed_at.is_some());
-        let after = before.after(&CidrFetchOutcome::Updated("1.2.3.4".to_string()), now());
+        let after = before.after(
+            &CidrFetchOutcome::Updated { body: "1.2.3.4".to_string(), networks: parse_networks("1.2.3.4") },
+            now(),
+        );
         assert_eq!(after.networks, parse_networks("1.2.3.4"));
         assert_eq!(after.fetched_at, Some(now()));
         assert_eq!(after.failed_at, None);

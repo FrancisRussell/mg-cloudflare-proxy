@@ -245,9 +245,9 @@ impl CidrAllowlist {
     /// KV, also records that Telegram confirmed the list.
     async fn persist(&self, outcome: &CidrFetchOutcome, now: SystemTime) {
         match outcome {
-            CidrFetchOutcome::Updated(list) => {
+            CidrFetchOutcome::Updated { body, .. } => {
                 // Only vouch for the list in KV if it actually got written.
-                if self.kv_put_best_effort(CIDR_LIST_KV_KEY, list).await {
+                if self.kv_put_best_effort(CIDR_LIST_KV_KEY, body).await {
                     self.mark_confirmed(now).await;
                 } else {
                     self.mark_failed(now).await;
@@ -295,13 +295,15 @@ impl CidrAllowlist {
                 return CidrFetchOutcome::Rejected;
             }
         };
-        let Some(list) = parse_cidr_list(&body) else {
-            let reason = if body.trim().is_empty() { "empty_list" } else { "malformed_list" };
-            console_error!("cidr_fetch: outcome=failed reason={reason} status={status}");
-            return CidrFetchOutcome::Rejected;
+        let networks = match parse_cidr_list(&body) {
+            Ok(networks) => networks,
+            Err(e) => {
+                console_error!("cidr_fetch: outcome=failed reason={e} status={status}");
+                return CidrFetchOutcome::Rejected;
+            }
         };
-        console_log!("cidr_fetch: outcome=success entries={} status={status}", list.lines().count());
-        CidrFetchOutcome::Updated(list)
+        console_log!("cidr_fetch: outcome=success entries={} status={status}", networks.len());
+        CidrFetchOutcome::Updated { body, networks }
     }
 
     /// Records that a fetch failed.
