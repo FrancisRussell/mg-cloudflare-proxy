@@ -1,11 +1,12 @@
 // What is known about Telegram's CIDR list, and the decisions made from it.
 // Pure logic only: no KV, network or clock access, so it can be tested
-// natively. Loading, fetching and storing live in telegram_cidrs.rs.
+// natively.
 
 use std::net::IpAddr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use ipnetwork::IpNetwork;
+use worker::js_sys;
 
 use crate::clock;
 
@@ -16,18 +17,18 @@ pub(crate) const CIDR_LIST_MAX_AGE: Duration = Duration::from_hours(24);
 /// (give or take `CIDR_LIST_RETRY_JITTER`), so a failing Telegram endpoint
 /// isn't hit by every request.
 const CIDR_LIST_RETRY_INTERVAL: Duration = Duration::from_hours(6);
-/// How far either side of `CIDR_LIST_RETRY_INTERVAL` the jitter reaches (see
-/// `jittered`), spreading out retries that would otherwise all become due at
-/// the same moment.
+/// How far either side of `CIDR_LIST_RETRY_INTERVAL` the random jitter reaches
+/// (see `Thresholds::draw`), spreading out retries that would otherwise all
+/// become due at the same moment.
 const CIDR_LIST_RETRY_JITTER: Duration = Duration::from_hours(1);
 /// Once about this long has passed since Telegram last confirmed the list
 /// (give or take `CIDR_LIST_FORCE_REFETCH_JITTER`), force a background re-fetch
 /// even for a *recognized* IP, so the list can't drift arbitrarily far out of
 /// date while every request happens to come from a known range.
 const CIDR_LIST_FORCE_REFETCH_MAX_AGE: Duration = Duration::from_hours(30 * 24);
-/// How far either side of `CIDR_LIST_FORCE_REFETCH_MAX_AGE` the jitter reaches
-/// (see `jittered`), so deployments don't all cross the threshold at the same
-/// instant.
+/// How far either side of `CIDR_LIST_FORCE_REFETCH_MAX_AGE` the random jitter
+/// reaches (see `Thresholds::draw`), so requests don't all cross the threshold
+/// at the same instant.
 const CIDR_LIST_FORCE_REFETCH_JITTER: Duration = Duration::from_hours(12);
 
 /// Validate a CIDR block or plain IP string. Returns true if parseable.
@@ -70,7 +71,8 @@ pub(crate) fn parse_networks(list: &str) -> Vec<IpNetwork> {
 /// What this isolate knows about the CIDR list.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CidrSnapshot {
-    /// Empty if no list has been cached.
+    /// Empty only if no list has been cached: a fetched list with no entries
+    /// is rejected as unusable, so a cached list is never empty.
     pub networks: Vec<IpNetwork>,
     /// When Telegram last confirmed the list: a successful fetch or a 304.
     /// It is sent as `If-Modified-Since`, so it must never claim a
@@ -113,14 +115,9 @@ impl CidrSnapshot {
         self.fetched_at.is_some_and(|at| clock::is_within(now, at, CIDR_LIST_MAX_AGE))
     }
 
-    /// True if the last fetch failed and it is too soon to try again: the
-    /// retry interval, jittered by a value fixed by the failure's own time so
-    /// that every isolate agrees when it ends.
-    fn retry_pending(&self, now: SystemTime) -> bool {
-        self.failed_at.is_some_and(|failed| {
-            let interval = jittered(CIDR_LIST_RETRY_INTERVAL, CIDR_LIST_RETRY_JITTER, failed);
-            clock::is_within(now, failed, interval)
-        })
+    /// True if the last fetch failed less than `retry_interval` ago.
+    fn retry_pending(&self, now: SystemTime, retry_interval: Duration) -> bool {
+        self.failed_at.is_some_and(|failed| clock::is_within(now, failed, retry_interval))
     }
 
     /// The snapshot after `outcome`, as of `now`: a confirmation clears any
@@ -157,20 +154,40 @@ pub(crate) fn merge(memory: Option<&CidrSnapshot>, kv: CidrSnapshot) -> CidrSnap
     )
 }
 
+/// The thresholds one request applies, each drawn at random within a fixed
+/// range so that requests don't all cross them at the same moment. Which rule
+/// applies is decided by the stored failure time, not by these draws.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Thresholds {
+    retry_interval: Duration,
+    force_refetch_max_age: Duration,
+}
+
+impl Thresholds {
+    /// Thresholds with a fresh random jitter.
+    pub(crate) fn draw() -> Self {
+        Self {
+            retry_interval: jittered(CIDR_LIST_RETRY_INTERVAL, CIDR_LIST_RETRY_JITTER),
+            force_refetch_max_age: jittered(CIDR_LIST_FORCE_REFETCH_MAX_AGE, CIDR_LIST_FORCE_REFETCH_JITTER),
+        }
+    }
+
+    /// The thresholds with no jitter, for tests.
+    #[cfg(test)]
+    fn undrawn() -> Self {
+        Self { retry_interval: CIDR_LIST_RETRY_INTERVAL, force_refetch_max_age: CIDR_LIST_FORCE_REFETCH_MAX_AGE }
+    }
+}
+
 /// True if a request from a *recognized* IP should also start a background
 /// refresh. After a failed fetch that's once the retry interval has passed,
 /// whatever the list's age, until a fetch succeeds. Otherwise it's when
-/// Telegram hasn't confirmed the list for about a month, jittered by a value
-/// fixed by the time of the last confirmation so that every isolate agrees when
-/// that is.
-pub(crate) fn background_refresh_due(snapshot: &CidrSnapshot, now: SystemTime) -> bool {
+/// Telegram hasn't confirmed the list for `thresholds.force_refetch_max_age`.
+pub(crate) fn background_refresh_due(snapshot: &CidrSnapshot, now: SystemTime, thresholds: Thresholds) -> bool {
     if snapshot.failed_at.is_some() {
-        return !snapshot.retry_pending(now);
+        return !snapshot.retry_pending(now, thresholds.retry_interval);
     }
-    snapshot.fetched_at.is_none_or(|fetched| {
-        let max_age = jittered(CIDR_LIST_FORCE_REFETCH_MAX_AGE, CIDR_LIST_FORCE_REFETCH_JITTER, fetched);
-        !clock::is_within(now, fetched, max_age)
-    })
+    snapshot.fetched_at.is_none_or(|fetched| !clock::is_within(now, fetched, thresholds.force_refetch_max_age))
 }
 
 /// What a request from an IP that isn't in the list should do.
@@ -186,10 +203,10 @@ pub(crate) enum UnknownIpPlan {
 }
 
 /// What a request from an IP that isn't in the list should do.
-pub(crate) fn unknown_ip_plan(snapshot: &CidrSnapshot, now: SystemTime) -> UnknownIpPlan {
+pub(crate) fn unknown_ip_plan(snapshot: &CidrSnapshot, now: SystemTime, thresholds: Thresholds) -> UnknownIpPlan {
     if snapshot.confirmed_recently(now) {
         UnknownIpPlan::Reject
-    } else if snapshot.retry_pending(now) {
+    } else if snapshot.retry_pending(now, thresholds.retry_interval) {
         UnknownIpPlan::Unverifiable
     } else {
         UnknownIpPlan::Refresh
@@ -209,34 +226,9 @@ pub(crate) enum CidrFetchOutcome {
     Unreachable,
 }
 
-/// `centre` moved by up to `jitter` either way, by an amount fixed by `since`.
-/// The same timestamp gives the same result in every isolate, so they all agree
-/// on when a threshold measured from it is crossed, while different timestamps
-/// give different results and so spread deployments out.
-fn jittered(centre: Duration, jitter: Duration, since: SystemTime) -> Duration {
-    apply_jitter(centre, jitter, unit_from(since))
-}
-
-/// The number of distinct values a 53-bit integer takes, as a float.
-const FLOAT_MANTISSA_RANGE: f64 = 9_007_199_254_740_992.0; // 2^53
-
-/// A number in `0.0..1.0` derived from `time` by mixing its milliseconds, so
-/// that times close together still give unrelated results.
-fn unit_from(time: SystemTime) -> f64 {
-    let millis = time.duration_since(UNIX_EPOCH).map_or(0, |since_epoch| since_epoch.as_millis());
-    let mut mixed = u64::try_from(millis).unwrap_or(u64::MAX);
-    // The SplitMix64 finaliser.
-    mixed ^= mixed >> 30;
-    mixed = mixed.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    mixed ^= mixed >> 27;
-    mixed = mixed.wrapping_mul(0x94d0_49bb_1331_11eb);
-    mixed ^= mixed >> 31;
-    // Keep the top 53 bits, which a float represents exactly.
-    let top_bits = mixed >> 11;
-    #[allow(clippy::cast_precision_loss)] // 53 bits fit an f64 mantissa exactly
-    let unit = top_bits as f64 / FLOAT_MANTISSA_RANGE;
-    unit
-}
+/// `centre` moved by a random amount up to `jitter` either way, freshly drawn
+/// on every call.
+fn jittered(centre: Duration, jitter: Duration) -> Duration { apply_jitter(centre, jitter, js_sys::Math::random()) }
 
 /// `centre` moved by up to `jitter` either way: `unit`, in `0.0..=1.0`, picks
 /// the position across that range, with 0.5 leaving `centre` unchanged.
@@ -254,6 +246,7 @@ mod tests {
 
     use super::*;
 
+    /// The network a CIDR literal denotes.
     fn network(cidr: &str) -> IpNetwork { cidr.parse().expect("test network literal must parse") }
 
     /// A fixed "now" far enough from the epoch that every age below is a valid
@@ -312,8 +305,11 @@ mod tests {
 
     #[test]
     fn test_parse_cidr_list_empty() {
+        // A list with no entries can't be cached: it would reject every
+        // request.
         assert!(parse_cidr_list("").is_none());
         assert!(parse_cidr_list("\n\n").is_none());
+        assert!(parse_cidr_list("  \n\t\n").is_none());
     }
 
     #[test]
@@ -386,7 +382,7 @@ mod tests {
             (snapshot(None, None), UnknownIpPlan::Refresh),
         ];
         for (state, expected) in cases {
-            assert_eq!(unknown_ip_plan(&state, now()), expected, "state: {state:?}");
+            assert_eq!(unknown_ip_plan(&state, now(), Thresholds::undrawn()), expected, "state: {state:?}");
         }
     }
 
@@ -394,7 +390,7 @@ mod tests {
     fn test_unknown_ip_plan_treats_a_future_confirmation_as_unconfirmed() {
         let mut state = snapshot(None, None);
         state.fetched_at = Some(now() + SECOND);
-        assert_eq!(unknown_ip_plan(&state, now()), UnknownIpPlan::Refresh);
+        assert_eq!(unknown_ip_plan(&state, now(), Thresholds::undrawn()), UnknownIpPlan::Refresh);
     }
 
     #[test]
@@ -409,7 +405,7 @@ mod tests {
             (snapshot(None, None), true),               // never confirmed
         ];
         for (state, expected) in cases {
-            assert_eq!(background_refresh_due(&state, now()), expected, "state: {state:?}");
+            assert_eq!(background_refresh_due(&state, now(), Thresholds::undrawn()), expected, "state: {state:?}");
         }
     }
 
@@ -419,49 +415,14 @@ mod tests {
         // attempt counts.
         for confirmed in [Some(WITHIN_A_MONTH), Some(PAST_A_MONTH), None] {
             assert!(
-                !background_refresh_due(&snapshot(confirmed, Some(SOON_AFTER_ATTEMPT)), now()),
+                !background_refresh_due(&snapshot(confirmed, Some(SOON_AFTER_ATTEMPT)), now(), Thresholds::undrawn()),
                 "confirmed {confirmed:?} ago, failed soon ago"
             );
             assert!(
-                background_refresh_due(&snapshot(confirmed, Some(LONG_AFTER_ATTEMPT)), now()),
+                background_refresh_due(&snapshot(confirmed, Some(LONG_AFTER_ATTEMPT)), now(), Thresholds::undrawn()),
                 "confirmed {confirmed:?} ago, failed long ago"
             );
         }
-    }
-
-    #[test]
-    fn test_decisions_depend_only_on_the_stored_timestamps() {
-        // Inside the jitter band the answer varies between failures but is the
-        // same every time for one failure: nothing random is drawn per request.
-        let in_band = CIDR_LIST_RETRY_INTERVAL;
-        let mut answers = std::collections::HashSet::new();
-        for offset_millis in 0..200 {
-            let failed = now() - in_band - Duration::from_millis(offset_millis * 37);
-            let state = CidrSnapshot::new(vec![network("91.108.56.0/22")], Some(now() - PAST_A_MONTH), Some(failed));
-            let first = state.retry_pending(now());
-            for _ in 0..3 {
-                assert_eq!(state.retry_pending(now()), first);
-            }
-            answers.insert(first);
-        }
-        assert_eq!(answers.len(), 2, "failures at the centre of the band should differ in when their wait ends");
-    }
-
-    #[test]
-    fn test_unit_from_is_deterministic_spread_and_in_range() {
-        let times: Vec<f64> =
-            (0..1000).map(|i| unit_from(UNIX_EPOCH + Duration::from_millis(1_700_000_000_000 + i))).collect();
-        assert!(times.iter().all(|unit| (0.0..1.0).contains(unit)));
-        assert_eq!(
-            unit_from(UNIX_EPOCH + Duration::from_millis(42)).to_bits(),
-            unit_from(UNIX_EPOCH + Duration::from_millis(42)).to_bits()
-        );
-        // Adjacent milliseconds shouldn't give adjacent results, and the values
-        // should cover the range rather than cluster.
-        let mean = times.iter().sum::<f64>() / 1000.0;
-        assert!((0.4..0.6).contains(&mean), "mean {mean}");
-        let below_a_quarter = times.iter().filter(|unit| **unit < 0.25).count();
-        assert!((150..350).contains(&below_a_quarter), "{below_a_quarter} below a quarter");
     }
 
     #[test]

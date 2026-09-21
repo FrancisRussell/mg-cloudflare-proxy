@@ -225,6 +225,7 @@ mod unsafe_ranges {
         "::ffff:0:0:0/96", // IPv4-translated addresses (SIIT), RFC 2765 section 2.1 (embeds an IPv4 address)
     ];
 
+    /// The networks the given CIDR literals denote.
     fn parse_all(cidrs: &[&str]) -> Vec<IpNetwork> {
         cidrs.iter().map(|cidr| cidr.parse().expect("hardcoded CIDR literal must be valid")).collect()
     }
@@ -240,7 +241,6 @@ mod unsafe_ranges {
 fn is_ip_safe(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
-            // Use Rust's built-in methods for standard ranges
             if v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
@@ -251,12 +251,10 @@ fn is_ip_safe(ip: std::net::IpAddr) -> bool {
             {
                 return false;
             }
-            // Check cached ranges Rust doesn't cover
             !unsafe_ranges::UNSAFE_V4.iter().any(|net| net.contains(ip))
         }
         std::net::IpAddr::V6(v6) => {
-            // Use Rust's built-in methods for standard ranges. to_ipv4()
-            // matches both IPv4-compatible (::/96) and IPv4-mapped
+            // to_ipv4() matches both IPv4-compatible (::/96) and IPv4-mapped
             // (::ffff:0:0/96) addresses; it also matches ::1, but
             // is_loopback() above already rejects that case first.
             if v6.is_loopback()
@@ -268,7 +266,6 @@ fn is_ip_safe(ip: std::net::IpAddr) -> bool {
             {
                 return false;
             }
-            // Check cached ranges Rust doesn't cover
             !unsafe_ranges::UNSAFE_V6.iter().any(|net| net.contains(ip))
         }
     }
@@ -298,8 +295,9 @@ fn folding_header_value(value: Option<String>) -> Option<String> {
 
 /// Look up the endpoint's Correlator instance and hand it a pre-shaped
 /// internal request: `X-Relay-Target` carries the validated endpoint,
-/// the method (POST/PUT) tells the Durable Object which branch to run,
-/// and the body is whatever that branch should forward if it decides to.
+/// `X-Relay-Budget-Ms` how much of the request's time is left, the method
+/// (POST/PUT) tells the Durable Object which branch to run, and the body is
+/// whatever that branch should forward if it decides to.
 async fn call_correlator(
     env: &Env, endpoint: &url::Url, method: Method, body: Vec<u8>, deadline: Deadline,
 ) -> Result<Response> {
@@ -444,9 +442,8 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
     console_error_panic_hook::set_once();
 
     // `ctx` rides as the router's per-request data (`RouteContext::data`) so
-    // handlers can reach `ctx.wait_until` for the background CIDR re-fetch
-    // backstop -- the router itself has no notion of the fetch event's
-    // Context otherwise.
+    // handlers can reach `ctx.wait_until` for CIDR list refreshes -- the router
+    // itself has no notion of the fetch event's Context otherwise.
     Router::with_data(ctx).post_async("/aesgcm", handle_aesgcm).put_async("/*path", handle_put).run(req, env).await
 }
 

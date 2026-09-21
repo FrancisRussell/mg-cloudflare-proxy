@@ -9,9 +9,9 @@
 // same instance and can be correlated — a plain Worker gives no such
 // guarantee across separate requests.
 //
-// State lives in `Cell`, not `state.storage()`: the correlation window is
-// only ~2s, well under a Durable Object's idle eviction time, so nothing
-// here is worth persisting across a restart.
+// State lives in `Cell`, not `state.storage()`: the correlation window
+// (`RECENT_POST_WINDOW`) is far shorter than a Durable Object's idle eviction
+// time, so nothing here is worth persisting across a restart.
 
 use std::cell::Cell;
 use std::time::{Duration, SystemTime};
@@ -22,7 +22,7 @@ use worker::*;
 use crate::clock::{self, Deadline};
 use crate::outbound::{send_with_timeout, FetchFailure};
 
-/// Header names used when forwarding to the distributor.
+/// Header names used when forwarding to the push server.
 /// `HeaderName::from_static` is `const fn`, so these are checked and built at
 /// compile time; `worker::Headers` itself only takes `&str`, so callers pass
 /// `NAME.as_str()`.
@@ -36,12 +36,12 @@ mod header_names {
     /// The `WebPush` payload encoding of the forwarded body.
     pub const CONTENT_ENCODING: HeaderName = HeaderName::from_static("content-encoding");
     /// RFC 8030 §5 resource URL for the created push message, on both the
-    /// distributor's response and our own normalized one.
+    /// push server's response and our own normalized one.
     pub const LOCATION: HeaderName = HeaderName::from_static("location");
 }
 
 /// RFC 8030 §5.2 message lifetime sent on the forwarded push, in seconds --
-/// the maximum, so the distributor retries delivery for as long as it's
+/// the maximum, so the push server retries delivery for as long as it's
 /// willing to rather than giving up early.
 const TTL_SECONDS: u32 = 30 * 24 * 60 * 60;
 /// RFC 8030 §5.3 delivery priority sent on the forwarded push -- Telegram
@@ -166,6 +166,7 @@ impl Correlator {
         }
     }
 
+    /// True if a POST for this endpoint succeeded within `RECENT_POST_WINDOW`.
     fn recent_post(&self) -> bool { is_post_recent(clock::now(), self.last_post.get(), RECENT_POST_WINDOW) }
 }
 
@@ -175,6 +176,7 @@ impl Correlator {
 struct PostInFlight<'a>(&'a Cell<u32>);
 
 impl<'a> PostInFlight<'a> {
+    /// Counts one more POST in flight, until the returned value is dropped.
     fn begin(counter: &'a Cell<u32>) -> Self {
         counter.set(counter.get() + 1);
         Self(counter)
@@ -242,20 +244,20 @@ async fn forward(target: &url::Url, body: Vec<u8>, deadline: Deadline) -> Result
             return crate::error_response(failure_status(failure));
         }
     };
-    let distributor_status = resp.status_code();
+    let push_server_status = resp.status_code();
 
-    // A distributor that redirects is rejected outright rather than relayed:
+    // A push server that redirects is rejected outright rather than relayed:
     // the SSRF check on `target` never saw wherever the Location points.
-    if StatusCode::from_u16(distributor_status).is_ok_and(|s| s.is_redirection()) {
+    if StatusCode::from_u16(push_server_status).is_ok_and(|s| s.is_redirection()) {
         console_error!(
-            "forward rejected: host={host} reason=distributor_redirected distributor_status={distributor_status}"
+            "forward rejected: host={host} reason=push_server_redirected push_server_status={push_server_status}"
         );
         return crate::error_response(StatusCode::BAD_GATEWAY);
     }
 
     let location = resp.headers().get(header_names::LOCATION.as_str())?;
     let retry_after = resp.headers().get(http::header::RETRY_AFTER.as_str())?;
-    let response = match forward_reply(distributor_status, location.as_deref(), retry_after.as_deref(), target.as_str())
+    let response = match forward_reply(push_server_status, location.as_deref(), retry_after.as_deref(), target.as_str())
     {
         ForwardReply::Created { location } => {
             let headers = Headers::new();
@@ -272,7 +274,7 @@ async fn forward(target: &url::Url, body: Vec<u8>, deadline: Deadline) -> Result
     };
 
     console_log!(
-        "forwarded: host={host} body_size={body_size} distributor_status={distributor_status} our_status={}",
+        "forwarded: host={host} body_size={body_size} push_server_status={push_server_status} our_status={}",
         response.status_code()
     );
     Ok(response)
@@ -362,7 +364,10 @@ mod tests {
         let target = "https://target.example";
         assert_eq!(
             forward_reply(StatusCode::TOO_MANY_REQUESTS.as_u16(), Some("https://example.com/x"), Some("30"), target),
-            ForwardReply::Failed { status: 429, retry_after: Some("30".to_string()) }
+            ForwardReply::Failed {
+                status: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                retry_after: Some("30".to_string())
+            }
         );
         assert_eq!(
             forward_reply(StatusCode::NOT_FOUND.as_u16(), None, None, target),

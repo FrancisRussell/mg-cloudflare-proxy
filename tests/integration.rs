@@ -79,6 +79,12 @@ const BUDGET_TOLERANCE: Duration = Duration::from_millis(1500);
 /// jitter.
 const LONG_AFTER_FAILURE: Duration = Duration::from_hours(8);
 
+/// How many requests arrive together in the shared-refresh scenario.
+const CONCURRENT_REQUESTS: usize = 3;
+/// How long the mock CIDR server takes to answer in the shared-refresh
+/// scenario, long enough that the requests overlap.
+const SLOW_CIDR_RESPONSE_DELAY: Duration = Duration::from_secs(1);
+
 /// A body size comfortably over the Worker's request body limit.
 const OVERSIZED_BODY_BYTES: usize = 64 * 1024;
 
@@ -96,10 +102,7 @@ fn kill_wrangler_process_group() {
     let pgid = WRANGLER_PGID.swap(0, Ordering::SeqCst);
     if pgid != 0 {
         // A negative PID targets the whole process group, per kill(2).
-        // pgid fits in i32: it's a real PID, which the OS caps well under
-        // i32::MAX.
-        #[allow(clippy::cast_possible_wrap)]
-        let group = Pid::from_raw(-(pgid as i32));
+        let group = Pid::from_raw(-i32::try_from(pgid).expect("a PID fits an i32"));
         if let Err(e) = signal::kill(group, Signal::SIGKILL) {
             eprintln!("warning: failed to kill wrangler dev process group {pgid}: {e}");
         }
@@ -131,6 +134,7 @@ fn pick_free_port() -> u16 {
 /// Manages a `wrangler dev` child process covering the whole test run:
 /// rebuilds the worker, starts it, and waits until it responds to requests.
 /// The whole process tree is killed on drop.
+#[derive(Debug)]
 struct WranglerDev {
     child: Child,
     port: u16,
@@ -370,6 +374,7 @@ impl WranglerDev {
             .unwrap_or_else(|e| panic!("writing {key} to KV failed: {e}"));
     }
 
+    /// Removes `key` from the local CIDR cache namespace.
     fn kv_delete(&self, key: &str) {
         ureq::delete(&format!("{}/values/{key}", self.kv_api_url()))
             .timeout(REQUEST_TIMEOUT)
@@ -377,12 +382,14 @@ impl WranglerDev {
             .unwrap_or_else(|e| panic!("deleting {key} from KV failed: {e}"));
     }
 
+    /// Writes each key and value in turn.
     fn kv_put_many(&self, entries: &[(&str, &str)]) {
         for (key, value) in entries {
             self.kv_put(key, value);
         }
     }
 
+    /// Removes each key in turn.
     fn kv_delete_many(&self, keys: &[&str]) {
         for key in keys {
             self.kv_delete(key);
@@ -462,8 +469,6 @@ impl Drop for WranglerDev {
     }
 }
 
-/// A minimal HTTP server standing in for a `UnifiedPush` distributor,
-/// recording what it receives instead of doing anything with it.
 /// The body and `Retry-After` a `MockDistributor` answers with.
 #[derive(Debug, Clone, Copy, Default)]
 struct Reply {
@@ -471,6 +476,9 @@ struct Reply {
     retry_after: Option<&'static str>,
 }
 
+/// A minimal HTTP server standing in for a `UnifiedPush` distributor,
+/// recording what it receives instead of doing anything with it.
+#[derive(Debug, Clone)]
 struct MockDistributor {
     port: u16,
     request_count: Arc<AtomicUsize>,
@@ -507,6 +515,8 @@ impl MockDistributor {
         Self::start_with(None, Duration::ZERO, status, reply)
     }
 
+    /// Starts a distributor with the given behaviour; the other constructors
+    /// are shorthands for common combinations.
     fn start_with(
         redirect_to: Option<&'static str>, response_delay: Duration, status: StatusCode, reply: Reply,
     ) -> Self {
@@ -556,8 +566,10 @@ impl MockDistributor {
     /// does reach this same machine, unlike in production Cloudflare Workers.
     fn url(&self) -> String { format!("http://localhost:{}/distributor", self.port) }
 
+    /// How many requests have reached the distributor.
     fn request_count(&self) -> usize { self.request_count.load(Ordering::SeqCst) }
 
+    /// The body of the most recent request.
     fn last_body(&self) -> Vec<u8> {
         self.last_body
             .lock()
@@ -577,6 +589,7 @@ impl MockDistributor {
 /// Same leaked-background-thread caveat as `MockDistributor` above: fine for
 /// this file's single `#[test] fn`, but would need explicit teardown if a
 /// second one is ever added.
+#[derive(Debug, Clone)]
 struct MockCidrServer {
     port: u16,
     request_count: Arc<AtomicUsize>,
@@ -589,6 +602,8 @@ struct MockCidrServer {
 }
 
 impl MockCidrServer {
+    /// Starts a server answering every request with `body` until told
+    /// otherwise.
     fn start(body: String) -> Self {
         // A hand-rolled server rather than `tiny_http`, so that "unreachable"
         // can close a connection without answering.
@@ -647,8 +662,10 @@ impl MockCidrServer {
         Self { port, request_count, last_if_modified_since, body, status, unreachable, silent, response_delay }
     }
 
+    /// Changes the list the server answers with.
     fn set_body(&self, body: String) { *self.body.lock().expect("a thread panicked while holding the lock") = body; }
 
+    /// Changes the status the server answers with.
     fn set_status(&self, status: StatusCode) { self.status.store(status.as_u16(), Ordering::SeqCst); }
 
     /// While set, requests are counted and their connections held open without
@@ -668,8 +685,11 @@ impl MockCidrServer {
     /// `MockDistributor::url` -- see its doc comment.
     fn url(&self) -> String { format!("http://localhost:{}/cidr.txt", self.port) }
 
+    /// How many requests have reached the server.
     fn request_count(&self) -> usize { self.request_count.load(Ordering::SeqCst) }
 
+    /// The `If-Modified-Since` header of the most recent request, if it had
+    /// one.
     fn last_if_modified_since(&self) -> Option<String> {
         self.last_if_modified_since.lock().expect("a thread panicked while holding the lock").clone()
     }
@@ -698,18 +718,23 @@ fn header_value(request_head: &str, name: &str) -> Option<String> {
     })
 }
 
+/// The URL of `path` on the Worker under test.
 fn worker_url(port: u16, path: &str) -> String { format!("http://127.0.0.1:{port}{path}") }
 
+/// `s` percent-encoded as one path segment or query value.
 fn encode(s: &str) -> String {
     percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
-fn status_of(result: Result<ureq::Response, ureq::Error>) -> u16 {
-    match result {
+/// The status the proxy answered with, whether ureq counts it as a success
+/// or an error status.
+fn status_of(result: Result<ureq::Response, ureq::Error>) -> StatusCode {
+    let code = match result {
         Ok(resp) => resp.status(),
         Err(ureq::Error::Status(code, _)) => code,
         Err(e) => panic!("request failed: {e}"),
-    }
+    };
+    StatusCode::from_u16(code).expect("the proxy answers with a valid status")
 }
 
 /// IPv4 addresses from the RFC 5737 documentation range -- guaranteed not to
@@ -760,7 +785,7 @@ fn integration_test() {
 /// PUTs to a throwaway distributor from `client_ip`, returning the proxy's
 /// status. What the distributor does with it doesn't matter to the CIDR
 /// scenarios, only whether the proxy let the request through.
-fn put_from(port: u16, client_ip: &str) -> u16 {
+fn put_from(port: u16, client_ip: &str) -> StatusCode {
     let distributor = MockDistributor::start(None);
     let resp = ureq::put(&worker_url(port, &format!("/{}", encode(&distributor.url()))))
         .set("CF-Connecting-IP", client_ip)
@@ -792,8 +817,8 @@ fn seeding_makes_recognized_ips_need_no_fetch(port: u16, dev: &WranglerDev, cidr
     let fetches_after_seed = cidr_server.request_count();
     assert_eq!(fetches_after_seed, 1, "the seed script should fetch the list once");
 
-    assert_eq!(put_from(port, TELEGRAM_IP), 201);
-    assert_eq!(put_from(port, MOCK_CIDR_IP_A), 201);
+    assert_eq!(put_from(port, TELEGRAM_IP), StatusCode::CREATED);
+    assert_eq!(put_from(port, MOCK_CIDR_IP_A), StatusCode::CREATED);
     assert_eq!(cidr_server.request_count(), fetches_after_seed, "recognized IPs shouldn't trigger a fetch");
 
     dev.seed_cidr_cache(&cidr_server.url());
@@ -808,7 +833,7 @@ fn seeding_makes_recognized_ips_need_no_fetch(port: u16, dev: &WranglerDev, cidr
 /// again: a flood of unrecognized IPs mustn't turn into a flood of fetches.
 fn unrecognized_ip_against_fresh_cache_does_not_fetch(port: u16, cidr_server: &MockCidrServer) {
     let fetches_before = cidr_server.request_count();
-    assert_eq!(put_from(port, MOCK_CIDR_IP_B), 403);
+    assert_eq!(put_from(port, MOCK_CIDR_IP_B), StatusCode::FORBIDDEN);
     assert_eq!(cidr_server.request_count(), fetches_before);
 }
 
@@ -828,31 +853,35 @@ fn invalid_requests_from_unrecognized_ip_do_not_fetch(port: u16, dev: &mut Wrang
         .set("Crypto-Key", "dh=xyz")
         .timeout(REQUEST_TIMEOUT)
         .send_bytes(&oversized);
-    assert_eq!(status_of(resp), 413, "an oversized POST body should be rejected");
+    assert_eq!(status_of(resp), StatusCode::PAYLOAD_TOO_LARGE, "an oversized POST body should be rejected");
 
     let resp = ureq::put(&worker_url(port, &format!("/{target}")))
         .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
         .timeout(REQUEST_TIMEOUT)
         .send_bytes(&oversized);
-    assert_eq!(status_of(resp), 413, "an oversized PUT body should be rejected");
+    assert_eq!(status_of(resp), StatusCode::PAYLOAD_TOO_LARGE, "an oversized PUT body should be rejected");
 
     let resp = ureq::put(&worker_url(port, "/not-a-url"))
         .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
         .timeout(REQUEST_TIMEOUT)
         .send_string("body");
-    assert_eq!(status_of(resp), 403, "a PUT with an invalid endpoint should be rejected");
+    assert_eq!(status_of(resp), StatusCode::FORBIDDEN, "a PUT with an invalid endpoint should be rejected");
 
     let resp = ureq::post(&worker_url(port, &format!("/aesgcm?e={target}")))
         .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
         .timeout(REQUEST_TIMEOUT)
         .send_string("ciphertext");
-    assert_eq!(status_of(resp), 400, "a POST without the aesgcm headers should be rejected");
+    assert_eq!(status_of(resp), StatusCode::BAD_REQUEST, "a POST without the aesgcm headers should be rejected");
 
     let resp = ureq::put(&worker_url(port, &format!("/{target}")))
         .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
         .timeout(REQUEST_TIMEOUT)
         .send(std::io::Cursor::new(oversized.clone()));
-    assert_eq!(status_of(resp), 413, "an oversized PUT body sent without a length should be rejected");
+    assert_eq!(
+        status_of(resp),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "an oversized PUT body sent without a length should be rejected"
+    );
 
     // Under `wrangler dev`, answering a chunked upload before it finishes can
     // leave the local proxy's connection to the Worker dead, failing whatever
@@ -861,7 +890,7 @@ fn invalid_requests_from_unrecognized_ip_do_not_fetch(port: u16, dev: &mut Wrang
 
     assert_eq!(cidr_server.request_count(), fetches_before, "none of those should have triggered a fetch");
 
-    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403);
+    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), StatusCode::FORBIDDEN);
     assert_eq!(
         cidr_server.request_count(),
         fetches_before + 1,
@@ -876,14 +905,22 @@ fn unrecognized_ip_against_stale_cache_fetches(port: u16, dev: &mut WranglerDev,
     dev.age_cidr_cache_and_restart(STALE_CACHE_AGE);
     let fetches_before = cidr_server.request_count();
 
-    assert_eq!(put_from(port, MOCK_CIDR_IP_B), 201, "an IP only the refreshed list contains should be accepted");
+    assert_eq!(
+        put_from(port, MOCK_CIDR_IP_B),
+        StatusCode::CREATED,
+        "an IP only the refreshed list contains should be accepted"
+    );
     assert_eq!(cidr_server.request_count(), fetches_before + 1);
     assert!(
         cidr_server.last_if_modified_since().is_some(),
         "a refresh of a cache with a real fetch time should be conditional"
     );
 
-    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403, "an IP in neither list should stay rejected");
+    assert_eq!(
+        put_from(port, MOCK_CIDR_IP_UNKNOWN),
+        StatusCode::FORBIDDEN,
+        "an IP in neither list should stay rejected"
+    );
     assert_eq!(cidr_server.request_count(), fetches_before + 1, "the refresh should have made the cache fresh again");
 }
 
@@ -900,14 +937,14 @@ fn failed_fetch_does_not_advance_the_confirmed_time(port: u16, dev: &mut Wrangle
     cidr_server.set_status(StatusCode::SERVICE_UNAVAILABLE);
     let fetches_before = cidr_server.request_count();
 
-    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 503);
+    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(cidr_server.request_count(), fetches_before + 1);
     let if_modified_since_before_failure = cidr_server.last_if_modified_since();
     assert!(if_modified_since_before_failure.is_some());
     assert_eq!(dev.kv_get(CIDR_LIST_FETCHED_AT_KV_KEY).trim(), confirmed_at, "a failed fetch confirmed nothing");
     assert_ne!(dev.kv_get(CIDR_LIST_FAILED_AT_KV_KEY).trim(), confirmed_at, "the failure should be recorded");
 
-    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 503);
+    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(cidr_server.request_count(), fetches_before + 1, "the failure should hold off another fetch");
 
     // The retry interval has passed: only the failure's age matters now, not
@@ -915,7 +952,7 @@ fn failed_fetch_does_not_advance_the_confirmed_time(port: u16, dev: &mut Wrangle
     dev.kv_put(CIDR_LIST_FAILED_AT_KV_KEY, &fetched_at_value(LONG_AFTER_FAILURE));
     dev.restart();
     cidr_server.set_status(StatusCode::OK);
-    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403);
+    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), StatusCode::FORBIDDEN);
     assert_eq!(cidr_server.request_count(), fetches_before + 2);
     assert_eq!(
         cidr_server.last_if_modified_since(),
@@ -940,18 +977,18 @@ fn unreachable_telegram_records_a_failure_and_holds_off_the_next(
     cidr_server.set_unreachable(true);
     let fetches_before = cidr_server.request_count();
 
-    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 503);
+    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(cidr_server.request_count(), fetches_before + 1);
     assert_eq!(dev.kv_get(CIDR_LIST_FETCHED_AT_KV_KEY).trim(), confirmed_at, "nothing was confirmed");
     assert_ne!(dev.kv_get(CIDR_LIST_FAILED_AT_KV_KEY).trim(), confirmed_at, "the failure should be recorded");
 
-    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 503);
+    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(cidr_server.request_count(), fetches_before + 1, "the failure should hold off another fetch");
 
     cidr_server.set_unreachable(false);
     dev.kv_put(CIDR_LIST_FAILED_AT_KV_KEY, &fetched_at_value(LONG_AFTER_FAILURE));
     dev.restart();
-    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403);
+    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), StatusCode::FORBIDDEN);
     assert_eq!(
         cidr_server.request_count(),
         fetches_before + 2,
@@ -986,7 +1023,7 @@ fn silent_telegram_holds_up_the_request_only_for_the_budget(
     let elapsed = started.elapsed();
     cidr_server.set_silent(false);
 
-    assert_eq!(status, 503, "an IP that can't be judged because Telegram hasn't answered");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "an IP that can't be judged because Telegram hasn't answered");
     assert!(elapsed <= TEST_RESPONSE_BUDGET + BUDGET_TOLERANCE, "answered long after the budget: {elapsed:?}");
     assert_eq!(dev.kv_get(CIDR_LIST_FAILED_AT_KV_KEY).trim(), confirmed_at, "the fetch is still running");
 
@@ -1001,14 +1038,16 @@ fn silent_telegram_holds_up_the_request_only_for_the_budget(
 /// refreshed share that one refresh instead of each fetching.
 fn concurrent_unrecognized_ips_share_one_refresh(port: u16, dev: &mut WranglerDev, cidr_server: &MockCidrServer) {
     dev.age_cidr_cache_and_restart(STALE_CACHE_AGE);
-    cidr_server.set_response_delay(Duration::from_secs(1));
+    cidr_server.set_response_delay(SLOW_CIDR_RESPONSE_DELAY);
     let fetches_before = cidr_server.request_count();
 
-    let requests: Vec<_> = (0..3).map(|_| std::thread::spawn(move || put_from(port, MOCK_CIDR_IP_UNKNOWN))).collect();
-    let statuses: Vec<u16> = requests.into_iter().map(|r| r.join().expect("a request thread panicked")).collect();
+    let requests: Vec<_> =
+        (0..CONCURRENT_REQUESTS).map(|_| std::thread::spawn(move || put_from(port, MOCK_CIDR_IP_UNKNOWN))).collect();
+    let statuses: Vec<StatusCode> =
+        requests.into_iter().map(|r| r.join().expect("a request thread panicked")).collect();
     cidr_server.set_response_delay(Duration::ZERO);
 
-    assert_eq!(statuses, [403, 403, 403]);
+    assert_eq!(statuses, [StatusCode::FORBIDDEN; CONCURRENT_REQUESTS]);
     assert_eq!(cidr_server.request_count(), fetches_before + 1, "the requests should have shared one fetch");
 }
 
@@ -1021,7 +1060,7 @@ fn refresh_consults_kv_before_fetching(port: u16, dev: &mut WranglerDev, cidr_se
     dev.age_cidr_cache_and_restart(STALE_CACHE_AGE);
     // Loads the stale state into the isolate; a recognized IP starts no
     // refresh.
-    assert_eq!(put_from(port, TELEGRAM_IP), 201);
+    assert_eq!(put_from(port, TELEGRAM_IP), StatusCode::CREATED);
     let fetches_before = cidr_server.request_count();
 
     // Meanwhile, another isolate refreshed the list, which now includes B.
@@ -1032,7 +1071,7 @@ fn refresh_consults_kv_before_fetching(port: u16, dev: &mut WranglerDev, cidr_se
         (CIDR_LIST_FAILED_AT_KV_KEY, &just_now),
     ]);
 
-    assert_eq!(put_from(port, MOCK_CIDR_IP_B), 201, "the newer list in KV should be adopted");
+    assert_eq!(put_from(port, MOCK_CIDR_IP_B), StatusCode::CREATED, "the newer list in KV should be adopted");
     assert_eq!(cidr_server.request_count(), fetches_before, "and Telegram shouldn't have been asked");
 }
 
@@ -1041,7 +1080,7 @@ fn refresh_consults_kv_before_fetching(port: u16, dev: &mut WranglerDev, cidr_se
 fn warm_isolate_answers_from_memory_without_kv(port: u16, dev: &WranglerDev) {
     let list = dev.kv_get(CIDR_LIST_KV_KEY);
     dev.kv_delete(CIDR_LIST_KV_KEY);
-    assert_eq!(put_from(port, TELEGRAM_IP), 201);
+    assert_eq!(put_from(port, TELEGRAM_IP), StatusCode::CREATED);
     dev.kv_put(CIDR_LIST_KV_KEY, list.trim_end());
 }
 
@@ -1054,11 +1093,11 @@ fn recognized_ip_against_very_stale_cache_refetches_in_background(
     dev.age_cidr_cache_and_restart(VERY_STALE_CACHE_AGE);
     let fetches_before = cidr_server.request_count();
 
-    assert_eq!(put_from(port, TELEGRAM_IP), 201);
+    assert_eq!(put_from(port, TELEGRAM_IP), StatusCode::CREATED);
     wait_for("the background refetch", || cidr_server.request_count() > fetches_before);
     assert_eq!(cidr_server.request_count(), fetches_before + 1);
 
-    assert_eq!(put_from(port, TELEGRAM_IP), 201);
+    assert_eq!(put_from(port, TELEGRAM_IP), StatusCode::CREATED);
     assert_eq!(
         cidr_server.request_count(),
         fetches_before + 1,
@@ -1076,11 +1115,11 @@ fn unrecognized_ip_against_empty_cache_fetches_unconditionally(
     dev.restart();
     let fetches_before = cidr_server.request_count();
 
-    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403);
+    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), StatusCode::FORBIDDEN);
     assert_eq!(cidr_server.request_count(), fetches_before + 1);
     assert_eq!(cidr_server.last_if_modified_since(), None, "with nothing cached, there's no fetch to condition on");
 
-    assert_eq!(put_from(port, TELEGRAM_IP), 201, "the fetch should have populated the cache");
+    assert_eq!(put_from(port, TELEGRAM_IP), StatusCode::CREATED, "the fetch should have populated the cache");
     assert_eq!(cidr_server.request_count(), fetches_before + 1);
 }
 
@@ -1098,22 +1137,25 @@ fn seeding_does_not_overwrite_newer_cache(dev: &WranglerDev, cidr_server: &MockC
     assert_eq!(cidr_server.request_count(), fetches_before, "the local copy is still recent, so no fetch");
 }
 
+/// A PUT from an IP that isn't Telegram's is rejected.
 fn rejects_non_telegram_ip(port: u16) {
     let resp = ureq::put(&worker_url(port, &format!("/{}", encode("http://example.com/"))))
         .set("CF-Connecting-IP", "8.8.8.8")
         .timeout(REQUEST_TIMEOUT)
         .send_string("body");
-    assert_eq!(status_of(resp), 403, "PUT from a non-Telegram IP should be rejected");
+    assert_eq!(status_of(resp), StatusCode::FORBIDDEN, "PUT from a non-Telegram IP should be rejected");
 }
 
+/// A target that is a literal private IP is rejected.
 fn rejects_literal_private_ip_target(port: u16) {
     let resp = ureq::put(&worker_url(port, &format!("/{}", encode("http://127.0.0.1:9/"))))
         .set("CF-Connecting-IP", TELEGRAM_IP)
         .timeout(REQUEST_TIMEOUT)
         .send_string("body");
-    assert_eq!(status_of(resp), 403, "a literal loopback IP as the target should be rejected");
+    assert_eq!(status_of(resp), StatusCode::FORBIDDEN, "a literal loopback IP as the target should be rejected");
 }
 
+/// A PUT from Telegram to a valid target reaches it with its body.
 fn forwards_put_to_valid_target(port: u16) {
     let distributor = MockDistributor::start(None);
 
@@ -1122,11 +1164,12 @@ fn forwards_put_to_valid_target(port: u16) {
         .timeout(REQUEST_TIMEOUT)
         .send_string("wake-up-body");
 
-    assert_eq!(status_of(resp), 201, "a valid forward should succeed");
+    assert_eq!(status_of(resp), StatusCode::CREATED, "a valid forward should succeed");
     assert_eq!(distributor.request_count(), 1, "the mock distributor should have received exactly one request");
     assert_eq!(distributor.last_body(), b"wake-up-body");
 }
 
+/// A push server that redirects is rejected, not followed.
 fn rejects_redirecting_distributor(port: u16) {
     let distributor = MockDistributor::start(Some("http://127.0.0.1:1/somewhere-unvalidated"));
 
@@ -1135,7 +1178,11 @@ fn rejects_redirecting_distributor(port: u16) {
         .timeout(REQUEST_TIMEOUT)
         .send_string("body");
 
-    assert_eq!(status_of(resp), 502, "a distributor that tries to redirect us should be rejected, not followed");
+    assert_eq!(
+        status_of(resp),
+        StatusCode::BAD_GATEWAY,
+        "a distributor that tries to redirect us should be rejected, not followed"
+    );
     assert_eq!(
         distributor.request_count(),
         1,
@@ -1143,6 +1190,7 @@ fn rejects_redirecting_distributor(port: u16) {
     );
 }
 
+/// A PUT arriving after a successful POST for the same endpoint is dropped.
 fn post_suppresses_following_put(port: u16) {
     let distributor = MockDistributor::start(None);
     let target = encode(&distributor.url());
@@ -1153,13 +1201,13 @@ fn post_suppresses_following_put(port: u16) {
         .set("Crypto-Key", "dh=xyz")
         .timeout(REQUEST_TIMEOUT)
         .send_string("ciphertext");
-    assert_eq!(status_of(post_resp), 201, "the POST leg should forward successfully");
+    assert_eq!(status_of(post_resp), StatusCode::CREATED, "the POST leg should forward successfully");
 
     let put_resp = ureq::put(&worker_url(port, &format!("/{target}")))
         .set("CF-Connecting-IP", TELEGRAM_IP)
         .timeout(REQUEST_TIMEOUT)
         .send_string("wake-up-body");
-    assert_eq!(status_of(put_resp), 200, "the PUT leg should be suppressed as a duplicate of the POST");
+    assert_eq!(status_of(put_resp), StatusCode::OK, "the PUT leg should be suppressed as a duplicate of the POST");
 
     assert_eq!(
         distributor.request_count(),
@@ -1177,7 +1225,7 @@ const PUT_SENT_AFTER_POST: Duration = Duration::from_millis(100);
 
 /// Sends a POST and, shortly after, the PUT for the same endpoint, returning
 /// the PUT's status and the POST's status.
-fn post_then_put_while_post_in_flight(port: u16, target: &str) -> (u16, u16) {
+fn post_then_put_while_post_in_flight(port: u16, target: &str) -> (StatusCode, StatusCode) {
     let post_thread = {
         let target_for_post = target.to_string();
         std::thread::spawn(move || {
@@ -1208,8 +1256,8 @@ fn put_waits_for_a_slow_post_and_is_suppressed_when_it_succeeds(port: u16) {
 
     let (put_answer, post_answer) = post_then_put_while_post_in_flight(port, &encode(&distributor.url()));
 
-    assert_eq!(post_answer, 201, "the POST should forward successfully, just slowly");
-    assert_eq!(put_answer, 200, "the PUT should be suppressed once its POST succeeds");
+    assert_eq!(post_answer, StatusCode::CREATED, "the POST should forward successfully, just slowly");
+    assert_eq!(put_answer, StatusCode::OK, "the PUT should be suppressed once its POST succeeds");
     assert_eq!(distributor.request_count(), 1, "only the POST should reach the push server");
 }
 
@@ -1220,8 +1268,12 @@ fn put_forwards_after_a_slow_post_that_fails(port: u16) {
 
     let (put_answer, post_answer) = post_then_put_while_post_in_flight(port, &encode(&distributor.url()));
 
-    assert_eq!(post_answer, 500, "the push server's failure is passed back to the POST");
-    assert_eq!(put_answer, 500, "the PUT was forwarded, so it gets the push server's answer");
+    assert_eq!(post_answer, StatusCode::INTERNAL_SERVER_ERROR, "the push server's failure is passed back to the POST");
+    assert_eq!(
+        put_answer,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the PUT was forwarded, so it gets the push server's answer"
+    );
     assert_eq!(distributor.request_count(), 2, "the failed POST must not have suppressed the PUT");
 }
 
@@ -1240,14 +1292,14 @@ fn refusal_passes_on_only_status_and_retry_after(port: u16) {
         .send_string("wake-up-body");
 
     let Err(ureq::Error::Status(status, resp)) = resp else { panic!("expected the refusal to be passed on") };
-    assert_eq!(status, 429);
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS.as_u16());
     assert_eq!(resp.header("Retry-After"), Some(RETRY_AFTER_SECONDS));
     assert_eq!(resp.into_string().expect("the response body is readable"), "", "the push server's body isn't relayed");
 }
 
 /// PUTs to `endpoint` from a Telegram IP, returning the proxy's status.
 /// `timeout` is how long the test client itself waits.
-fn put_to_endpoint(port: u16, endpoint: &str, timeout: Duration) -> u16 {
+fn put_to_endpoint(port: u16, endpoint: &str, timeout: Duration) -> StatusCode {
     status_of(
         ureq::put(&worker_url(port, &format!("/{}", encode(endpoint))))
             .set("CF-Connecting-IP", TELEGRAM_IP)
@@ -1261,9 +1313,9 @@ fn put_to_endpoint(port: u16, endpoint: &str, timeout: Duration) -> u16 {
 /// listens on, both answer 502.
 fn unreachable_push_server_answers_bad_gateway(port: u16) {
     // `.invalid` is reserved (RFC 2606) and never resolves.
-    assert_eq!(put_to_endpoint(port, "http://no-such-host.invalid/push", REQUEST_TIMEOUT), 502);
+    assert_eq!(put_to_endpoint(port, "http://no-such-host.invalid/push", REQUEST_TIMEOUT), StatusCode::BAD_GATEWAY);
     // Port 1 is not expected to have a listener.
-    assert_eq!(put_to_endpoint(port, "http://localhost:1/push", REQUEST_TIMEOUT), 502);
+    assert_eq!(put_to_endpoint(port, "http://localhost:1/push", REQUEST_TIMEOUT), StatusCode::BAD_GATEWAY);
 }
 
 /// A push server that accepts the connection and never answers is given up on
@@ -1282,7 +1334,10 @@ fn unanswering_push_server_answers_gateway_timeout(port: u16) {
     });
 
     let started = Instant::now();
-    assert_eq!(put_to_endpoint(port, &format!("http://localhost:{silent_port}/push"), CLIENT_PATIENCE), 504);
+    assert_eq!(
+        put_to_endpoint(port, &format!("http://localhost:{silent_port}/push"), CLIENT_PATIENCE),
+        StatusCode::GATEWAY_TIMEOUT
+    );
     let elapsed = started.elapsed();
     assert!(elapsed + BUDGET_TOLERANCE >= TEST_RESPONSE_BUDGET, "answered before the budget: {elapsed:?}");
     assert!(elapsed <= TEST_RESPONSE_BUDGET + BUDGET_TOLERANCE, "answered long after the budget: {elapsed:?}");

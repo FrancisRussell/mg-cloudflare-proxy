@@ -27,11 +27,13 @@ impl Deadline {
     /// A deadline `budget` from now.
     pub(crate) fn after(budget: Duration) -> Self { Self::starting_at(now(), budget) }
 
+    /// A deadline `budget` after `start`.
     fn starting_at(start: SystemTime, budget: Duration) -> Self { Self(start + budget) }
 
     /// How long is left, or zero once the deadline has passed.
     pub(crate) fn remaining(self) -> Duration { self.remaining_at(now()) }
 
+    /// How long is left as of `now`, or zero once the deadline has passed.
     fn remaining_at(self, now: SystemTime) -> Duration { self.0.duration_since(now).unwrap_or(Duration::ZERO) }
 }
 
