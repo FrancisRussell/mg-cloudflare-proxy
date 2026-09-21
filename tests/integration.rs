@@ -66,6 +66,9 @@ const CIDR_LIST_FETCHED_AT_KV_KEY: &str = "telegram_cidrs_fetched_at";
 const STALE_CACHE_AGE: Duration = Duration::from_hours(2 * 24);
 const VERY_STALE_CACHE_AGE: Duration = Duration::from_hours(31 * 24);
 
+/// A body size comfortably over the Worker's request body limit.
+const OVERSIZED_BODY_BYTES: usize = 64 * 1024;
+
 /// PGID of the currently-running `wrangler dev` process group, or 0 if none.
 /// Shared with the SIGINT handler installed in `integration_test`: a signal
 /// terminates the process without unwinding, so `Drop for WranglerDev` never
@@ -471,6 +474,7 @@ fn integration_test() {
     // below (which need `TELEGRAM_IP` recognized).
     seeding_makes_recognized_ips_need_no_fetch(port, &dev, &cidr_server);
     unrecognized_ip_against_fresh_cache_does_not_fetch(port, &cidr_server);
+    invalid_requests_from_unrecognized_ip_do_not_fetch(port, &dev, &cidr_server);
     unrecognized_ip_against_stale_cache_fetches(port, &dev, &cidr_server);
     recognized_ip_against_very_stale_cache_refetches_in_background(port, &dev, &cidr_server);
     unrecognized_ip_against_empty_cache_fetches_unconditionally(port, &dev, &cidr_server);
@@ -537,6 +541,52 @@ fn unrecognized_ip_against_fresh_cache_does_not_fetch(port: u16, cidr_server: &M
     let fetches_before = cidr_server.request_count();
     assert_eq!(put_from(port, MOCK_CIDR_IP_B), 403);
     assert_eq!(cidr_server.request_count(), fetches_before);
+}
+
+/// A request failing a structural check is rejected before the allowlist is
+/// consulted, so a prober from an unrecognized IP can't spend a CIDR fetch on
+/// it. That includes a body over the size limit, whether declared up front or
+/// streamed without a length.
+fn invalid_requests_from_unrecognized_ip_do_not_fetch(port: u16, dev: &WranglerDev, cidr_server: &MockCidrServer) {
+    dev.kv_put(CIDR_LIST_FETCHED_AT_KV_KEY, &fetched_at_value(STALE_CACHE_AGE));
+    let fetches_before = cidr_server.request_count();
+    let target = encode(&MockDistributor::start(None).url());
+    let oversized = vec![b'x'; OVERSIZED_BODY_BYTES];
+
+    let resp = ureq::put(&worker_url(port, &format!("/{target}")))
+        .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
+        .timeout(REQUEST_TIMEOUT)
+        .send_bytes(&oversized);
+    assert_eq!(status_of(resp), 413, "an oversized PUT body should be rejected");
+
+    let resp = ureq::put(&worker_url(port, &format!("/{target}")))
+        .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
+        .timeout(REQUEST_TIMEOUT)
+        .send(std::io::Cursor::new(oversized.clone()));
+    assert_eq!(status_of(resp), 413, "an oversized PUT body sent without a length should be rejected");
+
+    let resp = ureq::post(&worker_url(port, &format!("/aesgcm?e={target}")))
+        .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
+        .set("Encryption", "salt=abc")
+        .set("Crypto-Key", "dh=xyz")
+        .timeout(REQUEST_TIMEOUT)
+        .send_bytes(&oversized);
+    assert_eq!(status_of(resp), 413, "an oversized POST body should be rejected");
+
+    let resp = ureq::put(&worker_url(port, "/not-a-url"))
+        .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
+        .timeout(REQUEST_TIMEOUT)
+        .send_string("body");
+    assert_eq!(status_of(resp), 403, "a PUT with an invalid endpoint should be rejected");
+
+    assert_eq!(cidr_server.request_count(), fetches_before, "none of those should have triggered a fetch");
+
+    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403);
+    assert_eq!(
+        cidr_server.request_count(),
+        fetches_before + 1,
+        "a well-formed request from the same IP does fetch, so the checks above weren't passing only because the cache was fresh"
+    );
 }
 
 /// Once the cache has gone stale, an unrecognized IP triggers a blocking,

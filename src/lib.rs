@@ -15,6 +15,7 @@ mod correlator;
 mod telegram_cidrs;
 
 pub use correlator::Correlator;
+use futures_util::StreamExt;
 use http::StatusCode;
 use worker::*;
 
@@ -40,6 +41,30 @@ mod header_names {
 /// abuse rather than buffered and forwarded. 16KB covers real Telegram
 /// notifications with headroom; anything larger is likely garbage.
 const MAX_BODY_BYTES: usize = 16_384;
+
+/// The request body, or `None` if it exceeds `MAX_BODY_BYTES`. A declared
+/// `Content-Length` over the limit is refused without reading anything; the
+/// read itself is also capped, so a chunked or under-declared body can't be
+/// buffered past the limit either.
+async fn read_capped_body(req: &mut Request) -> Result<Option<Vec<u8>>> {
+    let declared_length =
+        req.headers().get(http::header::CONTENT_LENGTH.as_str())?.and_then(|v| v.parse::<usize>().ok());
+    if declared_length.is_some_and(|length| length > MAX_BODY_BYTES) {
+        return Ok(None);
+    }
+
+    // No body stream means an empty body.
+    let Ok(mut stream) = req.stream() else { return Ok(Some(Vec::new())) };
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if body.len() + chunk.len() > MAX_BODY_BYTES {
+            return Ok(None);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Some(body))
+}
 
 /// Rejects anything that isn't a plain http(s) URL with a host and no
 /// embedded credentials. Literal private/loopback IPs are rejected below;
@@ -222,15 +247,13 @@ async fn handle_aesgcm(mut req: Request, ctx: RouteContext<Context>) -> Result<R
 
     let encryption = req.headers().get(header_names::ENCRYPTION.as_str())?.unwrap_or_default();
     let crypto_key = req.headers().get(header_names::CRYPTO_KEY.as_str())?.unwrap_or_default();
-    let body = req.bytes().await?;
-    if body.len() > MAX_BODY_BYTES {
+    let Some(body) = read_capped_body(&mut req).await? else {
         console_log!(
-            "rejected: leg=aesgcm reason=payload_too_large ip={client_ip} host={} size={}",
-            endpoint.host_str().unwrap_or("?"),
-            body.len()
+            "rejected: leg=aesgcm reason=payload_too_large ip={client_ip} host={}",
+            endpoint.host_str().unwrap_or("?")
         );
         return error_response(StatusCode::PAYLOAD_TOO_LARGE);
-    }
+    };
 
     let kv = ctx.env.kv(CIDR_CACHE_KV_BINDING)?;
     let fetch_url = telegram_cidrs::cidr_list_url(&ctx.env);
@@ -270,15 +293,13 @@ async fn handle_put(mut req: Request, ctx: RouteContext<Context>) -> Result<Resp
         return error_response(StatusCode::FORBIDDEN);
     };
 
-    let body = req.bytes().await?;
-    if body.len() > MAX_BODY_BYTES {
+    let Some(body) = read_capped_body(&mut req).await? else {
         console_log!(
-            "rejected: leg=put reason=payload_too_large ip={client_ip} host={} size={}",
-            endpoint.host_str().unwrap_or("?"),
-            body.len()
+            "rejected: leg=put reason=payload_too_large ip={client_ip} host={}",
+            endpoint.host_str().unwrap_or("?")
         );
         return error_response(StatusCode::PAYLOAD_TOO_LARGE);
-    }
+    };
 
     let kv = ctx.env.kv(CIDR_CACHE_KV_BINDING)?;
     let fetch_url = telegram_cidrs::cidr_list_url(&ctx.env);
