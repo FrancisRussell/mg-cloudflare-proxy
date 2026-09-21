@@ -10,6 +10,7 @@ use ipnetwork::IpNetwork;
 use worker::*;
 
 use crate::clock;
+use crate::outbound::send_with_timeout;
 
 /// Header names used on the outbound CIDR-list fetch.
 mod header_names {
@@ -90,6 +91,9 @@ const CIDR_LIST_FORCE_REFETCH_MAX_AGE: Duration = Duration::from_hours(30 * 24);
 /// reaches (see `jittered`), so requests don't all cross the threshold at the
 /// same instant.
 const CIDR_LIST_FORCE_REFETCH_JITTER: Duration = Duration::from_hours(12);
+/// How long Telegram gets to answer a CIDR list fetch. Bounds a server that
+/// accepts the connection and then never replies.
+const CIDR_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to wait before retrying a failed KV read.
 const KV_READ_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// Where to fetch the Telegram CIDR list from. Overridable via the
@@ -301,10 +305,10 @@ async fn request_cidr_list(fetch_url: &str, if_modified_since: Option<&str>) -> 
     }
     let Ok(req) = Request::new_with_init(fetch_url, &init) else { return CidrFetchOutcome::Unreachable };
 
-    let mut resp = match Fetch::Request(req).send().await {
+    let mut resp = match send_with_timeout(req, CIDR_FETCH_TIMEOUT).await {
         Ok(resp) => resp,
-        Err(e) => {
-            console_error!("cidr_fetch: outcome=failed reason=network_error error={e}");
+        Err(failure) => {
+            console_error!("cidr_fetch: outcome=failed reason={failure}");
             return CidrFetchOutcome::Unreachable;
         }
     };

@@ -11,6 +11,7 @@
 
 mod clock;
 mod correlator;
+mod outbound;
 mod telegram_cidrs;
 
 pub use correlator::Correlator;

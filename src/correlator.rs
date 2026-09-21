@@ -14,14 +14,13 @@
 // here is worth persisting across a restart.
 
 use std::cell::Cell;
-use std::pin::pin;
 use std::time::{Duration, SystemTime};
 
-use futures_util::future::{select, Either};
 use http::StatusCode;
 use worker::*;
 
 use crate::clock;
+use crate::outbound::{send_with_timeout, FetchFailure};
 
 /// Header names used when forwarding to the distributor.
 /// `HeaderName::from_static` is `const fn`, so these are checked and built at
@@ -233,11 +232,11 @@ async fn forward(target: &url::Url, body: Vec<u8>) -> Result<Response> {
     let host = target.host_str().unwrap_or("?");
 
     let req = Request::new_with_init(target.as_str(), &init)?;
-    let resp = match send_with_timeout(req).await {
+    let resp = match send_with_timeout(req, FORWARD_TIMEOUT).await {
         Ok(resp) => resp,
         Err(failure) => {
             console_error!("forward failed: host={host} reason={failure}");
-            return crate::error_response(failure.status());
+            return crate::error_response(failure_status(failure));
         }
     };
     let distributor_status = resp.status_code();
@@ -276,60 +275,12 @@ async fn forward(target: &url::Url, body: Vec<u8>) -> Result<Response> {
     Ok(response)
 }
 
-/// Why a push server gave no answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ForwardFailure {
-    TimedOut,
-    /// The host name didn't resolve.
-    Dns,
-    /// Refused, reset, closed early, or an unparseable reply.
-    Connection,
-}
-
-impl ForwardFailure {
-    /// The status to answer the caller with: a gateway timeout if the push
-    /// server was too slow, otherwise a bad gateway.
-    fn status(self) -> StatusCode {
-        match self {
-            Self::TimedOut => StatusCode::GATEWAY_TIMEOUT,
-            Self::Dns | Self::Connection => StatusCode::BAD_GATEWAY,
-        }
-    }
-
-    /// Classifies a failed fetch by the runtime's error text, falling back to a
-    /// generic connection failure.
-    fn from_fetch_error(error: &Error) -> Self {
-        if error.to_string().contains("DNS lookup failed") {
-            Self::Dns
-        } else {
-            Self::Connection
-        }
-    }
-}
-
-impl std::fmt::Display for ForwardFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::TimedOut => "timeout",
-            Self::Dns => "dns",
-            Self::Connection => "connection",
-        })
-    }
-}
-
-/// Sends `req`, giving up after `FORWARD_TIMEOUT`.
-async fn send_with_timeout(req: Request) -> std::result::Result<Response, ForwardFailure> {
-    let controller = AbortController::default();
-    let signal = controller.signal();
-    let fetch = Fetch::Request(req);
-    let send = pin!(fetch.send_with_signal(&signal));
-    let timeout = pin!(Delay::from(FORWARD_TIMEOUT));
-    match select(send, timeout).await {
-        Either::Left((result, _)) => result.map_err(|e| ForwardFailure::from_fetch_error(&e)),
-        Either::Right(..) => {
-            controller.abort();
-            Err(ForwardFailure::TimedOut)
-        }
+/// The status to answer the caller with when the push server gave no answer:
+/// a gateway timeout if it was too slow, otherwise a bad gateway.
+fn failure_status(failure: FetchFailure) -> StatusCode {
+    match failure {
+        FetchFailure::TimedOut => StatusCode::GATEWAY_TIMEOUT,
+        FetchFailure::Dns | FetchFailure::Connection => StatusCode::BAD_GATEWAY,
     }
 }
 
@@ -405,17 +356,10 @@ mod tests {
     }
 
     #[test]
-    fn test_forward_failure_status() {
-        assert_eq!(ForwardFailure::TimedOut.status(), StatusCode::GATEWAY_TIMEOUT);
-        assert_eq!(ForwardFailure::Dns.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(ForwardFailure::Connection.status(), StatusCode::BAD_GATEWAY);
-    }
-
-    #[test]
-    fn test_forward_failure_reasons() {
-        assert_eq!(ForwardFailure::TimedOut.to_string(), "timeout");
-        assert_eq!(ForwardFailure::Dns.to_string(), "dns");
-        assert_eq!(ForwardFailure::Connection.to_string(), "connection");
+    fn test_failure_status() {
+        assert_eq!(failure_status(FetchFailure::TimedOut), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(failure_status(FetchFailure::Dns), StatusCode::BAD_GATEWAY);
+        assert_eq!(failure_status(FetchFailure::Connection), StatusCode::BAD_GATEWAY);
     }
 
     #[test]
