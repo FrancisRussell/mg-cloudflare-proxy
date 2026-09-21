@@ -90,6 +90,8 @@ const CIDR_LIST_FORCE_REFETCH_MAX_AGE: Duration = Duration::from_hours(30 * 24);
 /// reaches (see `jittered`), so requests don't all cross the threshold at the
 /// same instant.
 const CIDR_LIST_FORCE_REFETCH_JITTER: Duration = Duration::from_hours(12);
+/// How long to wait before retrying a failed KV read.
+const KV_READ_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// Where to fetch the Telegram CIDR list from. Overridable via the
 /// `CIDR_LIST_URL` wrangler var (see wrangler.toml) so the integration test
 /// can point this at a local mock server instead of Telegram's real endpoint.
@@ -187,7 +189,7 @@ struct CachedCidrList {
 /// The cache's contents, or an error if KV can't be read. Keys that are
 /// absent, or hold an unparseable timestamp, are treated as not cached.
 async fn current_cidr_list(kv: &KvStore) -> std::result::Result<CachedCidrList, KvError> {
-    let list = kv.get(CIDR_LIST_KV_KEY).text().await?;
+    let list = kv_get_text(kv, CIDR_LIST_KV_KEY).await?;
     let fetched_at = read_timestamp(kv, CIDR_LIST_FETCHED_AT_KV_KEY).await?;
     let attempted_at = read_timestamp(kv, CIDR_LIST_ATTEMPTED_AT_KV_KEY).await?;
 
@@ -205,7 +207,7 @@ async fn current_cidr_list(kv: &KvStore) -> std::result::Result<CachedCidrList, 
 /// The millis-since-epoch timestamp stored under `key`; `None` if absent or
 /// unparseable.
 async fn read_timestamp(kv: &KvStore, key: &str) -> std::result::Result<Option<SystemTime>, KvError> {
-    let value = kv.get(key).text().await?;
+    let value = kv_get_text(kv, key).await?;
     Ok(value.and_then(|v| v.parse::<u64>().ok()).map(|ms| UNIX_EPOCH + Duration::from_millis(ms)))
 }
 
@@ -273,7 +275,6 @@ async fn fetch_fresh_cidr_list(kv: &KvStore, fetch_url: &str, if_modified_since:
             if kv_put_best_effort(kv, CIDR_LIST_KV_KEY, &list).await {
                 mark_cidr_list_confirmed(kv).await;
             } else {
-                console_error!("cidr_fetch: outcome=failed reason=kv_write_error");
                 mark_cidr_list_attempted(kv).await;
             }
             Some(list)
@@ -358,6 +359,19 @@ fn http_date(t: SystemTime) -> String {
     js_date.to_utc_string().into()
 }
 
+/// The text stored under `key`, retrying once after `KV_READ_RETRY_DELAY` so
+/// that a momentary failure doesn't count as an outage.
+async fn kv_get_text(kv: &KvStore, key: &str) -> std::result::Result<Option<String>, KvError> {
+    match kv.get(key).text().await {
+        Ok(value) => Ok(value),
+        Err(e) => {
+            console_log!("cidr_cache: kv read failed, retrying key={key} error={e}");
+            Delay::from(KV_READ_RETRY_DELAY).await;
+            kv.get(key).text().await
+        }
+    }
+}
+
 /// `KvStore::put` only constructs a builder -- the write itself doesn't
 /// happen until `.execute().await`, easy to miss since the outer call isn't
 /// itself async. Failures don't propagate, since a missed write only means
@@ -365,10 +379,14 @@ fn http_date(t: SystemTime) -> String {
 /// request over; the result says whether the write happened for callers that
 /// must not act as if it had.
 async fn kv_put_best_effort(kv: &KvStore, key: &str, value: &str) -> bool {
-    match kv.put(key, value) {
+    let written = match kv.put(key, value) {
         Ok(builder) => builder.execute().await.is_ok(),
         Err(_) => false,
+    };
+    if !written {
+        console_error!("cidr_cache: outcome=failed reason=kv_write_error key={key}");
     }
+    written
 }
 
 #[cfg(test)]
