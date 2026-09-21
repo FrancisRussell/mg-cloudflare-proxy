@@ -16,6 +16,7 @@ futures-util = { version = "0.3", default-features = false }
 http = "1"
 ipnetwork = "0.20"
 percent-encoding = "2"
+thiserror = "2.0.17"
 url = "2"
 worker = "0.8"
 

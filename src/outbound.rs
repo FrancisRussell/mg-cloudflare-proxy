@@ -4,37 +4,36 @@ use std::pin::pin;
 use std::time::Duration;
 
 use futures_util::future::{select, Either};
-use worker::*;
+use thiserror::Error;
+use worker::{AbortController, Delay, Error as WorkerError, Fetch, Request, Response};
 
-/// Why an outbound fetch got no answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why an outbound fetch got no answer. The messages double as the reason
+/// logged for a failed fetch, so they stay short and free of spaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub(crate) enum FetchFailure {
+    /// The server didn't answer within the time allowed
+    #[error("timeout")]
     TimedOut,
-    /// The host name didn't resolve.
+
+    /// The host name didn't resolve
+    #[error("dns")]
     Dns,
-    /// Refused, reset, closed early, or an unparseable reply.
+
+    /// The connection was refused, reset or closed early, or the reply couldn't
+    /// be parsed
+    #[error("connection")]
     Connection,
 }
 
 impl FetchFailure {
     /// Classifies a failed fetch by the runtime's error text, falling back to a
     /// generic connection failure.
-    fn from_fetch_error(error: &Error) -> Self {
+    fn from_fetch_error(error: &WorkerError) -> Self {
         if error.to_string().contains("DNS lookup failed") {
             Self::Dns
         } else {
             Self::Connection
         }
-    }
-}
-
-impl std::fmt::Display for FetchFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::TimedOut => "timeout",
-            Self::Dns => "dns",
-            Self::Connection => "connection",
-        })
     }
 }
 
@@ -59,9 +58,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fetch_failure_reasons() {
-        assert_eq!(FetchFailure::TimedOut.to_string(), "timeout");
-        assert_eq!(FetchFailure::Dns.to_string(), "dns");
-        assert_eq!(FetchFailure::Connection.to_string(), "connection");
+    fn test_from_fetch_error_recognises_dns_failures() {
+        // The runtime's wording for an unresolvable host.
+        let dns = WorkerError::RustError("e = kj/async-io-unix.c++:1292: failed: DNS lookup failed.".to_string());
+        assert_eq!(FetchFailure::from_fetch_error(&dns), FetchFailure::Dns);
+    }
+
+    #[test]
+    fn test_from_fetch_error_treats_other_failures_as_connection_failures() {
+        for text in ["Network connection lost.", "Error: connect refused", ""] {
+            let error = WorkerError::RustError(text.to_string());
+            assert_eq!(FetchFailure::from_fetch_error(&error), FetchFailure::Connection, "text: {text:?}");
+        }
     }
 }

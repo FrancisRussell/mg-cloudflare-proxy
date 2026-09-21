@@ -22,6 +22,7 @@ pub use correlator::Correlator;
 use futures_util::StreamExt;
 use http::StatusCode;
 use telegram_cidrs::TelegramIpCheck;
+use thiserror::Error;
 use worker::*;
 
 /// Header names this crate reads or writes. `HeaderName::from_static` is
@@ -73,26 +74,30 @@ async fn read_capped_body(req: &mut Request) -> Result<Option<Vec<u8>>> {
     Ok(Some(body))
 }
 
-/// Why a forwarding target was refused. Logged, never sent to the caller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why a forwarding target was refused. Logged, never sent to the caller; the
+/// messages double as the reason in that log line, so they stay short and free
+/// of spaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 enum EndpointRejection {
+    /// The endpoint isn't a URL
+    #[error("unparseable")]
     Unparseable,
-    UnsupportedScheme,
-    HasCredentials,
-    NoHost,
-    NonPublicIp,
-}
 
-impl std::fmt::Display for EndpointRejection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Unparseable => "unparseable",
-            Self::UnsupportedScheme => "unsupported_scheme",
-            Self::HasCredentials => "has_credentials",
-            Self::NoHost => "no_host",
-            Self::NonPublicIp => "non_public_ip",
-        })
-    }
+    /// The scheme is neither http nor https
+    #[error("unsupported_scheme")]
+    UnsupportedScheme,
+
+    /// The URL embeds credentials
+    #[error("has_credentials")]
+    HasCredentials,
+
+    /// The URL has no host
+    #[error("no_host")]
+    NoHost,
+
+    /// The host is a literal IP address that isn't public
+    #[error("non_public_ip")]
+    NonPublicIp,
 }
 
 /// Rejects anything that isn't a plain http(s) URL with a host and no
