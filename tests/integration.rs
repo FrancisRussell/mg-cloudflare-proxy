@@ -19,7 +19,7 @@ use std::io::Read;
 use std::net::TcpListener;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -52,12 +52,14 @@ const TELEGRAM_CIDR_RANGE: &str = "91.108.56.0/22";
 const TELEGRAM_IP: &str = "91.108.56.1";
 
 /// KV keys and binding the Worker caches the CIDR list under. Must match
-/// `CIDR_LIST_KV_KEY`, `CIDR_LIST_FETCHED_AT_KV_KEY` and
+/// `CIDR_LIST_KV_KEY`, `CIDR_LIST_FETCHED_AT_KV_KEY`,
+/// `CIDR_LIST_ATTEMPTED_AT_KV_KEY` and
 /// `CIDR_CACHE_KV_BINDING` in src/, which this test can't import (the crate
 /// only builds for wasm).
 const CIDR_CACHE_BINDING: &str = "CIDR_CACHE";
 const CIDR_LIST_KV_KEY: &str = "telegram_cidrs";
 const CIDR_LIST_FETCHED_AT_KV_KEY: &str = "telegram_cidrs_fetched_at";
+const CIDR_LIST_ATTEMPTED_AT_KV_KEY: &str = "telegram_cidrs_attempted_at";
 
 /// Cache ages used to force each freshness class deterministically. The
 /// Worker treats a list as stale past 24h, and as very stale past somewhere
@@ -255,6 +257,14 @@ impl WranglerDev {
         self.run_against_local_kv(cmd, "wrangler kv key put");
     }
 
+    /// Makes the cache look as if Telegram last confirmed the list, and last
+    /// answered at all, `age` ago.
+    fn age_cidr_cache(&self, age: Duration) {
+        let timestamp = fetched_at_value(age);
+        self.kv_put(CIDR_LIST_FETCHED_AT_KV_KEY, &timestamp);
+        self.kv_put(CIDR_LIST_ATTEMPTED_AT_KV_KEY, &timestamp);
+    }
+
     fn kv_delete(&self, key: &str) {
         let mut cmd = Command::new("npx");
         cmd.args(["wrangler", "kv", "key", "delete", "--binding", CIDR_CACHE_BINDING, key]);
@@ -382,10 +392,10 @@ impl MockDistributor {
 }
 
 /// A minimal HTTP server standing in for Telegram's CIDR list endpoint,
-/// serving a body that tests can change, and recording how many times it was
-/// hit and the `If-Modified-Since` (if any) the latest request carried --
-/// used to verify the proxy only fetches when it actually needs to, and
-/// sends a conditional header only when it has a genuine fetch to refer to.
+/// serving a body and status that tests can change, and recording how many
+/// times it was hit and the `If-Modified-Since` (if any) the latest request
+/// carried -- used to verify the proxy only fetches when it actually needs to,
+/// and sends a conditional header only when it has a genuine fetch to refer to.
 /// Never answers 304.
 ///
 /// Same leaked-background-thread caveat as `MockDistributor` above: fine for
@@ -396,6 +406,7 @@ struct MockCidrServer {
     request_count: Arc<AtomicUsize>,
     last_if_modified_since: Arc<Mutex<Option<String>>>,
     body: Arc<Mutex<String>>,
+    status: Arc<AtomicU16>,
 }
 
 impl MockCidrServer {
@@ -406,10 +417,12 @@ impl MockCidrServer {
         let last_if_modified_since = Arc::new(Mutex::new(None));
 
         let body = Arc::new(Mutex::new(body));
+        let status = Arc::new(AtomicU16::new(StatusCode::OK.as_u16()));
 
         let count = Arc::clone(&request_count);
         let if_modified_since_store = Arc::clone(&last_if_modified_since);
         let body_store = Arc::clone(&body);
+        let status_store = Arc::clone(&status);
         std::thread::spawn(move || {
             for request in server.incoming_requests() {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -421,14 +434,17 @@ impl MockCidrServer {
                 *if_modified_since_store.lock().unwrap() = seen;
 
                 let body = body_store.lock().unwrap().clone();
-                let _ = request.respond(Response::from_string(body));
+                let status = status_store.load(Ordering::SeqCst);
+                let _ = request.respond(Response::from_string(body).with_status_code(status));
             }
         });
 
-        Self { port, request_count, last_if_modified_since, body }
+        Self { port, request_count, last_if_modified_since, body, status }
     }
 
     fn set_body(&self, body: String) { *self.body.lock().unwrap() = body; }
+
+    fn set_status(&self, status: StatusCode) { self.status.store(status.as_u16(), Ordering::SeqCst); }
 
     /// A hostname, not a literal IP, for the same reason as
     /// `MockDistributor::url` -- see its doc comment.
@@ -476,6 +492,7 @@ fn integration_test() {
     unrecognized_ip_against_fresh_cache_does_not_fetch(port, &cidr_server);
     invalid_requests_from_unrecognized_ip_do_not_fetch(port, &dev, &cidr_server);
     unrecognized_ip_against_stale_cache_fetches(port, &dev, &cidr_server);
+    failed_fetch_does_not_advance_the_confirmed_time(port, &dev, &cidr_server);
     recognized_ip_against_very_stale_cache_refetches_in_background(port, &dev, &cidr_server);
     unrecognized_ip_against_empty_cache_fetches_unconditionally(port, &dev, &cidr_server);
     seeding_does_not_overwrite_newer_cache(&dev, &cidr_server);
@@ -548,22 +565,10 @@ fn unrecognized_ip_against_fresh_cache_does_not_fetch(port: u16, cidr_server: &M
 /// it. That includes a body over the size limit, whether declared up front or
 /// streamed without a length.
 fn invalid_requests_from_unrecognized_ip_do_not_fetch(port: u16, dev: &WranglerDev, cidr_server: &MockCidrServer) {
-    dev.kv_put(CIDR_LIST_FETCHED_AT_KV_KEY, &fetched_at_value(STALE_CACHE_AGE));
+    dev.age_cidr_cache(STALE_CACHE_AGE);
     let fetches_before = cidr_server.request_count();
     let target = encode(&MockDistributor::start(None).url());
     let oversized = vec![b'x'; OVERSIZED_BODY_BYTES];
-
-    let resp = ureq::put(&worker_url(port, &format!("/{target}")))
-        .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
-        .timeout(REQUEST_TIMEOUT)
-        .send_bytes(&oversized);
-    assert_eq!(status_of(resp), 413, "an oversized PUT body should be rejected");
-
-    let resp = ureq::put(&worker_url(port, &format!("/{target}")))
-        .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
-        .timeout(REQUEST_TIMEOUT)
-        .send(std::io::Cursor::new(oversized.clone()));
-    assert_eq!(status_of(resp), 413, "an oversized PUT body sent without a length should be rejected");
 
     let resp = ureq::post(&worker_url(port, &format!("/aesgcm?e={target}")))
         .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
@@ -573,11 +578,28 @@ fn invalid_requests_from_unrecognized_ip_do_not_fetch(port: u16, dev: &WranglerD
         .send_bytes(&oversized);
     assert_eq!(status_of(resp), 413, "an oversized POST body should be rejected");
 
+    let resp = ureq::put(&worker_url(port, &format!("/{target}")))
+        .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
+        .timeout(REQUEST_TIMEOUT)
+        .send_bytes(&oversized);
+    assert_eq!(status_of(resp), 413, "an oversized PUT body should be rejected");
+
     let resp = ureq::put(&worker_url(port, "/not-a-url"))
         .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
         .timeout(REQUEST_TIMEOUT)
         .send_string("body");
     assert_eq!(status_of(resp), 403, "a PUT with an invalid endpoint should be rejected");
+
+    let resp = ureq::put(&worker_url(port, &format!("/{target}")))
+        .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
+        .timeout(REQUEST_TIMEOUT)
+        .send(std::io::Cursor::new(oversized.clone()));
+    assert_eq!(status_of(resp), 413, "an oversized PUT body sent without a length should be rejected");
+
+    // Under `wrangler dev`, answering a chunked upload before it finishes can
+    // leave the local proxy's connection to the Worker dead, failing whatever
+    // request comes next. Spend one request on absorbing that.
+    let _ = ureq::get(&worker_url(port, "/")).timeout(REQUEST_TIMEOUT).call();
 
     assert_eq!(cidr_server.request_count(), fetches_before, "none of those should have triggered a fetch");
 
@@ -593,7 +615,7 @@ fn invalid_requests_from_unrecognized_ip_do_not_fetch(port: u16, dev: &WranglerD
 /// conditional fetch, and is accepted if the refreshed list now contains it.
 fn unrecognized_ip_against_stale_cache_fetches(port: u16, dev: &WranglerDev, cidr_server: &MockCidrServer) {
     cidr_server.set_body(format!("{TELEGRAM_CIDR_RANGE}\n{MOCK_CIDR_IP_A}\n{MOCK_CIDR_IP_B}"));
-    dev.kv_put(CIDR_LIST_FETCHED_AT_KV_KEY, &fetched_at_value(STALE_CACHE_AGE));
+    dev.age_cidr_cache(STALE_CACHE_AGE);
     let fetches_before = cidr_server.request_count();
 
     assert_eq!(put_from(port, MOCK_CIDR_IP_B), 201, "an IP only the refreshed list contains should be accepted");
@@ -607,13 +629,46 @@ fn unrecognized_ip_against_stale_cache_fetches(port: u16, dev: &WranglerDev, cid
     assert_eq!(cidr_server.request_count(), fetches_before + 1, "the refresh should have made the cache fresh again");
 }
 
+/// A fetch that fails is recorded as an attempt, which holds off further
+/// fetches, but leaves the time Telegram last confirmed the list alone. That
+/// time is what the next refresh sends as `If-Modified-Since`: advancing it on
+/// a failure would let Telegram answer 304 for changes made since the list was
+/// really last held, keeping an out-of-date list.
+fn failed_fetch_does_not_advance_the_confirmed_time(port: u16, dev: &WranglerDev, cidr_server: &MockCidrServer) {
+    let confirmed_at = fetched_at_value(STALE_CACHE_AGE);
+    dev.kv_put(CIDR_LIST_FETCHED_AT_KV_KEY, &confirmed_at);
+    dev.kv_put(CIDR_LIST_ATTEMPTED_AT_KV_KEY, &confirmed_at);
+    cidr_server.set_status(StatusCode::SERVICE_UNAVAILABLE);
+    let fetches_before = cidr_server.request_count();
+
+    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403);
+    assert_eq!(cidr_server.request_count(), fetches_before + 1);
+    let if_modified_since_before_failure = cidr_server.last_if_modified_since();
+    assert!(if_modified_since_before_failure.is_some());
+    assert_eq!(dev.kv_get(CIDR_LIST_FETCHED_AT_KV_KEY).trim(), confirmed_at, "a failed fetch confirmed nothing");
+    assert_ne!(dev.kv_get(CIDR_LIST_ATTEMPTED_AT_KV_KEY).trim(), confirmed_at, "the attempt should be recorded");
+
+    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403);
+    assert_eq!(cidr_server.request_count(), fetches_before + 1, "the failed attempt should hold off another");
+
+    dev.kv_put(CIDR_LIST_ATTEMPTED_AT_KV_KEY, &confirmed_at);
+    cidr_server.set_status(StatusCode::OK);
+    assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403);
+    assert_eq!(cidr_server.request_count(), fetches_before + 2);
+    assert_eq!(
+        cidr_server.last_if_modified_since(),
+        if_modified_since_before_failure,
+        "the refresh after a failure should still be conditioned on when the list was last confirmed"
+    );
+}
+
 /// A recognized IP is answered immediately even when the cache is very
 /// stale, but still prompts a refresh, so a reassigned Telegram range can't
 /// stay trusted indefinitely.
 fn recognized_ip_against_very_stale_cache_refetches_in_background(
     port: u16, dev: &WranglerDev, cidr_server: &MockCidrServer,
 ) {
-    dev.kv_put(CIDR_LIST_FETCHED_AT_KV_KEY, &fetched_at_value(VERY_STALE_CACHE_AGE));
+    dev.age_cidr_cache(VERY_STALE_CACHE_AGE);
     let fetches_before = cidr_server.request_count();
 
     assert_eq!(put_from(port, TELEGRAM_IP), 201);
@@ -636,6 +691,7 @@ fn unrecognized_ip_against_empty_cache_fetches_unconditionally(
 ) {
     dev.kv_delete(CIDR_LIST_KV_KEY);
     dev.kv_delete(CIDR_LIST_FETCHED_AT_KV_KEY);
+    dev.kv_delete(CIDR_LIST_ATTEMPTED_AT_KV_KEY);
     let fetches_before = cidr_server.request_count();
 
     assert_eq!(put_from(port, MOCK_CIDR_IP_UNKNOWN), 403);

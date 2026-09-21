@@ -14,8 +14,8 @@ use crate::clock;
 mod header_names {
     use http::HeaderName;
 
-    /// Sent on the outbound CIDR-list fetch, echoing back the last fetch
-    /// attempt's own timestamp, so an unchanged list costs Telegram's
+    /// Sent on the outbound CIDR-list fetch, echoing back when Telegram last
+    /// confirmed the cached list, so an unchanged list costs Telegram's
     /// server a 304 rather than a full body.
     pub const IF_MODIFIED_SINCE: HeaderName = HeaderName::from_static("if-modified-since");
 }
@@ -58,11 +58,19 @@ fn parse_cidr_list(content: &str) -> Option<String> {
 }
 
 const CIDR_LIST_KV_KEY: &str = "telegram_cidrs";
+/// When Telegram last confirmed the cached list: a successful fetch or a 304.
 const CIDR_LIST_FETCHED_AT_KV_KEY: &str = "telegram_cidrs_fetched_at";
-/// How long a cached CIDR list is trusted before an unrecognized IP is
-/// allowed to trigger a re-fetch.
+/// When Telegram last gave any definitive answer, usable or not. Throttles
+/// re-fetches without claiming the list was confirmed, which
+/// `CIDR_LIST_FETCHED_AT_KV_KEY` must never do: it is sent as
+/// `If-Modified-Since`, and a 304 against a time we never actually got the
+/// list at would keep a stale list forever.
+const CIDR_LIST_ATTEMPTED_AT_KV_KEY: &str = "telegram_cidrs_attempted_at";
+/// How long after the last answer from Telegram an unrecognized IP may not
+/// trigger another re-fetch.
 const CIDR_LIST_MAX_AGE: Duration = Duration::from_hours(24);
-/// Beyond this age, force a background re-fetch even for a *recognized* IP
+/// Beyond this time since Telegram last confirmed the list, force a
+/// background re-fetch even for a *recognized* IP
 /// -- otherwise a dropped-and-reassigned Telegram range would stay trusted
 /// forever, since a recognized IP normally never triggers a fetch at all
 /// (see `is_telegram_ip`). Real IPv4 reclaim quarantine periods run 3
@@ -139,7 +147,7 @@ struct CachedCidrList {
     list: String,
     freshness: CidrListFreshness,
     /// The `If-Modified-Since` value safe to send if a fetch is needed: the
-    /// real time of the last fetch, and only when a list from that fetch is
+    /// real time Telegram last confirmed the list, and only when a list is
     /// actually on hand. A 304 answered against anything else would leave us
     /// with a list we never received.
     if_modified_since: Option<String>,
@@ -147,23 +155,32 @@ struct CachedCidrList {
 
 async fn current_cidr_list(kv: &KvStore) -> CachedCidrList {
     let list = kv.get(CIDR_LIST_KV_KEY).text().await.ok().flatten();
-    let fetched_at = match kv.get(CIDR_LIST_FETCHED_AT_KV_KEY).text().await {
-        Ok(Some(fetched_at)) => fetched_at.parse::<u64>().ok().map(|ms| UNIX_EPOCH + Duration::from_millis(ms)),
-        _ => None,
-    };
+    let fetched_at = read_timestamp(kv, CIDR_LIST_FETCHED_AT_KV_KEY).await;
+    let attempted_at = read_timestamp(kv, CIDR_LIST_ATTEMPTED_AT_KV_KEY).await;
 
-    let freshness = freshness_of(clock::now(), fetched_at, jittered_force_refetch_max_age());
+    let freshness = freshness_of(clock::now(), attempted_at, fetched_at, jittered_force_refetch_max_age());
     let if_modified_since = list.as_ref().and(fetched_at).map(http_date);
     CachedCidrList { list: list.unwrap_or_default(), freshness, if_modified_since }
 }
 
-/// Classifies a list fetched at `fetched_at`. A missing timestamp is
-/// `VeryStale`, so an unseeded or damaged cache fails toward refreshing.
-fn freshness_of(now: SystemTime, fetched_at: Option<SystemTime>, force_refetch_max_age: Duration) -> CidrListFreshness {
-    let Some(fetched_at) = fetched_at else { return CidrListFreshness::VeryStale };
-    if clock::is_within(now, fetched_at, CIDR_LIST_MAX_AGE) {
+/// The millis-since-epoch timestamp stored under `key`, or `None` if it's
+/// absent or unreadable.
+async fn read_timestamp(kv: &KvStore, key: &str) -> Option<SystemTime> {
+    let value = kv.get(key).text().await.ok().flatten()?;
+    value.parse::<u64>().ok().map(|ms| UNIX_EPOCH + Duration::from_millis(ms))
+}
+
+/// Classifies the cache. `Fresh` means Telegram answered recently, so no
+/// fetch is due. Otherwise the list is `Stale` while it was confirmed within
+/// `force_refetch_max_age`, and `VeryStale` beyond that or with no confirmed
+/// time at all, so an unseeded or damaged cache fails toward refreshing.
+fn freshness_of(
+    now: SystemTime, attempted_at: Option<SystemTime>, fetched_at: Option<SystemTime>, force_refetch_max_age: Duration,
+) -> CidrListFreshness {
+    let within = |then: Option<SystemTime>, max_age| then.is_some_and(|then| clock::is_within(now, then, max_age));
+    if within(attempted_at, CIDR_LIST_MAX_AGE) || within(fetched_at, CIDR_LIST_MAX_AGE) {
         CidrListFreshness::Fresh
-    } else if clock::is_within(now, fetched_at, force_refetch_max_age) {
+    } else if within(fetched_at, force_refetch_max_age) {
         CidrListFreshness::Stale
     } else {
         CidrListFreshness::VeryStale
@@ -186,12 +203,12 @@ fn jittered_force_refetch_max_age() -> Duration {
 /// common case) then costs Telegram's server a bodyless 304 instead of the
 /// full list.
 ///
-/// The fetched-at timestamp is updated on any definitive answer (a 304, a
-/// success, or a bad-but-reachable response like an unparseable body), so a
-/// broken-but-reachable endpoint isn't hit on every subsequent
-/// unrecognized-IP request either -- only a network-level failure leaves it
-/// untouched, since that's the one case worth retrying sooner than
-/// `CIDR_LIST_MAX_AGE`.
+/// Any definitive answer (a 304, a success, or a bad-but-reachable response
+/// like an unparseable body) records an attempt, so a broken-but-reachable
+/// endpoint isn't hit on every subsequent unrecognized-IP request either.
+/// Only a 304 or a valid list also records that Telegram confirmed the list.
+/// A network-level failure records nothing, since that's the one case worth
+/// retrying sooner than `CIDR_LIST_MAX_AGE`.
 ///
 /// `current_list` is returned unchanged on a 304, since that response
 /// carries no body to re-derive it from.
@@ -211,7 +228,7 @@ async fn fetch_fresh_cidr_list(
             let status = resp.status_code();
             if status == StatusCode::NOT_MODIFIED.as_u16() {
                 console_log!("cidr_fetch: outcome=not_modified status={status}");
-                mark_cidr_list_fetched(kv).await;
+                mark_cidr_list_confirmed(kv).await;
                 return Some(current_list.to_string());
             }
             if StatusCode::from_u16(status).is_ok_and(|s| s.is_success()) {
@@ -222,21 +239,27 @@ async fn fetch_fresh_cidr_list(
                                 "cidr_fetch: outcome=success entries={} status={status}",
                                 parsed.lines().count()
                             );
-                            kv_put_best_effort(kv, CIDR_LIST_KV_KEY, &parsed).await;
-                            mark_cidr_list_fetched(kv).await;
+                            // Only vouch for the list in KV if it actually got
+                            // written.
+                            if kv_put_best_effort(kv, CIDR_LIST_KV_KEY, &parsed).await {
+                                mark_cidr_list_confirmed(kv).await;
+                            } else {
+                                console_error!("cidr_fetch: outcome=failed reason=kv_write_error");
+                                mark_cidr_list_attempted(kv).await;
+                            }
                             return Some(parsed);
                         }
                         console_error!("cidr_fetch: outcome=failed reason=unparseable status={status}");
-                        mark_cidr_list_fetched(kv).await;
+                        mark_cidr_list_attempted(kv).await;
                     }
                     Err(e) => {
                         console_error!("cidr_fetch: outcome=failed reason=body_read_error status={status} error={e}");
-                        mark_cidr_list_fetched(kv).await;
+                        mark_cidr_list_attempted(kv).await;
                     }
                 }
             } else {
                 console_error!("cidr_fetch: outcome=failed reason=bad_status status={status}");
-                mark_cidr_list_fetched(kv).await;
+                mark_cidr_list_attempted(kv).await;
             }
         }
         Err(e) => console_error!("cidr_fetch: outcome=failed reason=network_error error={e}"),
@@ -251,8 +274,16 @@ pub(crate) fn cidr_list_url(env: &Env) -> String {
     env.var(CIDR_LIST_URL_VAR).map_or_else(|_| TELEGRAM_CIDR_URL.to_string(), |v| v.to_string())
 }
 
-async fn mark_cidr_list_fetched(kv: &KvStore) {
-    kv_put_best_effort(kv, CIDR_LIST_FETCHED_AT_KV_KEY, &millis_since_epoch(clock::now()).to_string()).await;
+/// Records that Telegram answered, whether or not the answer was usable.
+async fn mark_cidr_list_attempted(kv: &KvStore) {
+    kv_put_best_effort(kv, CIDR_LIST_ATTEMPTED_AT_KV_KEY, &millis_since_epoch(clock::now()).to_string()).await;
+}
+
+/// Records that Telegram confirmed the cached list is current.
+async fn mark_cidr_list_confirmed(kv: &KvStore) {
+    let now = millis_since_epoch(clock::now()).to_string();
+    kv_put_best_effort(kv, CIDR_LIST_FETCHED_AT_KV_KEY, &now).await;
+    kv_put_best_effort(kv, CIDR_LIST_ATTEMPTED_AT_KV_KEY, &now).await;
 }
 
 /// An HTTP-date string (e.g. for `If-Modified-Since`) for the given point
@@ -264,12 +295,14 @@ fn http_date(t: SystemTime) -> String {
 
 /// `KvStore::put` only constructs a builder -- the write itself doesn't
 /// happen until `.execute().await`, easy to miss since the outer call isn't
-/// itself async. Failures are swallowed here: a missed write only means the
-/// next request re-fetches, so it's never worth failing an otherwise-valid
-/// request over.
-async fn kv_put_best_effort(kv: &KvStore, key: &str, value: &str) {
-    if let Ok(builder) = kv.put(key, value) {
-        let _ = builder.execute().await;
+/// itself async. Failures don't propagate, since a missed write only means
+/// the next request re-fetches and it's never worth failing an otherwise-valid
+/// request over; the result says whether the write happened for callers that
+/// must not act as if it had.
+async fn kv_put_best_effort(kv: &KvStore, key: &str, value: &str) -> bool {
+    match kv.put(key, value) {
+        Ok(builder) => builder.execute().await.is_ok(),
+        Err(_) => false,
     }
 }
 
@@ -320,23 +353,57 @@ mod tests {
         assert!(parse_cidr_list("\n\n").is_none());
     }
 
+    /// A fixed "now" far enough from the epoch that every age below is a valid
+    /// time.
+    fn now_for_freshness_tests() -> SystemTime { UNIX_EPOCH + CIDR_LIST_FORCE_REFETCH_MAX_AGE * 2 }
+
     #[test]
-    fn test_freshness_of() {
-        let now = UNIX_EPOCH + CIDR_LIST_FORCE_REFETCH_MAX_AGE * 2;
+    fn test_freshness_of_by_confirmed_age() {
+        let now = now_for_freshness_tests();
         let cases = [
             (now - Duration::from_secs(1), CidrListFreshness::Fresh),
             (now - CIDR_LIST_MAX_AGE - Duration::from_secs(1), CidrListFreshness::Stale),
             (now - CIDR_LIST_FORCE_REFETCH_MAX_AGE - Duration::from_secs(1), CidrListFreshness::VeryStale),
-            (now + Duration::from_secs(1), CidrListFreshness::VeryStale), // fetched "in the future"
+            (now + Duration::from_secs(1), CidrListFreshness::VeryStale), // confirmed "in the future"
         ];
         for (fetched_at, expected) in cases {
-            assert_eq!(freshness_of(now, Some(fetched_at), CIDR_LIST_FORCE_REFETCH_MAX_AGE), expected);
+            assert_eq!(freshness_of(now, None, Some(fetched_at), CIDR_LIST_FORCE_REFETCH_MAX_AGE), expected);
         }
     }
 
     #[test]
-    fn test_freshness_of_missing_timestamp_is_very_stale() {
-        assert_eq!(freshness_of(UNIX_EPOCH, None, CIDR_LIST_FORCE_REFETCH_MAX_AGE), CidrListFreshness::VeryStale);
+    fn test_freshness_of_missing_timestamps_is_very_stale() {
+        let now = now_for_freshness_tests();
+        assert_eq!(freshness_of(now, None, None, CIDR_LIST_FORCE_REFETCH_MAX_AGE), CidrListFreshness::VeryStale);
+    }
+
+    #[test]
+    fn test_freshness_of_recent_attempt_throttles_regardless_of_confirmed_age() {
+        let now = now_for_freshness_tests();
+        let long_ago = now - CIDR_LIST_FORCE_REFETCH_MAX_AGE - Duration::from_secs(1);
+        let recent = now - Duration::from_secs(1);
+        for fetched_at in [Some(long_ago), None] {
+            assert_eq!(
+                freshness_of(now, Some(recent), fetched_at, CIDR_LIST_FORCE_REFETCH_MAX_AGE),
+                CidrListFreshness::Fresh
+            );
+        }
+    }
+
+    #[test]
+    fn test_freshness_of_old_attempt_falls_back_to_confirmed_age() {
+        let now = now_for_freshness_tests();
+        let old_attempt = now - CIDR_LIST_MAX_AGE - Duration::from_secs(1);
+        let confirmed_recently = now - CIDR_LIST_MAX_AGE - Duration::from_secs(2);
+        let confirmed_long_ago = now - CIDR_LIST_FORCE_REFETCH_MAX_AGE - Duration::from_secs(1);
+        assert_eq!(
+            freshness_of(now, Some(old_attempt), Some(confirmed_recently), CIDR_LIST_FORCE_REFETCH_MAX_AGE),
+            CidrListFreshness::Stale
+        );
+        assert_eq!(
+            freshness_of(now, Some(old_attempt), Some(confirmed_long_ago), CIDR_LIST_FORCE_REFETCH_MAX_AGE),
+            CidrListFreshness::VeryStale
+        );
     }
 
     #[test]
