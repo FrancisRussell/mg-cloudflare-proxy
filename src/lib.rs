@@ -15,6 +15,9 @@ mod correlator;
 mod outbound;
 mod telegram_cidrs;
 
+use std::time::Duration;
+
+use clock::Deadline;
 pub use correlator::Correlator;
 use futures_util::StreamExt;
 use http::StatusCode;
@@ -37,6 +40,9 @@ mod header_names {
     /// Internal header carrying the validated forwarding target from the
     /// Worker to the Correlator Durable Object.
     pub(crate) const X_RELAY_TARGET: HeaderName = HeaderName::from_static("x-relay-target");
+    /// Internal header carrying how much of the request's time budget is left,
+    /// in milliseconds, from the Worker to the Correlator Durable Object.
+    pub(crate) const X_RELAY_BUDGET_MS: HeaderName = HeaderName::from_static("x-relay-budget-ms");
 }
 
 /// Real `WebPush` ciphertext is small; anything past this is treated as
@@ -134,6 +140,32 @@ pub(crate) fn error_response(status: StatusCode) -> Result<Response> {
     Response::error(status.canonical_reason().expect("standard status code has a canonical reason"), status.as_u16())
 }
 
+/// The wrangler var holding the most time, in milliseconds, a request may take
+/// before it's answered, so Telegram isn't kept waiting on a slow push server
+/// or CIDR refresh.
+const REQUEST_BUDGET_MS_VAR: &str = "MAX_RESPONSE_MS";
+/// The request budget when `REQUEST_BUDGET_MS_VAR` is unset or unusable.
+pub(crate) const DEFAULT_REQUEST_BUDGET: Duration = Duration::from_secs(5);
+
+/// How long a request may take: the `REQUEST_BUDGET_MS_VAR` var if it holds a
+/// positive number of milliseconds, otherwise `DEFAULT_REQUEST_BUDGET`.
+fn request_budget(env: &Env) -> Duration {
+    let configured = env.var(REQUEST_BUDGET_MS_VAR).ok().map(|value| value.to_string());
+    parse_request_budget(configured.as_deref()).unwrap_or_else(|| {
+        if let Some(value) = configured {
+            console_error!(
+                "config: ignoring {REQUEST_BUDGET_MS_VAR}={value}, which isn't a positive number of milliseconds"
+            );
+        }
+        DEFAULT_REQUEST_BUDGET
+    })
+}
+
+/// `value` as a budget, if it is a positive number of milliseconds.
+fn parse_request_budget(value: Option<&str>) -> Option<Duration> {
+    value?.trim().parse::<u64>().ok().filter(|millis| *millis > 0).map(Duration::from_millis)
+}
+
 /// How long a client is told to wait before retrying when its IP couldn't be
 /// verified.
 const UNVERIFIABLE_RETRY_AFTER_SECONDS: &str = "60";
@@ -141,11 +173,11 @@ const UNVERIFIABLE_RETRY_AFTER_SECONDS: &str = "60";
 /// `None` if `client_ip` is a Telegram IP, otherwise the response to send
 /// instead of forwarding.
 async fn reject_unless_telegram_ip(
-    leg: &str, client_ip: std::net::IpAddr, ctx: &RouteContext<Context>,
+    leg: &str, client_ip: std::net::IpAddr, deadline: Deadline, ctx: &RouteContext<Context>,
 ) -> Result<Option<Response>> {
     let kv = ctx.env.kv(CIDR_CACHE_KV_BINDING)?;
     let fetch_url = telegram_cidrs::cidr_list_url(&ctx.env);
-    match telegram_cidrs::is_telegram_ip(&kv, client_ip, &fetch_url, &ctx.data).await {
+    match telegram_cidrs::is_telegram_ip(&kv, client_ip, &fetch_url, &ctx.data, deadline).await {
         TelegramIpCheck::Telegram => Ok(None),
         TelegramIpCheck::NotTelegram => {
             console_log!("rejected: leg={leg} reason=ip_not_in_telegram_range ip={client_ip}");
@@ -268,12 +300,15 @@ fn folding_header_value(value: Option<String>) -> Option<String> {
 /// internal request: `X-Relay-Target` carries the validated endpoint,
 /// the method (POST/PUT) tells the Durable Object which branch to run,
 /// and the body is whatever that branch should forward if it decides to.
-async fn call_correlator(env: &Env, endpoint: &url::Url, method: Method, body: Vec<u8>) -> Result<Response> {
+async fn call_correlator(
+    env: &Env, endpoint: &url::Url, method: Method, body: Vec<u8>, deadline: Deadline,
+) -> Result<Response> {
     let namespace = env.durable_object(CORRELATOR_BINDING)?;
     let stub = namespace.id_from_name(endpoint.as_str())?.get_stub()?;
 
     let headers = Headers::new();
     headers.set(header_names::X_RELAY_TARGET.as_str(), endpoint.as_str())?;
+    headers.set(header_names::X_RELAY_BUDGET_MS.as_str(), &deadline.remaining().as_millis().to_string())?;
 
     let mut init = RequestInit::new();
     init.with_method(method).with_headers(headers).with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into()));
@@ -297,6 +332,7 @@ async fn call_correlator(env: &Env, endpoint: &url::Url, method: Method, body: V
 /// well-formed enough to forward reaches the one check that can trigger
 /// outbound traffic to Telegram.
 async fn handle_aesgcm(mut req: Request, ctx: RouteContext<Context>) -> Result<Response> {
+    let deadline = Deadline::after(request_budget(&ctx.env));
     let Some(client_ip_str) = get_client_ip(&req) else {
         console_log!("rejected: leg=aesgcm reason=missing_cf_connecting_ip");
         return error_response(StatusCode::FORBIDDEN);
@@ -337,13 +373,13 @@ async fn handle_aesgcm(mut req: Request, ctx: RouteContext<Context>) -> Result<R
 
     // Keep this last: an unrecognized IP can trigger a CIDR fetch, so only
     // otherwise-valid requests may reach it.
-    if let Some(rejection) = reject_unless_telegram_ip("aesgcm", client_ip, &ctx).await? {
+    if let Some(rejection) = reject_unless_telegram_ip("aesgcm", client_ip, deadline, &ctx).await? {
         return Ok(rejection);
     }
 
     let folded = fold_aesgcm_body(&encryption, &crypto_key, &body);
 
-    call_correlator(&ctx.env, &endpoint, Method::Post, folded).await
+    call_correlator(&ctx.env, &endpoint, Method::Post, folded, deadline).await
 }
 
 /// PUT /<url-encoded-endpoint> — Simple Push (`token_type=4`) leg.
@@ -351,6 +387,7 @@ async fn handle_aesgcm(mut req: Request, ctx: RouteContext<Context>) -> Result<R
 /// Same ordering rationale as `handle_aesgcm`: structural validation before
 /// the one check that can trigger outbound traffic to Telegram.
 async fn handle_put(mut req: Request, ctx: RouteContext<Context>) -> Result<Response> {
+    let deadline = Deadline::after(request_budget(&ctx.env));
     let Some(client_ip_str) = get_client_ip(&req) else {
         console_log!("rejected: leg=put reason=missing_cf_connecting_ip");
         return error_response(StatusCode::FORBIDDEN);
@@ -385,11 +422,11 @@ async fn handle_put(mut req: Request, ctx: RouteContext<Context>) -> Result<Resp
 
     // Keep this last: an unrecognized IP can trigger a CIDR fetch, so only
     // otherwise-valid requests may reach it.
-    if let Some(rejection) = reject_unless_telegram_ip("put", client_ip, &ctx).await? {
+    if let Some(rejection) = reject_unless_telegram_ip("put", client_ip, deadline, &ctx).await? {
         return Ok(rejection);
     }
 
-    call_correlator(&ctx.env, &endpoint, Method::Put, body).await
+    call_correlator(&ctx.env, &endpoint, Method::Put, body, deadline).await
 }
 
 /// The target endpoint URL travels url-encoded in the PUT path, so it needs
@@ -537,6 +574,15 @@ mod tests {
             fold_aesgcm_body(encryption, crypto_key, body),
             b"aesgcm\nEncryption: salt=abc\nCrypto-Key: dh=xyz\nciphertext"
         );
+    }
+
+    #[test]
+    fn test_parse_request_budget() {
+        assert_eq!(parse_request_budget(Some("2500")), Some(Duration::from_millis(2500)));
+        assert_eq!(parse_request_budget(Some(" 5000 ")), Some(Duration::from_millis(5000)));
+        for unusable in [None, Some(""), Some("0"), Some("-1"), Some("5s"), Some("2.5")] {
+            assert_eq!(parse_request_budget(unusable), None, "value: {unusable:?}");
+        }
     }
 
     #[test]

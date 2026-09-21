@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime};
 use http::StatusCode;
 use worker::*;
 
-use crate::clock;
+use crate::clock::{self, Deadline};
 use crate::outbound::{send_with_timeout, FetchFailure};
 
 /// Header names used when forwarding to the distributor.
@@ -55,22 +55,17 @@ const CONTENT_ENCODING_AES128GCM: &str = "aes128gcm";
 /// the same endpoint checks in.
 const RECENT_POST_WINDOW: Duration = Duration::from_secs(2);
 
-/// How long a push server gets to answer a forwarded push before it's given
-/// up on. Bounds a server that accepts the connection and then never replies,
-/// which would otherwise hold the request open indefinitely.
-const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// How long the PUT handler waits for a same-endpoint POST to land before
 /// giving up and forwarding a synthetic wake-up. Nothing documents how far
 /// apart the two requests arrive, so this is an empirical guess, not a spec
 /// value.
 const CORRELATION_WAIT: Duration = Duration::from_millis(200);
 
-/// The longest a PUT keeps waiting for POSTs that are still being forwarded
-/// once `CORRELATION_WAIT` is over. Past it the PUT stops waiting and
-/// forwards, accepting a possible duplicate over holding the wake-up up
-/// behind a slow push server.
-const POST_IN_FLIGHT_MAX_WAIT: Duration = Duration::from_secs(5);
+/// How much of the request's time a PUT keeps back for forwarding its wake-up
+/// while it waits for POSTs still being forwarded. Once only this much is left
+/// it stops waiting and forwards, accepting a possible duplicate over holding
+/// the wake-up up behind a slow push server.
+const FORWARD_RESERVE: Duration = Duration::from_secs(1);
 /// How often that wait checks whether the POSTs have finished.
 const POST_IN_FLIGHT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -107,11 +102,17 @@ impl DurableObject for Correlator {
             return Response::error("missing X-Relay-Target", StatusCode::BAD_REQUEST.as_u16());
         };
         let target_url = url::Url::parse(&target).map_err(|e| Error::RustError(format!("bad target: {e}")))?;
+        let budget = req
+            .headers()
+            .get(crate::header_names::X_RELAY_BUDGET_MS.as_str())?
+            .and_then(|millis| millis.parse::<u64>().ok())
+            .map_or(crate::DEFAULT_REQUEST_BUDGET, Duration::from_millis);
+        let deadline = Deadline::after(budget);
         let body = req.bytes().await?;
 
         match req.method() {
-            Method::Post => self.handle_post(&target_url, body).await,
-            Method::Put => self.handle_put(&target_url, body).await,
+            Method::Post => self.handle_post(&target_url, body, deadline).await,
+            Method::Put => self.handle_put(&target_url, body, deadline).await,
             _ => crate::error_response(StatusCode::METHOD_NOT_ALLOWED),
         }
     }
@@ -121,9 +122,9 @@ impl Correlator {
     /// POST leg: forward the (already header-folded) body, and on success
     /// record that this endpoint just received real content, so a PUT
     /// arriving shortly after knows to suppress its wake-up.
-    async fn handle_post(&self, target: &url::Url, body: Vec<u8>) -> Result<Response> {
+    async fn handle_post(&self, target: &url::Url, body: Vec<u8>, deadline: Deadline) -> Result<Response> {
         let _in_flight = PostInFlight::begin(&self.posts_in_flight);
-        let resp = forward(target, body).await?;
+        let resp = forward(target, body, deadline).await?;
         if StatusCode::from_u16(resp.status_code()).is_ok_and(|s| s.is_success()) {
             self.last_post.set(Some(clock::now()));
         }
@@ -136,31 +137,31 @@ impl Correlator {
     /// Simple Push body as a synthetic wake-up. A concurrent PUT for the
     /// same endpoint defers to whichever one got here first (see
     /// `put_in_flight`'s doc comment).
-    async fn handle_put(&self, target: &url::Url, body: Vec<u8>) -> Result<Response> {
+    async fn handle_put(&self, target: &url::Url, body: Vec<u8>, deadline: Deadline) -> Result<Response> {
         if self.recent_post() {
             return Response::ok("");
         }
         let Some(claim) = PutInFlight::claim(&self.put_in_flight) else { return Response::ok("") };
 
         Delay::from(CORRELATION_WAIT).await;
-        self.wait_for_posts_in_flight().await;
+        self.wait_for_posts_in_flight(deadline).await;
 
         let should_forward = !self.recent_post();
         drop(claim);
 
         if should_forward {
-            forward(target, body).await
+            forward(target, body, deadline).await
         } else {
             Response::ok("")
         }
     }
 
-    /// Waits, up to `POST_IN_FLIGHT_MAX_WAIT`, for POSTs still being forwarded:
-    /// one may yet succeed and make this PUT redundant. A POST that fails
-    /// records nothing, so the PUT still forwards after it.
-    async fn wait_for_posts_in_flight(&self) {
-        let deadline = clock::now() + POST_IN_FLIGHT_MAX_WAIT;
-        while self.posts_in_flight.get() > 0 && clock::now() < deadline {
+    /// Waits for POSTs still being forwarded, until only `FORWARD_RESERVE` of
+    /// the request's time is left: one may yet succeed and make this PUT
+    /// redundant. A POST that fails records nothing, so the PUT still forwards
+    /// after it.
+    async fn wait_for_posts_in_flight(&self, deadline: Deadline) {
+        while self.posts_in_flight.get() > 0 && deadline.remaining() > FORWARD_RESERVE {
             Delay::from(POST_IN_FLIGHT_POLL_INTERVAL).await;
         }
     }
@@ -215,8 +216,9 @@ fn is_post_recent(now: SystemTime, last_post: Option<SystemTime>, window: Durati
 /// back off on other 2xx codes, so any 2xx is normalized to that shape.
 ///
 /// Uses `redirect: manual`, which stops a redirect being followed and
-/// surfaces its real status and `Location` rather than an opaque response.
-async fn forward(target: &url::Url, body: Vec<u8>) -> Result<Response> {
+/// surfaces its real status and `Location` rather than an opaque response. A
+/// push server that hasn't answered when `deadline` passes is given up on.
+async fn forward(target: &url::Url, body: Vec<u8>, deadline: Deadline) -> Result<Response> {
     let headers = Headers::new();
     headers.set(header_names::TTL.as_str(), &TTL_SECONDS.to_string())?;
     headers.set(header_names::URGENCY.as_str(), URGENCY_HIGH)?;
@@ -232,7 +234,8 @@ async fn forward(target: &url::Url, body: Vec<u8>) -> Result<Response> {
     let host = target.host_str().unwrap_or("?");
 
     let req = Request::new_with_init(target.as_str(), &init)?;
-    let resp = match send_with_timeout(req, FORWARD_TIMEOUT).await {
+    // The push server gets whatever is left of the request's time.
+    let resp = match send_with_timeout(req, deadline.remaining()).await {
         Ok(resp) => resp,
         Err(failure) => {
             console_error!("forward failed: host={host} reason={failure}");

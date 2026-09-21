@@ -69,6 +69,12 @@ const CIDR_LIST_ATTEMPTED_AT_KV_KEY: &str = "telegram_cidrs_attempted_at";
 const STALE_CACHE_AGE: Duration = Duration::from_hours(2 * 24);
 const VERY_STALE_CACHE_AGE: Duration = Duration::from_hours(31 * 24);
 
+/// The most time the Worker is told a request may take, shorter than its
+/// default so the timeout scenarios don't take long.
+const TEST_RESPONSE_BUDGET: Duration = Duration::from_secs(3);
+/// How far past the response budget a timeout answer may arrive.
+const BUDGET_TOLERANCE: Duration = Duration::from_millis(1500);
+
 /// A body size comfortably over the Worker's request body limit.
 const OVERSIZED_BODY_BYTES: usize = 64 * 1024;
 
@@ -168,6 +174,8 @@ fn spawn_wrangler_dev(
             &port.to_string(),
             "--var",
             &format!("CIDR_LIST_URL:{cidr_list_url}"),
+            "--var",
+            &format!("MAX_RESPONSE_MS:{}", TEST_RESPONSE_BUDGET.as_millis()),
             "--persist-to",
             persist_dir.to_str().expect("temp dir path must be valid UTF-8"),
         ])
@@ -631,7 +639,7 @@ fn integration_test() {
     refresh_consults_kv_before_fetching(port, &mut dev, &cidr_server);
     failed_fetch_does_not_advance_the_confirmed_time(port, &mut dev, &cidr_server);
     unreachable_telegram_records_an_attempt_and_holds_off_the_next(port, &mut dev, &cidr_server);
-    silent_telegram_is_given_up_on(port, &mut dev, &cidr_server);
+    silent_telegram_holds_up_the_request_only_for_the_budget(port, &mut dev, &cidr_server);
     concurrent_unrecognized_ips_share_one_refresh(port, &mut dev, &cidr_server);
     recognized_ip_against_very_stale_cache_refetches_in_background(port, &mut dev, &cidr_server);
     unrecognized_ip_against_empty_cache_fetches_unconditionally(port, &mut dev, &cidr_server);
@@ -847,12 +855,18 @@ fn unreachable_telegram_records_an_attempt_and_holds_off_the_next(
     );
 }
 
-/// A Telegram endpoint that accepts the connection and never answers is given
-/// up on after the fetch timeout, and counts as a failed attempt.
-fn silent_telegram_is_given_up_on(port: u16, dev: &mut WranglerDev, cidr_server: &MockCidrServer) {
-    /// Longer than the Worker's fetch timeout, so the Worker's answer is the
-    /// one seen.
+/// A Telegram endpoint that accepts the connection and never answers holds up
+/// the request only for the response budget, which then gets a 503. The
+/// refresh carries on in the background until the fetch times out, and its
+/// attempt is recorded then.
+fn silent_telegram_holds_up_the_request_only_for_the_budget(
+    port: u16, dev: &mut WranglerDev, cidr_server: &MockCidrServer,
+) {
+    /// Longer than the response budget, so the Worker's answer is the one seen.
     const CLIENT_PATIENCE: Duration = Duration::from_secs(30);
+    /// Longer than the Worker's CIDR fetch timeout.
+    const BACKGROUND_FETCH_PATIENCE: Duration = Duration::from_secs(30);
+
     let confirmed_at = fetched_at_value(STALE_CACHE_AGE);
     dev.kv_put(CIDR_LIST_FETCHED_AT_KV_KEY, &confirmed_at);
     dev.kv_put(CIDR_LIST_ATTEMPTED_AT_KV_KEY, &confirmed_at);
@@ -866,11 +880,18 @@ fn silent_telegram_is_given_up_on(port: u16, dev: &mut WranglerDev, cidr_server:
             .timeout(CLIENT_PATIENCE)
             .send_string("body"),
     );
+    let elapsed = started.elapsed();
     cidr_server.set_silent(false);
 
-    assert_eq!(status, 503, "an IP that can't be judged because Telegram never answered");
-    assert!(started.elapsed() < CLIENT_PATIENCE, "the Worker should give up well before the client does");
-    assert_ne!(dev.kv_get(CIDR_LIST_ATTEMPTED_AT_KV_KEY).trim(), confirmed_at, "the attempt should be recorded");
+    assert_eq!(status, 503, "an IP that can't be judged because Telegram hasn't answered");
+    assert!(elapsed <= TEST_RESPONSE_BUDGET + BUDGET_TOLERANCE, "answered long after the budget: {elapsed:?}");
+    assert_eq!(dev.kv_get(CIDR_LIST_ATTEMPTED_AT_KV_KEY).trim(), confirmed_at, "the fetch is still running");
+
+    let give_up = Instant::now() + BACKGROUND_FETCH_PATIENCE;
+    while dev.kv_get(CIDR_LIST_ATTEMPTED_AT_KV_KEY).trim() == confirmed_at {
+        assert!(Instant::now() < give_up, "the background refresh never recorded its attempt");
+        std::thread::sleep(POLL_INTERVAL);
+    }
 }
 
 /// Requests for unrecognized IPs that arrive together while the list is being
@@ -1142,9 +1163,9 @@ fn unreachable_push_server_answers_bad_gateway(port: u16) {
 }
 
 /// A push server that accepts the connection and never answers is given up on
-/// after the Worker's forward timeout, rather than holding the request open.
+/// once the response budget is spent, rather than holding the request open.
 fn unanswering_push_server_answers_gateway_timeout(port: u16) {
-    /// Longer than the Worker's forward timeout, so the Worker's answer is the
+    /// Longer than the Worker's response budget, so the Worker's answer is the
     /// one seen.
     const CLIENT_PATIENCE: Duration = Duration::from_secs(30);
 
@@ -1158,5 +1179,7 @@ fn unanswering_push_server_answers_gateway_timeout(port: u16) {
 
     let started = Instant::now();
     assert_eq!(put_to_endpoint(port, &format!("http://localhost:{silent_port}/push"), CLIENT_PATIENCE), 504);
-    assert!(started.elapsed() < CLIENT_PATIENCE, "the Worker should answer well before the client gives up");
+    let elapsed = started.elapsed();
+    assert!(elapsed + BUDGET_TOLERANCE >= TEST_RESPONSE_BUDGET, "answered before the budget: {elapsed:?}");
+    assert!(elapsed <= TEST_RESPONSE_BUDGET + BUDGET_TOLERANCE, "answered long after the budget: {elapsed:?}");
 }

@@ -5,9 +5,11 @@
 // `is_telegram_ip`'s doc comment for the rules.
 
 use std::cell::{Cell, RefCell};
+use std::pin::pin;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use futures_util::future::try_join3;
+use futures_channel::oneshot;
+use futures_util::future::{select, try_join3, Either};
 use http::StatusCode;
 use worker::*;
 
@@ -15,7 +17,7 @@ use crate::cidr_state::{
     background_refresh_due, merge, parse_cidr_list, parse_networks, refresh_unnecessary, unknown_ip_plan,
     CidrFetchOutcome, CidrSnapshot, Thresholds, UnknownIpPlan,
 };
-use crate::clock;
+use crate::clock::{self, Deadline};
 use crate::outbound::send_with_timeout;
 
 /// Header names used on the outbound CIDR-list fetch.
@@ -84,7 +86,8 @@ pub(crate) enum TelegramIpCheck {
 }
 
 /// Checks `ip` against this isolate's copy of the list, loading it from KV
-/// only the first time.
+/// only the first time. A request waits for a refresh only until `deadline`; a
+/// refresh still running by then carries on in the background.
 ///
 /// A recognized IP is accepted straight away. If Telegram hasn't confirmed the
 /// list for about a month, it also starts a refresh in the background via
@@ -100,7 +103,7 @@ pub(crate) enum TelegramIpCheck {
 /// If the cache can't be read, nothing is fetched: a KV outage must not turn
 /// into a fetch per request.
 pub(crate) async fn is_telegram_ip(
-    kv: &KvStore, ip: std::net::IpAddr, fetch_url: &str, ctx: &Context,
+    kv: &KvStore, ip: std::net::IpAddr, fetch_url: &str, ctx: &Context, deadline: Deadline,
 ) -> TelegramIpCheck {
     let snapshot = match remembered() {
         Some(snapshot) => snapshot,
@@ -123,7 +126,7 @@ pub(crate) async fn is_telegram_ip(
             let kv = kv.clone();
             let fetch_url = fetch_url.to_string();
             ctx.wait_until(async move {
-                refresh(&kv, &fetch_url, thresholds).await;
+                refresh(kv, fetch_url, thresholds).await;
             });
         }
         return TelegramIpCheck::Telegram;
@@ -132,7 +135,7 @@ pub(crate) async fn is_telegram_ip(
     let snapshot = match unknown_ip_plan(&snapshot, clock::now(), thresholds) {
         UnknownIpPlan::Reject => return TelegramIpCheck::NotTelegram,
         UnknownIpPlan::Unverifiable => return TelegramIpCheck::Unverifiable,
-        UnknownIpPlan::Refresh => match refresh(kv, fetch_url, thresholds).await {
+        UnknownIpPlan::Refresh => match refresh_until(kv, fetch_url, thresholds, deadline, ctx).await {
             Some(refreshed) => refreshed,
             None => return TelegramIpCheck::Unverifiable,
         },
@@ -148,18 +151,46 @@ pub(crate) async fn is_telegram_ip(
     }
 }
 
+/// Runs a refresh, waiting for it only until `deadline`. The refresh runs
+/// under `ctx.wait_until` from the start, so a slow Telegram doesn't hold up
+/// the response but the refresh still finishes, and its result reaches later
+/// requests. (Timers set up by a request don't survive the response, so a
+/// refresh can't simply be handed over part-way.) Returns `None` if the
+/// refresh didn't finish in time, or if KV couldn't be read.
+async fn refresh_until(
+    kv: &KvStore, fetch_url: &str, thresholds: Thresholds, deadline: Deadline, ctx: &Context,
+) -> Option<CidrSnapshot> {
+    let (sender, receiver) = oneshot::channel();
+    let (kv, fetch_url) = (kv.clone(), fetch_url.to_string());
+    ctx.wait_until(async move {
+        // The request may have stopped waiting; the refresh's effects on the
+        // snapshot and KV are what matter then.
+        let _ = sender.send(refresh(kv, fetch_url, thresholds).await);
+    });
+
+    let out_of_time = pin!(Delay::from(deadline.remaining()));
+    match select(receiver, out_of_time).await {
+        Either::Left((Ok(refreshed), _)) => refreshed,
+        Either::Left((Err(_), _)) => None,
+        Either::Right(..) => {
+            console_log!("cidr_cache: refresh outlasted the response time, finishing it in the background");
+            None
+        }
+    }
+}
+
 /// Brings this isolate's copy up to date, and returns it, or `None` if KV
 /// couldn't be read. KV is consulted first, since another isolate may already
 /// have refreshed the list, or attempted to, and its timestamps decide whether
 /// Telegram needs asking at all. Only one refresh runs in an isolate at a time:
 /// the others wait for it and use what it leaves behind.
-async fn refresh(kv: &KvStore, fetch_url: &str, thresholds: Thresholds) -> Option<CidrSnapshot> {
+async fn refresh(kv: KvStore, fetch_url: String, thresholds: Thresholds) -> Option<CidrSnapshot> {
     let Some(_lease) = RefreshLease::claim(clock::now()) else {
         wait_for_running_refresh().await;
         return remembered();
     };
 
-    let from_kv = match load_from_kv(kv).await {
+    let from_kv = match load_from_kv(&kv).await {
         Ok(loaded) => loaded,
         Err(e) => {
             console_error!("cidr_cache: outcome=failed reason=kv_read_error error={e}");
@@ -173,11 +204,11 @@ async fn refresh(kv: &KvStore, fetch_url: &str, thresholds: Thresholds) -> Optio
     }
 
     let if_modified_since = merged.if_modified_since().map(http_date);
-    let outcome = request_cidr_list(fetch_url, if_modified_since.as_deref()).await;
+    let outcome = request_cidr_list(&fetch_url, if_modified_since.as_deref()).await;
     let now = clock::now();
     let updated = merged.after(&outcome, now);
     remember(updated.clone());
-    persist(kv, &outcome, now).await;
+    persist(&kv, &outcome, now).await;
     Some(updated)
 }
 

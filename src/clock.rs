@@ -19,9 +19,35 @@ pub(crate) fn is_within(now: SystemTime, then: SystemTime, max_age: Duration) ->
     now.duration_since(then).is_ok_and(|age| age < max_age)
 }
 
+/// A point in time by which something has to be finished.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Deadline(SystemTime);
+
+impl Deadline {
+    /// A deadline `budget` from now.
+    pub(crate) fn after(budget: Duration) -> Self { Self::starting_at(now(), budget) }
+
+    fn starting_at(start: SystemTime, budget: Duration) -> Self { Self(start + budget) }
+
+    /// How long is left, or zero once the deadline has passed.
+    pub(crate) fn remaining(self) -> Duration { self.remaining_at(now()) }
+
+    fn remaining_at(self, now: SystemTime) -> Duration { self.0.duration_since(now).unwrap_or(Duration::ZERO) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_deadline_remaining_counts_down_and_stops_at_zero() {
+        let start = UNIX_EPOCH + Duration::from_secs(100);
+        let deadline = Deadline::starting_at(start, Duration::from_secs(5));
+        assert_eq!(deadline.remaining_at(start), Duration::from_secs(5));
+        assert_eq!(deadline.remaining_at(start + Duration::from_secs(2)), Duration::from_secs(3));
+        assert_eq!(deadline.remaining_at(start + Duration::from_secs(5)), Duration::ZERO);
+        assert_eq!(deadline.remaining_at(start + Duration::from_secs(9)), Duration::ZERO);
+    }
 
     const MAX_AGE: Duration = Duration::from_secs(10);
 
