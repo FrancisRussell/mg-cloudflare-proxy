@@ -172,6 +172,10 @@ Known residual gaps, accepted rather than fixed:
   Telegram-IP check passes — an external attacker can't reach it at all, so
   this is cost scaling with genuine usage (more real push server targets in
   use), not an attacker-controlled cost multiplier.
+- **Arbitrary forwarding targets**: anyone who can register a Telegram device
+  token can point it at any public host, using this Worker to send it a
+  handful of opaque POSTs. There's no allowlist of permitted targets, because
+  one would mean pre-registering a notifier before it works.
 
 ## Logging and privacy
 
