@@ -7,10 +7,11 @@ compatibility_date = "2026-09-01"
 # matching the `worker` crate in Cargo.toml so builds don't drift with releases.
 command = "cargo install -q --locked worker-build@0.8.6 && worker-build --release"
 
+# `npm run deploy` (scripts/deploy.sh) finds or creates the namespace and adds
+# its `id` to a generated copy of this file. Deploy that way: a plain
+# `wrangler deploy` of this file would provision a new namespace.
 [[kv_namespaces]]
 binding = "CIDR_CACHE"
-id = "YOUR_KV_NAMESPACE_ID_HERE"
-preview_id = "YOUR_PREVIEW_KV_NAMESPACE_ID_HERE"
 
 [vars]
 # Overridden in the integration test (--var) to point at a local mock server

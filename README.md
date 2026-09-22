@@ -54,59 +54,31 @@ per-URL place to keep state that Cloudflare guarantees both requests reach.
 You'll need a Cloudflare account, Node.js/npm and a Rust toolchain, and a
 UnifiedPush app installed on your phone.
 
-### 1. Create a KV namespace
-
-The gateway keeps a small cache in Cloudflare KV (its simple key-value
-store). Log in to your Cloudflare dashboard and create a new KV namespace
-(Workers & AI → KV → Create namespace). Choose a name like `mercurygram-proxy`
-and note the namespace ID and preview ID. The `CIDR_CACHE` binding name is
-what the code actually keys off, so the namespace's own name is free to stay
-generic even though it's currently only used for the CIDR cache.
-
-### 2. Configure wrangler and deploy
-
-Update `wrangler.toml` with your KV namespace IDs:
-
-```toml
-[[kv_namespaces]]
-binding = "CIDR_CACHE"
-id = "your-namespace-id-here"
-preview_id = "your-preview-namespace-id-here"
-```
-
-Then install dependencies and log in:
+### 1. Install dependencies
 
 ```sh
 npm install
-npx wrangler login
 ```
 
-### 3. Seed the Telegram CIDR cache
-
-The proxy only accepts requests from Telegram's published IP ranges, cached
-in the `CIDR_CACHE` namespace. Fill it before the first deploy so the Worker
-starts with a warm cache rather than every early request fetching the list
-at once:
+### 2. Deploy
 
 ```sh
-npm run seed-cidr
+npm run deploy
 ```
 
-This fetches the list from Telegram (needs network access) into
-`~/.cache/mg-cloudflare-proxy/` (`$XDG_CACHE_HOME` if set) and uploads it,
-with its fetch time, to the namespace. Repeated runs reuse the local copy for
-a day rather than hitting Telegram again, and skip the upload if the namespace already holds a list at least as new. Delete
-that directory to force a fresh fetch. The namespace outlives redeploys, so the
-seed is a one-off; the Worker keeps the cache current itself from then on
-(see Security notes).
+This logs in if needed, then finds the `CIDR_CACHE` KV namespace by name
+(creating it if the account has none) and deploys against it, so re-running
+this from a fresh clone reuses the same namespace instead of creating another
+one. It also seeds the namespace with Telegram's published IP ranges before
+deploying, so the Worker starts with a warm cache rather than every early
+request fetching the list at once; the seed fetches into
+`~/.cache/mg-cloudflare-proxy/` (`$XDG_CACHE_HOME` if set) and reuses that
+local copy for a day rather than hitting Telegram again on every deploy
+(delete that directory to force a fresh fetch). A failed seed doesn't stop
+the deploy -- the Worker fills the cache itself from the first request (see
+Security notes).
 
-### 4. Deploy
-
-```sh
-npx wrangler deploy
-```
-
-### 5. Configure Mercurygram
+### 3. Configure Mercurygram
 
 Point Mercurygram (Settings → Mercurygram → Notifications → UnifiedPush) at
 your UnifiedPush app, then set the gateway URL to your deployed Worker's
@@ -145,13 +117,14 @@ a plain `cargo test` doesn't build or run it at all.
 Unix-only (process groups aren't portable); compiles to an empty, harmless
 test binary on other platforms.
 
-Start the dev server for manual testing, seeding its local cache first
-(`--preview` is the namespace `wrangler dev` reads):
+Start the dev server for manual testing:
 
 ```sh
-npm run seed-cidr -- --local --preview
 npx wrangler dev
 ```
+
+Its local KV starts empty, so the first unrecognized IP fetches the CIDR
+list itself, same as an unseeded deploy.
 
 ## Security notes
 

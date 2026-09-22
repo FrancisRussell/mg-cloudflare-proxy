@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "seed-cidr": "bash scripts/seed-cidr-cache.sh",
-    "deploy": "wrangler deploy"
+    "deploy": "bash scripts/deploy.sh"
   },
   "devDependencies": {
     "wrangler": "^4.133.0"

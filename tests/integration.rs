@@ -175,10 +175,17 @@ fn spawn_output_reader(mut pipe: impl Read + Send + 'static, output: Arc<Mutex<V
     });
 }
 
+/// The `[[kv_namespaces]]` binding in wrangler.toml, which has no namespace ID
+/// of its own because deploying supplies one.
+const KV_BINDING_LINE: &str = "binding = \"CIDR_CACHE\"";
+/// Stands in for the namespace IDs a deploy would supply. `wrangler kv` refuses
+/// to target a local `--preview` namespace without one.
+const TEST_KV_NAMESPACE_ID: &str = "test-cidr-cache";
+
 /// Writes a copy of wrangler.toml for `wrangler dev` to run from, without its
 /// `[build]` section, which would rebuild the Worker on every (re)start when
 /// this test has already built it. `main` is made absolute, since the copy
-/// lives elsewhere.
+/// lives elsewhere, and the KV binding gets namespace IDs.
 fn write_test_wrangler_config(dir: &std::path::Path) -> std::path::PathBuf {
     let original = std::fs::read_to_string(std::path::Path::new(PROJECT_DIR).join("wrangler.toml"))
         .expect("failed to read wrangler.toml");
@@ -196,6 +203,10 @@ fn write_test_wrangler_config(dir: &std::path::Path) -> std::path::PathBuf {
         } else {
             copy.push_str(line);
             copy.push('\n');
+        }
+        if line == KV_BINDING_LINE {
+            writeln!(copy, "id = \"{TEST_KV_NAMESPACE_ID}\"\npreview_id = \"{TEST_KV_NAMESPACE_ID}\"")
+                .expect("writing to a String can't fail");
         }
     }
     let path = dir.join("wrangler.test.toml");
@@ -413,11 +424,13 @@ impl WranglerDev {
     }
 
     /// Runs the seed script's `cmd` with the flags that point wrangler's KV
-    /// commands at the namespace this `wrangler dev` reads (`--local
-    /// --preview`, under this run's `--persist-to` directory), returning its
-    /// stdout and panicking with its output if it fails.
+    /// commands at the namespace this `wrangler dev` reads (this run's config
+    /// and `--local --preview`, under its `--persist-to` directory), returning
+    /// its stdout and panicking with its output if it fails.
     fn run_against_local_kv(&self, mut cmd: Command, what: &str) -> String {
         let output = cmd
+            .arg("--config")
+            .arg(&self.config_path)
             .args(["--local", "--preview", "--persist-to"])
             .arg(&self.persist_dir)
             .current_dir(PROJECT_DIR)
