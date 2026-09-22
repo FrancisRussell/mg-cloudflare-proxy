@@ -220,6 +220,14 @@ fn spawn_wrangler_dev(
     port: u16, cidr_list_url: &str, persist_dir: &std::path::Path, config_path: &std::path::Path,
     output: &Arc<Mutex<Vec<u8>>>,
 ) -> Child {
+    // Node, esbuild and workerd all fall back to the OS temp directory for
+    // their own scratch files (sockets, an esbuild metafile, and the like)
+    // that --persist-to doesn't cover. Pointing TMPDIR at a subdirectory of
+    // persist_dir keeps those out of the shared system temp directory and
+    // lets Drop sweep them up along with everything else there.
+    let node_tmp_dir = persist_dir.join("node-tmp");
+    std::fs::create_dir_all(&node_tmp_dir).expect("failed to create the wrangler dev TMPDIR");
+
     let mut child = Command::new("npx")
         .args([
             "wrangler",
@@ -236,6 +244,7 @@ fn spawn_wrangler_dev(
             persist_dir.to_str().expect("temp dir path must be valid UTF-8"),
         ])
         .current_dir(PROJECT_DIR)
+        .env("TMPDIR", &node_tmp_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Its own process group, so the whole tree (node, workerd, esbuild --
