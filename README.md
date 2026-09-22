@@ -39,7 +39,7 @@ then forwards the notification to the UnifiedPush service you configured
 Mercurygram to use.
 
 According to `aesgcm-proxy`, Mercurygram registers a Simple Push token with
-Telegram alongside its WebPush one. Due to this, Mercurygram's notifications
+Telegram alongside its Web Push one. Due to this, Mercurygram's notifications
 arrive as two kinds of request: a `POST` carrying the encrypted content (only
 non-secret chats), and a `PUT` carrying a bare ping with no content.
 `aesgcm-proxy` heuristically detects when these requests refer to the same
@@ -158,7 +158,7 @@ Mitigations in place against a few specific threats:
   leg's path rejects sequences that decode to invalid UTF-8 rather than
   panicking on attacker-controlled input.
 - **Oversized payloads**: request bodies over `MAX_BODY_BYTES` (16KB, well
-  above real Telegram `WebPush` ciphertext sizes) are rejected outright.
+  above real Telegram Web Push ciphertext sizes) are rejected outright.
 
 Known residual gaps, accepted rather than fixed:
 
@@ -184,6 +184,30 @@ CIDR-list fetch attempts log their outcome (success and entry count, a 304,
 or the specific failure reason) but nothing about the request that triggered
 them. Nothing here is stored beyond Cloudflare's normal `wrangler tail`/log
 retention — the proxy itself keeps no logs of its own.
+
+## Alternatives
+
+Mercurygram's own repo also ships a Cloudflare Worker gateway, in JavaScript,
+at
+[`Gateways/CloudflareWorker`](https://github.com/Mercurygram/Mercurygram/tree/Mercurygram/Gateways/CloudflareWorker),
+deployed by pasting `worker.mjs` into the Cloudflare dashboard and does not
+require a KV namespace or Durable Object. It also optionally supports delivery
+straight through Google's Firebase Cloud Messaging (FCM), which this project
+deliberately doesn't.
+
+Notable differences:
+
+- **Telegram CIDR list caching.** This project uses a KV namespace to cache the
+  list of Telegram CIDRs. This significantly reduces the number of pulls it does
+  of that list from the Telegram servers.
+- **PUT/POST correlation.** This implementation uses a Durable Object to
+  correlate Simple Push and Web Push notifications. This means that correlation
+  can occur correctly even if the notifications are routed to different
+  isolates, which is untrue for `worker.mjs`. As mentioned above, it's not
+  entirely clear why this is done, but a correlation failure possibly leads to
+  duplicate notifications.
+- **Logging.** A UnifiedPush endpoint URL is a bearer capability, and its
+  logs include it in full; this project logs only the push server's host.
 
 ## License
 
