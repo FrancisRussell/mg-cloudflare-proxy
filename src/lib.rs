@@ -173,10 +173,26 @@ fn parse_request_budget(value: Option<&str>) -> Option<Duration> {
 /// verified.
 const UNVERIFIABLE_RETRY_AFTER_SECONDS: &str = "60";
 
+/// Which of the two routes a request came in on, for log lines only.
+#[derive(Debug, Clone, Copy)]
+enum Leg {
+    Aesgcm,
+    Put,
+}
+
+impl std::fmt::Display for Leg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Aesgcm => "aesgcm",
+            Self::Put => "put",
+        })
+    }
+}
+
 /// `None` if `client_ip` is a Telegram IP, otherwise the response to send
 /// instead of forwarding.
 async fn reject_unless_telegram_ip(
-    leg: &str, client_ip: std::net::IpAddr, deadline: Deadline, ctx: &RouteContext<Context>,
+    leg: Leg, client_ip: std::net::IpAddr, deadline: Deadline, ctx: &RouteContext<Context>,
 ) -> Result<Option<Response>> {
     match CidrAllowlist::new(&ctx.env)?.is_telegram_ip(client_ip, &ctx.data, deadline).await {
         TelegramIpCheck::Telegram => Ok(None),
@@ -372,7 +388,7 @@ async fn handle_aesgcm(mut req: Request, ctx: RouteContext<Context>) -> Result<R
 
     // Keep this last: an unrecognized IP can trigger a CIDR fetch, so only
     // otherwise-valid requests may reach it.
-    if let Some(rejection) = reject_unless_telegram_ip("aesgcm", client_ip, deadline, &ctx).await? {
+    if let Some(rejection) = reject_unless_telegram_ip(Leg::Aesgcm, client_ip, deadline, &ctx).await? {
         return Ok(rejection);
     }
 
@@ -421,7 +437,7 @@ async fn handle_put(mut req: Request, ctx: RouteContext<Context>) -> Result<Resp
 
     // Keep this last: an unrecognized IP can trigger a CIDR fetch, so only
     // otherwise-valid requests may reach it.
-    if let Some(rejection) = reject_unless_telegram_ip("put", client_ip, deadline, &ctx).await? {
+    if let Some(rejection) = reject_unless_telegram_ip(Leg::Put, client_ip, deadline, &ctx).await? {
         return Ok(rejection);
     }
 
