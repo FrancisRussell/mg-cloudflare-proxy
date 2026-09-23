@@ -10,12 +10,28 @@ set -euo pipefail
 # wrangler.toml (git-ignored), which is what gets deployed. The cache is then
 # seeded (see seed-cidr-cache.sh), and a failure there only costs the Worker a
 # fetch of its own.
+#
+# CIDR_CACHE_NAMESPACE_TITLE and MERCURYGRAM_PROXY_WORKER_NAME (see below)
+# let a second deployment from this same checkout avoid colliding with a
+# first, without editing wrangler.toml.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-# The binding must match the `[[kv_namespaces]]` binding in wrangler.toml.
+# Must match the `[[kv_namespaces]]` binding in wrangler.toml, which in turn
+# must match the CIDR_CACHE_KV_BINDING constant in src/telegram_cidrs.rs --
+# not something to override at deploy time without changing those too.
 KV_BINDING="CIDR_CACHE"
-NAMESPACE_TITLE="mercurygram-proxy-cidr-cache"
+# Override to give a second deployment (e.g. from another checkout) its own
+# CIDR cache namespace instead of sharing this one -- harmless either way,
+# since the namespace holds nothing but Telegram's public IP list.
+NAMESPACE_TITLE="${CIDR_CACHE_NAMESPACE_TITLE:-mercurygram-proxy-cidr-cache}"
+# Override to deploy a second, independent copy from this checkout without
+# editing wrangler.toml: a separate Worker means a separate *.workers.dev URL
+# and, since a Durable Object's instances are scoped to the Worker that
+# declares the class, separate Correlator instances too -- unlike the CIDR
+# cache, not something to share between deployments that shouldn't affect
+# each other. Empty means keep wrangler.toml's own name.
+WORKER_NAME="${MERCURYGRAM_PROXY_WORKER_NAME:-}"
 # Relative to the repository root, so that wrangler resolves the config's
 # relative paths (the built Worker) the same way as for wrangler.toml itself.
 DEPLOY_CONFIG="wrangler.deploy.toml"
@@ -47,8 +63,10 @@ if [[ -z "$namespace_id" ]]; then
   exit 1
 fi
 
-# Adds the namespace ID to the binding's table.
-awk -v binding="binding = \"$KV_BINDING\"" -v id="$namespace_id" '
+# Adds the namespace ID to the binding's table, and substitutes WORKER_NAME
+# for the top-level `name` if set.
+awk -v binding="binding = \"$KV_BINDING\"" -v id="$namespace_id" -v worker_name="$WORKER_NAME" '
+  worker_name != "" && /^name = / { print "name = \"" worker_name "\""; next }
   { print }
   $0 == binding { print "id = \"" id "\"" }
 ' "$REPO_ROOT/wrangler.toml" >"$REPO_ROOT/$DEPLOY_CONFIG"
