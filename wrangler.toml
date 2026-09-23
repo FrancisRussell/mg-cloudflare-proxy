@@ -1,6 +1,13 @@
-name = "mercurygram-proxy"
+name = "mg-proxy"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-09-01"
+
+# Logs viewable in the dashboard after the fact, not just while `wrangler
+# tail` is actively running. Traffic here is small enough that sampling
+# everything costs nothing.
+[observability]
+enabled = true
+head_sampling_rate = 1
 
 [build]
 # worker-build is a Rust tool (not an npm package), pinned to the version

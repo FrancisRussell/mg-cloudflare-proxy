@@ -11,7 +11,7 @@ set -euo pipefail
 # seeded (see seed-cidr-cache.sh), and a failure there only costs the Worker a
 # fetch of its own.
 #
-# CIDR_CACHE_NAMESPACE_TITLE and MERCURYGRAM_PROXY_WORKER_NAME (see below)
+# CIDR_CACHE_NAMESPACE_TITLE and MG_PROXY_WORKER_NAME (see below)
 # let a second deployment from this same checkout avoid colliding with a
 # first, without editing wrangler.toml.
 
@@ -24,14 +24,14 @@ KV_BINDING="CIDR_CACHE"
 # Override to give a second deployment (e.g. from another checkout) its own
 # CIDR cache namespace instead of sharing this one -- harmless either way,
 # since the namespace holds nothing but Telegram's public IP list.
-NAMESPACE_TITLE="${CIDR_CACHE_NAMESPACE_TITLE:-mercurygram-proxy-cidr-cache}"
+NAMESPACE_TITLE="${CIDR_CACHE_NAMESPACE_TITLE:-mg-proxy-cidr-cache}"
 # Override to deploy a second, independent copy from this checkout without
 # editing wrangler.toml: a separate Worker means a separate *.workers.dev URL
 # and, since a Durable Object's instances are scoped to the Worker that
 # declares the class, separate Correlator instances too -- unlike the CIDR
 # cache, not something to share between deployments that shouldn't affect
 # each other. Empty means keep wrangler.toml's own name.
-WORKER_NAME="${MERCURYGRAM_PROXY_WORKER_NAME:-}"
+WORKER_NAME="${MG_PROXY_WORKER_NAME:-}"
 # Relative to the repository root, so that wrangler resolves the config's
 # relative paths (the built Worker) the same way as for wrangler.toml itself.
 DEPLOY_CONFIG="wrangler.deploy.toml"
