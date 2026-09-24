@@ -20,7 +20,7 @@ use http::StatusCode;
 use worker::*;
 
 use crate::clock::{self, Deadline};
-use crate::outbound::send_with_timeout;
+use crate::outbound::{send_with_timeout, FetchFailure};
 
 /// Push headers from RFC 8030 that the `http` crate has no constant for.
 /// `HeaderName::from_static` is `const fn`, so these are checked and built at
@@ -63,6 +63,14 @@ const CORRELATION_WAIT: Duration = Duration::from_millis(200);
 const FORWARD_RESERVE: Duration = Duration::from_secs(1);
 /// How often that wait checks whether the POSTs have finished.
 const POST_IN_FLIGHT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How much of `deadline` a retried attempt needs left (on top of any wait
+/// before it, e.g. a 429's `Retry-After`) to be worth making at all, rather
+/// than answering with the first attempt's failure.
+const MIN_RETRY_BUDGET: Duration = Duration::from_secs(1);
+/// The longest a 429's `Retry-After` is honoured before retrying; past this,
+/// waiting it out would likely cost more of the budget than it's worth.
+const MAX_HONOURED_RETRY_AFTER: Duration = Duration::from_secs(3);
 
 /// One endpoint's record of recent POSTs, used to decide whether its PUTs are
 /// redundant wake-ups.
@@ -208,31 +216,37 @@ fn is_post_recent(now: SystemTime, last_post: Option<SystemTime>, window: Durati
     last_post.is_some_and(|t| clock::is_within(now, t, window))
 }
 
-/// Forwards `body` to `target` as a WebPush-shaped POST. RFC 8030 §5 expects
-/// a `201 Created` with a `Location` header on success, and some senders
-/// back off on other 2xx codes, so any 2xx is normalized to that shape.
+/// Forwards `body` to `target` as a WebPush-shaped POST, retrying once for a
+/// failure that looks transient (see `retry_delay`). RFC 8030 §5 expects a
+/// `201 Created` with a `Location` header on success, and some senders back
+/// off on other 2xx codes, so any 2xx is normalized to that shape.
 ///
 /// Uses `redirect: manual`, which stops a redirect being followed and
 /// surfaces its real status and `Location` rather than an opaque response. A
 /// push server that hasn't answered when `deadline` passes is given up on.
 async fn forward(target: &url::Url, body: Vec<u8>, deadline: Deadline) -> Result<Response> {
-    let headers = Headers::new();
-    headers.set(header_names::TTL.as_str(), &TTL_SECONDS.to_string())?;
-    headers.set(header_names::URGENCY.as_str(), URGENCY_HIGH)?;
-    headers.set(http::header::CONTENT_ENCODING.as_str(), CONTENT_ENCODING_AES128GCM)?;
-
-    let mut init = RequestInit::new();
-    init.with_method(Method::Post)
-        .with_headers(headers)
-        .with_redirect(RequestRedirect::Manual)
-        .with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into()));
-
     let body_size = body.len();
     let host = target.host_str().unwrap_or("?");
 
-    let req = Request::new_with_init(target.as_str(), &init)?;
-    // The push server gets whatever is left of the request's time.
-    let resp = match send_with_timeout(req, deadline.remaining()).await {
+    let mut outcome = send_once(target, &body, deadline).await?;
+    let delay = match &outcome {
+        Err(failure) => retry_delay(Err(*failure)),
+        Ok(resp) => {
+            let retry_after = resp.headers().get(http::header::RETRY_AFTER.as_str())?;
+            retry_delay(Ok((resp.status_code(), retry_after.as_deref())))
+        }
+    };
+    if let Some(delay) = delay {
+        if deadline.remaining() > delay + MIN_RETRY_BUDGET {
+            console_log!("forward: retrying host={host}");
+            if !delay.is_zero() {
+                Delay::from(delay).await;
+            }
+            outcome = send_once(target, &body, deadline).await?;
+        }
+    }
+
+    let resp = match outcome {
         Ok(resp) => resp,
         Err(failure) => {
             console_error!("forward failed: host={host} reason={failure}");
@@ -273,6 +287,48 @@ async fn forward(target: &url::Url, body: Vec<u8>, deadline: Deadline) -> Result
         response.status_code()
     );
     Ok(response)
+}
+
+/// Builds and sends one push attempt.
+async fn send_once(
+    target: &url::Url, body: &[u8], deadline: Deadline,
+) -> Result<std::result::Result<Response, FetchFailure>> {
+    let headers = Headers::new();
+    headers.set(header_names::TTL.as_str(), &TTL_SECONDS.to_string())?;
+    headers.set(header_names::URGENCY.as_str(), URGENCY_HIGH)?;
+    headers.set(http::header::CONTENT_ENCODING.as_str(), CONTENT_ENCODING_AES128GCM)?;
+
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post)
+        .with_headers(headers)
+        .with_redirect(RequestRedirect::Manual)
+        .with_body(Some(js_sys::Uint8Array::from(body).into()));
+
+    let req = Request::new_with_init(target.as_str(), &init)?;
+    // The push server gets whatever is left of the request's time.
+    Ok(send_with_timeout(req, deadline.remaining()).await)
+}
+
+/// How long to wait before retrying `outcome`, or `None` if it isn't worth
+/// retrying at all: a timeout or DNS failure is unlikely to resolve within
+/// the same request, and a push server status is only retried if it looks
+/// transient -- 502, 503, 504, or a 429 whose `Retry-After` is short enough
+/// to be worth honouring (RFC 8030 section 8.4).
+fn retry_delay(outcome: std::result::Result<(u16, Option<&str>), FetchFailure>) -> Option<Duration> {
+    match outcome {
+        Err(FetchFailure::Connection) => Some(Duration::ZERO),
+        Err(FetchFailure::TimedOut | FetchFailure::Dns) => None,
+        Ok((status, retry_after)) => match StatusCode::from_u16(status).ok() {
+            Some(StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT) => {
+                Some(Duration::ZERO)
+            }
+            Some(StatusCode::TOO_MANY_REQUESTS) => {
+                let wait = Duration::from_secs(retry_after?.parse().ok()?);
+                (wait <= MAX_HONOURED_RETRY_AFTER).then_some(wait)
+            }
+            _ => None,
+        },
+    }
 }
 
 /// How `forward` answers the caller once the push server has answered.
@@ -338,6 +394,53 @@ mod tests {
         assert!(is_post_recent(just_inside, Some(last_post), RECENT_POST_WINDOW));
         assert!(!is_post_recent(just_outside, Some(last_post), RECENT_POST_WINDOW));
         assert!(!is_post_recent(just_inside, None, RECENT_POST_WINDOW), "no POST has been seen");
+    }
+
+    #[test]
+    fn test_retry_delay_retries_connection_failures_immediately() {
+        assert_eq!(retry_delay(Err(FetchFailure::Connection)), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn test_retry_delay_does_not_retry_timeouts_or_dns_failures() {
+        assert_eq!(retry_delay(Err(FetchFailure::TimedOut)), None);
+        assert_eq!(retry_delay(Err(FetchFailure::Dns)), None);
+    }
+
+    #[test]
+    fn test_retry_delay_retries_transient_push_server_statuses_immediately() {
+        for status in [StatusCode::BAD_GATEWAY, StatusCode::SERVICE_UNAVAILABLE, StatusCode::GATEWAY_TIMEOUT] {
+            assert_eq!(retry_delay(Ok((status.as_u16(), None))), Some(Duration::ZERO), "status: {status}");
+        }
+    }
+
+    #[test]
+    fn test_retry_delay_does_not_retry_other_push_server_statuses() {
+        for status in [StatusCode::OK, StatusCode::BAD_REQUEST, StatusCode::NOT_FOUND, StatusCode::GONE] {
+            assert_eq!(retry_delay(Ok((status.as_u16(), None))), None, "status: {status}");
+        }
+    }
+
+    #[test]
+    fn test_retry_delay_honours_a_short_429_retry_after() {
+        assert_eq!(retry_delay(Ok((StatusCode::TOO_MANY_REQUESTS.as_u16(), Some("2")))), Some(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn test_retry_delay_does_not_retry_a_long_429_retry_after() {
+        let too_long = (MAX_HONOURED_RETRY_AFTER + Duration::from_secs(1)).as_secs().to_string();
+        assert_eq!(retry_delay(Ok((StatusCode::TOO_MANY_REQUESTS.as_u16(), Some(&too_long)))), None);
+    }
+
+    #[test]
+    fn test_retry_delay_does_not_retry_429_with_no_usable_retry_after() {
+        for retry_after in [None, Some("soon"), Some("")] {
+            assert_eq!(
+                retry_delay(Ok((StatusCode::TOO_MANY_REQUESTS.as_u16(), retry_after))),
+                None,
+                "retry_after: {retry_after:?}"
+            );
+        }
     }
 
     #[test]
