@@ -521,31 +521,40 @@ impl MockDistributor {
     /// `MockDistributor` from every test would then leak for the remainder
     /// of the whole `cargo test` run rather than being scoped to just one.
     fn start(redirect_to: Option<&'static str>) -> Self {
-        Self::start_with(redirect_to, Duration::ZERO, StatusCode::OK, Reply::default())
+        Self::start_with(redirect_to, Duration::ZERO, StatusCode::OK, Reply::default(), None)
     }
 
     /// A distributor that waits `response_delay` before answering every
     /// request with `status`, for exercising requests that are still being
     /// forwarded when another arrives.
     fn start_slow(response_delay: Duration, status: StatusCode) -> Self {
-        Self::start_with(None, response_delay, status, Reply::default())
+        Self::start_with(None, response_delay, status, Reply::default(), None)
     }
 
     /// A distributor that refuses every push with `status` and `reply`, as a
     /// rate-limiting push server would.
     fn start_refusing(status: StatusCode, reply: Reply) -> Self {
-        Self::start_with(None, Duration::ZERO, status, reply)
+        Self::start_with(None, Duration::ZERO, status, reply, None)
+    }
+
+    /// A distributor that answers its first request with `first_status` (no
+    /// body, no `Retry-After`) and every request after that with a plain 200
+    /// -- for exercising the proxy's own retry of a transient failure.
+    fn start_failing_once(first_status: StatusCode) -> Self {
+        Self::start_with(None, Duration::ZERO, StatusCode::OK, Reply::default(), Some(first_status))
     }
 
     /// Starts a distributor with the given behaviour; the other constructors
     /// are shorthands for common combinations.
     fn start_with(
         redirect_to: Option<&'static str>, response_delay: Duration, status: StatusCode, reply: Reply,
+        first_status: Option<StatusCode>,
     ) -> Self {
         let port = pick_free_port();
         let server = tiny_http::Server::http(("127.0.0.1", port)).expect("failed to start mock distributor");
         let request_count = Arc::new(AtomicUsize::new(0));
         let last_body = Arc::new(Mutex::new(None));
+        let fail_next = Arc::new(AtomicBool::new(first_status.is_some()));
 
         let count = Arc::clone(&request_count);
         let body_store = Arc::clone(&last_body);
@@ -557,6 +566,10 @@ impl MockDistributor {
                 *body_store.lock().expect("a thread panicked while holding the lock") = Some(body);
 
                 std::thread::sleep(response_delay);
+                if let Some(first_status) = first_status.filter(|_| fail_next.swap(false, Ordering::SeqCst)) {
+                    let _ = request.respond(Response::from_string("").with_status_code(first_status.as_u16()));
+                    continue;
+                }
                 let status = if redirect_to.is_some() { StatusCode::FOUND } else { status };
                 let response = Response::from_string(reply.body).with_status_code(status.as_u16());
                 let response = match reply.retry_after {
@@ -800,6 +813,7 @@ fn integration_test() {
     put_waits_for_a_slow_post_and_is_suppressed_when_it_succeeds(port);
     put_forwards_after_a_slow_post_that_fails(port);
     refusal_passes_on_only_status_and_retry_after(port);
+    retries_a_transient_failure_and_succeeds(port);
     unreachable_push_server_answers_bad_gateway(port);
     unanswering_push_server_answers_gateway_timeout(port);
 }
@@ -1317,6 +1331,20 @@ fn refusal_passes_on_only_status_and_retry_after(port: u16) {
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS.as_u16());
     assert_eq!(resp.header("Retry-After"), Some(RETRY_AFTER_SECONDS));
     assert_eq!(resp.into_string().expect("the response body is readable"), "", "the push server's body isn't relayed");
+}
+
+/// A distributor that fails once with a transient-looking status is retried
+/// once, and the retry's success is what the caller sees.
+fn retries_a_transient_failure_and_succeeds(port: u16) {
+    let distributor = MockDistributor::start_failing_once(StatusCode::SERVICE_UNAVAILABLE);
+
+    let resp = ureq::put(&worker_url(port, &format!("/{}", encode(&distributor.url()))))
+        .set("CF-Connecting-IP", TELEGRAM_IP)
+        .timeout(REQUEST_TIMEOUT)
+        .send_string("wake-up-body");
+
+    assert_eq!(status_of(resp), StatusCode::CREATED, "the retried attempt should have succeeded");
+    assert_eq!(distributor.request_count(), 2, "the first, failing attempt and the retry should both have landed");
 }
 
 /// PUTs to `endpoint` from a Telegram IP, returning the proxy's status.
