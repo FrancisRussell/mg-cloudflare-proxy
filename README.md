@@ -81,9 +81,34 @@ Security notes).
 ### 3. Configure Mercurygram
 
 Point Mercurygram (Settings → Mercurygram → Notifications → UnifiedPush) at
-your UnifiedPush app, then set the gateway URL to your deployed Worker's
+your UnifiedPush app (e.g. Sunup), then set the gateway URL to your deployed Worker's
 `*.workers.dev` URL, or a custom domain. Either way Telegram sees this URL,
-since it's where Telegram sends the pushes.
+since it's where Telegram sends the pushes. Check in your UnifiedPush
+app that Mercurygram has successfully registered.
+
+### 4. Test notifications
+
+If you have multiple Telegram accounts, simply message one from the other to
+create a test notification. If you do not have multiple accounts it's also
+possible to create a bot account:
+
+Message `@BotFather` and run `/newbot` to create a bot and API key. Send a
+message to the bot from your Telegram account (bots cannot send to users that
+have never messaged them). Then send yourself a test message through it:
+
+```sh
+export TELEGRAM_BOT_TOKEN=<token from BotFather>
+scripts/send-test-push.py <your_telegram_username>
+```
+
+For this test you should ensure that Mercurygram is not running (not simply
+backgrounded) otherwise it may receive the notification via a direct connection.
+Note that for a cold notification, it may in fact take several seconds for this
+to propagate to the phone. There may also be some Cloudflare latency when a worker
+is used for the first time. Subsequent notifications are typically faster.
+
+While doing this, it's also possible to see the logs from the worker by
+running `npx wrangler tail` inside the repo.
 
 ## Local development
 
