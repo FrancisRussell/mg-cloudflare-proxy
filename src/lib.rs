@@ -148,7 +148,7 @@ pub(crate) fn error_response(status: StatusCode) -> Result<Response> {
 /// or CIDR refresh.
 const REQUEST_BUDGET_MS_VAR: &str = "MAX_RESPONSE_MS";
 /// The request budget when `REQUEST_BUDGET_MS_VAR` is unset or unusable.
-pub(crate) const DEFAULT_REQUEST_BUDGET: Duration = Duration::from_secs(5);
+pub(crate) const DEFAULT_REQUEST_BUDGET: Duration = Duration::from_secs(15);
 
 /// How long a request may take: the `REQUEST_BUDGET_MS_VAR` var if it holds a
 /// positive number of milliseconds, otherwise `DEFAULT_REQUEST_BUDGET`.
