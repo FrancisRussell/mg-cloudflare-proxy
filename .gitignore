@@ -6,3 +6,4 @@ tags
 tags.lock
 tags.temp
 /wrangler.deploy.toml
+__pycache__
