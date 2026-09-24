@@ -59,7 +59,9 @@ const CORRELATION_WAIT: Duration = Duration::from_millis(200);
 /// How much of the request's time a PUT keeps back for forwarding its wake-up
 /// while it waits for POSTs still being forwarded. Once only this much is left
 /// it stops waiting and forwards, accepting a possible duplicate over holding
-/// the wake-up up behind a slow push server.
+/// the wake-up up behind a slow push server. A POST's own retry can extend
+/// how long it holds `posts_in_flight`, making that duplicate somewhat more
+/// likely than before -- the same trade-off, just reached a little more often.
 const FORWARD_RESERVE: Duration = Duration::from_secs(1);
 /// How often that wait checks whether the POSTs have finished.
 const POST_IN_FLIGHT_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -327,6 +329,10 @@ async fn send_once(
 /// a duration; a delay-seconds one doesn't need it.
 fn retry_delay(outcome: std::result::Result<(u16, Option<&str>), FetchFailure>, now: SystemTime) -> Option<Duration> {
     match outcome {
+        // A connection failure can't be told apart from one where the push
+        // server already processed the request before the connection dropped
+        // -- retrying it risks delivering the same push twice, accepted like
+        // every other duplicate-over-missed trade-off here.
         Err(FetchFailure::Connection) => Some(Duration::ZERO),
         Err(FetchFailure::TimedOut | FetchFailure::Dns) => None,
         Ok((status, retry_after)) => match StatusCode::from_u16(status).ok() {
