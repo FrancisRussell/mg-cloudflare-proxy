@@ -171,9 +171,10 @@ is kept current on demand:
 Mitigations in place against a few specific threats:
 
 - **SSRF via the forwarding target**: `validate_endpoint`/`is_ip_safe`
-  reject literal private, loopback, link-local, and other non-public IP
-  ranges for both IPv4 and IPv6 equally, so a target URL can't point the
-  proxy's outbound `fetch()` at internal infrastructure.
+  reject literal private, loopback, link-local, and other non-public IPv4
+  and IPv6 ranges. A Worker's `fetch()` can't reach private networks anyway,
+  so this is defense in depth; the CIDR check above is what stops others
+  using the proxy as a relay.
 - **SSRF via a redirecting push server**: forwarding uses `redirect: manual`
   and rejects any 3xx response from the push server outright rather than
   following it — the SSRF check above only validated the *original* target,
@@ -235,8 +236,16 @@ Notable differences:
   isolates, which is untrue for `worker.mjs`. As mentioned above, it's not
   entirely clear why this is done, but a correlation failure possibly leads to
   duplicate notifications.
-- **Logging.** A UnifiedPush endpoint URL is a bearer capability, and its
-  logs include it in full; this project logs only the push server's host.
+- **Logging.** A UnifiedPush endpoint URL is a bearer capability so this project
+  only logs the push server's host and not the whole URL.
+- **Retries.** If a push to a UnifiedPush endpoint fails in a way that
+  suggests a retry might succeed, a single retry is made, provided there is
+  time left within the request's time limit.
+
+In all honesty however, this project would probably not exist if the author
+had realized that
+[`Gateways/CloudflareWorker`](https://github.com/Mercurygram/Mercurygram/tree/Mercurygram/Gateways/CloudflareWorker)
+already existed at the time.
 
 ## License
 
