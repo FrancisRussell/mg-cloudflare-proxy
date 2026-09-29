@@ -28,6 +28,14 @@ def api_call(token: str, method: str, params: dict[str, str]) -> dict[str, Any]:
     return result
 
 
+def bot_username(token: str) -> str:
+    result = api_call(token, "getMe", {})
+    if not result.get("ok"):
+        sys.exit(f"getMe failed: {result}")
+    username: str = result["result"]["username"]
+    return username
+
+
 def find_chat_id(token: str, username: str) -> int | None:
     result = api_call(token, "getUpdates", {})
     if not result.get("ok"):
@@ -54,7 +62,10 @@ def main() -> None:
     username = args.username.removeprefix("@")
     chat_id = find_chat_id(token, username)
     if chat_id is None:
-        sys.exit(f"No chat found for @{username} -- have they messaged the bot yet?")
+        sys.exit(
+            f"No chat found for @{username} -- have they messaged "
+            f"the bot (@{bot_username(token)}) yet?"
+        )
 
     now = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     text = args.text or f"Test message sent at {now}."
