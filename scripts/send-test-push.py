@@ -9,10 +9,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 API_BASE = "https://api.telegram.org"
 REQUEST_TIMEOUT_SECONDS = 10
+CONFIG_SUBDIR = "mg-cloudflare-proxy"
+TOKEN_FILENAME = "test-push-token"
 
 
 def api_call(token: str, method: str, params: dict[str, str]) -> dict[str, Any]:
@@ -47,6 +50,21 @@ def find_chat_id(token: str, username: str) -> int | None:
     return None
 
 
+def token_path() -> Path:
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    config_dir = Path(config_home) if config_home else Path.home() / ".config"
+    return config_dir / CONFIG_SUBDIR / TOKEN_FILENAME
+
+
+def load_token() -> str | None:
+    if token := os.environ.get("TELEGRAM_BOT_TOKEN"):
+        return token
+    try:
+        return token_path().read_text().strip() or None
+    except FileNotFoundError:
+        return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("username", help="Telegram username to send to")
@@ -55,9 +73,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    token = load_token()
     if not token:
-        sys.exit("Set TELEGRAM_BOT_TOKEN in the environment first")
+        sys.exit(
+            f"Set TELEGRAM_BOT_TOKEN in the environment, or put the token in {token_path()}"
+        )
 
     username = args.username.removeprefix("@")
     chat_id = find_chat_id(token, username)

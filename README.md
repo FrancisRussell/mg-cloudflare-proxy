@@ -101,6 +101,9 @@ export TELEGRAM_BOT_TOKEN=<token from BotFather>
 scripts/send-test-push.py <your_telegram_username>
 ```
 
+The token can also be kept in `~/.config/mg-cloudflare-proxy/test-push-token`
+to avoid re-exporting it in every shell.
+
 For this test you should ensure that Mercurygram is not running (not simply
 backgrounded) otherwise it may receive the notification via a direct connection.
 Note that for a cold notification, it may in fact take several seconds for this
