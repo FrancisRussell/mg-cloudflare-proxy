@@ -136,11 +136,20 @@ fn get_client_ip(req: &Request) -> Option<String> {
     req.headers().get(header_names::CF_CONNECTING_IP.as_str()).ok().flatten()
 }
 
-/// `Response::error` using `status`'s own canonical reason phrase (e.g.
-/// "Forbidden" for 403) as the message, for error paths that carry no
-/// extra diagnostic detail beyond the status itself.
+/// `Response::error`, with `Content-Type: text/plain; charset=utf-8` set
+/// explicitly -- unlike `Response::ok`, `Response::error` leaves it unset,
+/// which leaves the error body's type to guesswork.
+pub(crate) fn error_response_with_message(msg: impl Into<String>, status: StatusCode) -> Result<Response> {
+    let mut response = Response::error(msg, status.as_u16())?;
+    response.headers_mut().set(http::header::CONTENT_TYPE.as_str(), "text/plain; charset=utf-8")?;
+    Ok(response)
+}
+
+/// `error_response_with_message` using `status`'s own canonical reason
+/// phrase (e.g. "Forbidden" for 403) as the message, for error paths that
+/// carry no extra diagnostic detail beyond the status itself.
 pub(crate) fn error_response(status: StatusCode) -> Result<Response> {
-    Response::error(status.canonical_reason().expect("standard status code has a canonical reason"), status.as_u16())
+    error_response_with_message(status.canonical_reason().expect("standard status code has a canonical reason"), status)
 }
 
 /// The wrangler var holding the most time, in milliseconds, a request may take
@@ -360,7 +369,7 @@ async fn handle_aesgcm(mut req: Request, ctx: RouteContext<Context>) -> Result<R
     let url = req.url()?;
     let Some((_, endpoint_raw)) = url.query_pairs().find(|(k, _)| k == "e") else {
         console_log!("rejected: leg=aesgcm reason=missing_e_param ip={client_ip}");
-        return Response::error("missing ?e= parameter", StatusCode::BAD_REQUEST.as_u16());
+        return error_response_with_message("missing ?e= parameter", StatusCode::BAD_REQUEST);
     };
     let endpoint_raw = endpoint_raw.into_owned();
     let endpoint = match validate_endpoint(&endpoint_raw) {
@@ -461,6 +470,16 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // `ctx` rides as the router's per-request data (`RouteContext::data`) so
     // handlers can reach `ctx.wait_until` for CIDR list refreshes -- the router
     // itself has no notion of the fetch event's Context otherwise.
+    //
+    // The PUT route's `/*path` wildcard matches every possible path, so the
+    // router's method-mismatch check always finds it and answers any
+    // request that isn't a registered GET/POST/PUT match with its own
+    // built-in "Method Not Allowed" -- there's no path this Worker can
+    // reach a "Not Found" through. That built-in response goes through
+    // `worker::Response::error` and has no Content-Type set, with no hook
+    // to override it: once a response has crossed a `fetch()` boundary (the
+    // Correlator's, which every real POST/PUT crosses), its headers are
+    // immutable, so this can't be patched here either. Accepted as-is.
     Router::with_data(ctx).post_async("/aesgcm", handle_aesgcm).put_async("/*path", handle_put).run(req, env).await
 }
 

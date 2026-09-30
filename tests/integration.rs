@@ -772,6 +772,17 @@ fn status_of(result: Result<ureq::Response, ureq::Error>) -> StatusCode {
     StatusCode::from_u16(code).expect("the proxy answers with a valid status")
 }
 
+/// The proxy's Content-Type header, whether ureq counts the response as a
+/// success or an error status.
+fn content_type_of(result: &Result<ureq::Response, ureq::Error>) -> Option<String> {
+    match result {
+        Ok(resp) => resp.header("Content-Type"),
+        Err(ureq::Error::Status(_, resp)) => resp.header("Content-Type"),
+        Err(e) => panic!("request failed: {e}"),
+    }
+    .map(String::from)
+}
+
 /// IPv4 addresses from the RFC 5737 documentation range -- guaranteed not to
 /// be in any real Telegram range. The mock CIDR server's first list includes
 /// `_A` only, and its second list adds `_B`; `_UNKNOWN` is never listed.
@@ -1188,6 +1199,11 @@ fn rejects_literal_private_ip_target(port: u16) {
         .set("CF-Connecting-IP", TELEGRAM_IP)
         .timeout(REQUEST_TIMEOUT)
         .send_string("body");
+    assert_eq!(
+        content_type_of(&resp).as_deref(),
+        Some("text/plain; charset=utf-8"),
+        "a rejection's body should declare its type"
+    );
     assert_eq!(status_of(resp), StatusCode::FORBIDDEN, "a literal loopback IP as the target should be rejected");
 }
 
@@ -1200,6 +1216,11 @@ fn forwards_put_to_valid_target(port: u16) {
         .timeout(REQUEST_TIMEOUT)
         .send_string("wake-up-body");
 
+    assert_eq!(
+        content_type_of(&resp),
+        None,
+        "a bodyless relay of the push server's status shouldn't declare a body type"
+    );
     assert_eq!(status_of(resp), StatusCode::CREATED, "a valid forward should succeed");
     assert_eq!(distributor.request_count(), 1, "the mock distributor should have received exactly one request");
     assert_eq!(distributor.last_body(), b"wake-up-body");

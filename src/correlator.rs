@@ -103,7 +103,7 @@ impl DurableObject for Correlator {
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
         let Some(target) = req.headers().get(crate::header_names::X_RELAY_TARGET.as_str())? else {
-            return Response::error("missing X-Relay-Target", StatusCode::BAD_REQUEST.as_u16());
+            return crate::error_response_with_message("missing X-Relay-Target", StatusCode::BAD_REQUEST);
         };
         let target_url = url::Url::parse(&target).map_err(|e| Error::RustError(format!("bad target: {e}")))?;
         let budget = req
