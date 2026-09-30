@@ -462,6 +462,12 @@ fn percent_decode(s: &str) -> Option<String> {
     percent_encoding::percent_decode_str(s).decode_utf8().ok().map(std::borrow::Cow::into_owned)
 }
 
+/// GET /health -- liveness check for external uptime monitoring. Not behind
+/// the Telegram-IP check: a monitor's requests don't come from Telegram, so
+/// gating this would make it unmonitorable. Does no KV or Durable Object
+/// work, so it stays cheap regardless of how often it's hit.
+async fn handle_health(_req: Request, _ctx: RouteContext<Context>) -> Result<Response> { Response::ok("OK") }
+
 /// The Worker's fetch entry point: routes Telegram's POST and PUT requests.
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
@@ -480,7 +486,12 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // to override it: once a response has crossed a `fetch()` boundary (the
     // Correlator's, which every real POST/PUT crosses), its headers are
     // immutable, so this can't be patched here either. Accepted as-is.
-    Router::with_data(ctx).post_async("/aesgcm", handle_aesgcm).put_async("/*path", handle_put).run(req, env).await
+    Router::with_data(ctx)
+        .get_async("/health", handle_health)
+        .post_async("/aesgcm", handle_aesgcm)
+        .put_async("/*path", handle_put)
+        .run(req, env)
+        .await
 }
 
 #[cfg(test)]

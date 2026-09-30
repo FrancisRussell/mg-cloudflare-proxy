@@ -110,6 +110,9 @@ is used for the first time. Subsequent notifications are typically faster.
 While doing this, it's also possible to see the logs from the worker by
 running `npx wrangler tail` inside the repo.
 
+`GET /health` returns a plain `200 OK` for external uptime monitoring, and
+is accessible from any IP.
+
 ## Local development
 
 Run unit tests:
