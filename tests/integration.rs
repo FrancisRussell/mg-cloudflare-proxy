@@ -574,14 +574,17 @@ impl MockDistributor {
                 let response = Response::from_string(reply.body).with_status_code(status.as_u16());
                 let response = match reply.retry_after {
                     Some(seconds) => response.with_header(
-                        tiny_http::Header::from_bytes(&b"Retry-After"[..], seconds.as_bytes())
-                            .expect("a static header is valid"),
+                        tiny_http::Header::from_bytes(
+                            http::header::RETRY_AFTER.as_str().as_bytes(),
+                            seconds.as_bytes(),
+                        )
+                        .expect("a static header is valid"),
                     ),
                     None => response,
                 };
                 let response = match redirect_to {
                     Some(location) => response.with_header(
-                        tiny_http::Header::from_bytes(&b"Location"[..], location.as_bytes())
+                        tiny_http::Header::from_bytes(http::header::LOCATION.as_str().as_bytes(), location.as_bytes())
                             .expect("the location is a valid header value"),
                     ),
                     None => response,
@@ -776,8 +779,8 @@ fn status_of(result: Result<ureq::Response, ureq::Error>) -> StatusCode {
 /// success or an error status.
 fn content_type_of(result: &Result<ureq::Response, ureq::Error>) -> Option<String> {
     match result {
-        Ok(resp) => resp.header("Content-Type"),
-        Err(ureq::Error::Status(_, resp)) => resp.header("Content-Type"),
+        Ok(resp) => resp.header(http::header::CONTENT_TYPE.as_str()),
+        Err(ureq::Error::Status(_, resp)) => resp.header(http::header::CONTENT_TYPE.as_str()),
         Err(e) => panic!("request failed: {e}"),
     }
     .map(String::from)
@@ -1350,7 +1353,7 @@ fn refusal_passes_on_only_status_and_retry_after(port: u16) {
 
     let Err(ureq::Error::Status(status, resp)) = resp else { panic!("expected the refusal to be passed on") };
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS.as_u16());
-    assert_eq!(resp.header("Retry-After"), Some(RETRY_AFTER_SECONDS));
+    assert_eq!(resp.header(http::header::RETRY_AFTER.as_str()), Some(RETRY_AFTER_SECONDS));
     assert_eq!(resp.into_string().expect("the response body is readable"), "", "the push server's body isn't relayed");
 }
 
