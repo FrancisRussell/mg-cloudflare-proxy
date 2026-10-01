@@ -229,9 +229,7 @@ Mercurygram's own repo also ships a Cloudflare Worker gateway, in JavaScript,
 at
 [`Gateways/CloudflareWorker`](https://github.com/Mercurygram/Mercurygram/tree/Mercurygram/Gateways/CloudflareWorker),
 deployed by pasting `worker.mjs` into the Cloudflare dashboard and does not
-require a KV namespace or Durable Object. It also optionally supports delivery
-straight through Google's Firebase Cloud Messaging (FCM), which this project
-deliberately doesn't.
+require a KV namespace or Durable Object.
 
 Notable differences:
 
@@ -249,6 +247,10 @@ Notable differences:
 - **Retries.** If a push to a UnifiedPush endpoint fails in a way that
   suggests a retry might succeed, a single retry is made, provided there is
   time left within the request's time limit.
+- **Firebase Cloud Messaging (FCM) delivery.** `worker.mjs` also has a
+  `/fcm/<token>` route for relaying notifications via Google's FCM. This is
+  deliberately left unimplemented. Attempting to use the FCM UnifiedPush
+  distributor with this proxy will fail.
 
 In all honesty however, this project would probably not exist if the author
 had realized that
