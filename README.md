@@ -1,5 +1,7 @@
 # mg-cloudflare-proxy
 
+[![CI](https://github.com/FrancisRussell/mg-cloudflare-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/FrancisRussell/mg-cloudflare-proxy/actions/workflows/ci.yml)
+
 An alternative push-notification gateway for
 [Mercurygram](https://github.com/Mercurygram/Mercurygram), running on
 Cloudflare Workers. Mercurygram depends on a gateway to deliver notifications

@@ -1,0 +1,97 @@
+on: [push]
+
+name: CI
+
+jobs:
+  test:
+    name: Cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: FrancisRussell/ferrous-actions@v1
+        name: Cargo cache
+        with:
+          command: cache
+      - uses: FrancisRussell/ferrous-actions@v1
+        name: Install Rustup
+        with:
+          command: install-rustup
+          toolchain: stable
+          target: wasm32-unknown-unknown
+          profile: minimal
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - uses: FrancisRussell/ferrous-actions@v1
+        name: Cargo test (lib)
+        with:
+          command: cargo test
+          args: --lib
+      # Builds the real Wasm artifact (via wrangler dev's own build step) and
+      # exercises it against a local workerd instance.
+      - uses: FrancisRussell/ferrous-actions@v1
+        name: Cargo test (integration)
+        with:
+          command: cargo test
+          args: --features integration-tests --test integration
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: FrancisRussell/ferrous-actions@v1
+        name: Cargo cache
+        with:
+          command: cache
+      - uses: FrancisRussell/ferrous-actions@v1
+        name: Install Rustup
+        with:
+          command: install-rustup
+          toolchain: stable
+          target: wasm32-unknown-unknown
+          profile: minimal
+          components: clippy
+      - uses: FrancisRussell/ferrous-actions@v1
+        name: Clippy (lib, wasm target)
+        with:
+          command: cargo clippy
+          args: --target wasm32-unknown-unknown -- -D warnings
+      - uses: FrancisRussell/ferrous-actions@v1
+        name: Clippy (integration tests)
+        with:
+          command: cargo clippy
+          args: --features integration-tests --test integration -- -D warnings
+
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: FrancisRussell/ferrous-actions@v1
+        name: Install Rustup (nightly)
+        with:
+          command: install-rustup
+          toolchain: nightly
+          profile: minimal
+          components: rustfmt
+      # rustfmt.toml sets options only nightly rustfmt honours; the stable
+      # toolchain pinned by rust-toolchain.toml doesn't apply them.
+      - uses: FrancisRussell/ferrous-actions@v1
+        name: Cargo fmt --check
+        with:
+          command: cargo fmt
+          toolchain: nightly
+          args: --check
+
+  pre-commit:
+    name: Pre-commit hooks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+      - uses: pre-commit/action@v3.0.1
