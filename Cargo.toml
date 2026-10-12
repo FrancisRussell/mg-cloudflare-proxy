@@ -15,7 +15,7 @@ futures-channel = { version = "0.3", default-features = false, features = ["allo
 futures-util = { version = "0.3", default-features = false }
 http = "1"
 httpdate = "1.0.3"
-ipnetwork = "0.20"
+ipnetwork = "0.21"
 percent-encoding = "2"
 thiserror = "2.0.17"
 url = "2"
@@ -25,7 +25,7 @@ worker = "0.8"
 ctrlc = "3.5.2"
 nix = { version = "0.31.3", features = ["signal"] }
 tiny_http = "0.12"
-ureq = "2"
+ureq = "3"
 
 [features]
 # Gates tests/integration.rs -- see that file's header comment.

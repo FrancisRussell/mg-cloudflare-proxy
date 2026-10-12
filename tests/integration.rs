@@ -62,6 +62,10 @@ const TELEGRAM_IP: &str = "91.108.56.1";
 const CIDR_LIST_KV_KEY: &str = "telegram_cidrs";
 const CIDR_LIST_FETCHED_AT_KV_KEY: &str = "telegram_cidrs_fetched_at";
 const CIDR_LIST_FAILED_AT_KV_KEY: &str = "telegram_cidrs_failed_at";
+/// The header the Worker reads the client IP from. Must match
+/// `header_names::CF_CONNECTING_IP` in src/, which this test can't import
+/// (the crate only builds for wasm).
+const CF_CONNECTING_IP: &str = "CF-Connecting-IP";
 
 /// Cache ages that put the cache in each freshness class whatever the Worker's
 /// jitter draws: past the fresh window but well inside the force-refetch
@@ -332,8 +336,7 @@ impl WranglerDev {
             if let Ok(Some(exit_status)) = self.child.try_wait() {
                 panic!("wrangler dev exited early with {exit_status}");
             }
-            let result = ureq::get(&worker_url(self.port, "/")).timeout(REQUEST_TIMEOUT).call();
-            if matches!(result, Ok(_) | Err(ureq::Error::Status(_, _))) {
+            if with_test_config(ureq::get(&worker_url(self.port, "/"))).call().is_ok() {
                 return;
             }
             assert!(Instant::now() < deadline, "wrangler dev did not become ready within {READY_TIMEOUT:?}");
@@ -364,12 +367,10 @@ impl WranglerDev {
     /// The id the local explorer API gives the CIDR cache namespace.
     fn find_kv_namespace_id(&self) -> String {
         let url = format!("http://127.0.0.1:{}/cdn-cgi/local/explorer/api/storage/kv/namespaces", self.port);
-        let listing = ureq::get(&url)
-            .timeout(REQUEST_TIMEOUT)
+        let mut resp = with_test_config(ureq::get(&url))
             .call()
-            .unwrap_or_else(|e| panic!("wrangler dev's local explorer API is unavailable ({e}); is wrangler current?"))
-            .into_string()
-            .expect("the namespace listing is readable");
+            .unwrap_or_else(|e| panic!("wrangler dev's local explorer API is unavailable ({e}); is wrangler current?"));
+        let listing = resp.body_mut().read_to_string().expect("the namespace listing is readable");
         let after_id = listing.split_once("\"id\":\"").expect("the namespace listing has an id").1;
         after_id.split_once('"').expect("the id is quoted").0.to_string()
     }
@@ -377,27 +378,27 @@ impl WranglerDev {
     /// The raw value currently stored under `key`, or an empty string if
     /// there is none.
     fn kv_get(&self, key: &str) -> String {
-        match ureq::get(&format!("{}/values/{key}", self.kv_api_url())).timeout(REQUEST_TIMEOUT).call() {
-            Ok(resp) => resp.into_string().expect("the value is readable"),
-            Err(ureq::Error::Status(404, _)) => String::new(),
-            Err(e) => panic!("reading {key} from KV failed: {e}"),
+        let mut resp = with_test_config(ureq::get(&format!("{}/values/{key}", self.kv_api_url())))
+            .call()
+            .unwrap_or_else(|e| panic!("reading {key} from KV failed: {e}"));
+        if resp.status() == StatusCode::NOT_FOUND {
+            return String::new();
         }
+        resp.body_mut().read_to_string().expect("the value is readable")
     }
 
     /// Writes a raw value straight into the local CIDR cache namespace, to
     /// put it in states (e.g. an old timestamp) that can't be reached by
     /// waiting.
     fn kv_put(&self, key: &str, value: &str) {
-        ureq::put(&format!("{}/values/{key}", self.kv_api_url()))
-            .timeout(REQUEST_TIMEOUT)
-            .send_string(value)
+        with_test_config(ureq::put(&format!("{}/values/{key}", self.kv_api_url())))
+            .send(value)
             .unwrap_or_else(|e| panic!("writing {key} to KV failed: {e}"));
     }
 
     /// Removes `key` from the local CIDR cache namespace.
     fn kv_delete(&self, key: &str) {
-        ureq::delete(&format!("{}/values/{key}", self.kv_api_url()))
-            .timeout(REQUEST_TIMEOUT)
+        with_test_config(ureq::delete(&format!("{}/values/{key}", self.kv_api_url())))
             .call()
             .unwrap_or_else(|e| panic!("deleting {key} from KV failed: {e}"));
     }
@@ -764,26 +765,30 @@ fn encode(s: &str) -> String {
     percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
-/// The status the proxy answered with, whether ureq counts it as a success
-/// or an error status.
-fn status_of(result: Result<ureq::Response, ureq::Error>) -> StatusCode {
-    let code = match result {
-        Ok(resp) => resp.status(),
-        Err(ureq::Error::Status(code, _)) => code,
-        Err(e) => panic!("request failed: {e}"),
-    };
-    StatusCode::from_u16(code).expect("the proxy answers with a valid status")
+/// Applies the given timeout and disables ureq's own status-to-error
+/// conversion, so a non-2xx response is returned rather than turned into
+/// an `Err`.
+fn with_timeout<S>(req: ureq::RequestBuilder<S>, timeout: Duration) -> ureq::RequestBuilder<S> {
+    req.config().timeout_global(Some(timeout)).http_status_as_error(false).build()
 }
 
-/// The proxy's Content-Type header, whether ureq counts the response as a
-/// success or an error status.
-fn content_type_of(result: &Result<ureq::Response, ureq::Error>) -> Option<String> {
-    match result {
-        Ok(resp) => resp.header(http::header::CONTENT_TYPE.as_str()),
-        Err(ureq::Error::Status(_, resp)) => resp.header(http::header::CONTENT_TYPE.as_str()),
-        Err(e) => panic!("request failed: {e}"),
-    }
-    .map(String::from)
+/// `with_timeout` using this suite's standard `REQUEST_TIMEOUT`.
+fn with_test_config<S>(req: ureq::RequestBuilder<S>) -> ureq::RequestBuilder<S> { with_timeout(req, REQUEST_TIMEOUT) }
+
+/// The status the proxy answered with.
+fn status_of(result: Result<http::Response<ureq::Body>, ureq::Error>) -> StatusCode {
+    result.unwrap_or_else(|e| panic!("request failed: {e}")).status()
+}
+
+/// The proxy's Content-Type header.
+fn content_type_of(result: &Result<http::Response<ureq::Body>, ureq::Error>) -> Option<String> {
+    result
+        .as_ref()
+        .unwrap_or_else(|e| panic!("request failed: {e}"))
+        .headers()
+        .get(http::header::CONTENT_TYPE.as_str())
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
 }
 
 /// IPv4 addresses from the RFC 5737 documentation range -- guaranteed not to
@@ -837,10 +842,9 @@ fn integration_test() {
 /// scenarios, only whether the proxy let the request through.
 fn put_from(port: u16, client_ip: &str) -> StatusCode {
     let distributor = MockDistributor::start(None);
-    let resp = ureq::put(&worker_url(port, &format!("/{}", encode(&distributor.url()))))
-        .set("CF-Connecting-IP", client_ip)
-        .timeout(REQUEST_TIMEOUT)
-        .send_string("body");
+    let resp = with_test_config(ureq::put(&worker_url(port, &format!("/{}", encode(&distributor.url())))))
+        .header(CF_CONNECTING_IP, client_ip)
+        .send("body");
     status_of(resp)
 }
 
@@ -897,36 +901,32 @@ fn invalid_requests_from_unrecognized_ip_do_not_fetch(port: u16, dev: &mut Wrang
     let target = encode(&MockDistributor::start(None).url());
     let oversized = vec![b'x'; OVERSIZED_BODY_BYTES];
 
-    let resp = ureq::post(&worker_url(port, &format!("/aesgcm?e={target}")))
-        .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
-        .set("Encryption", "salt=abc")
-        .set("Crypto-Key", "dh=xyz")
-        .timeout(REQUEST_TIMEOUT)
-        .send_bytes(&oversized);
+    let resp = with_test_config(ureq::post(&worker_url(port, &format!("/aesgcm?e={target}"))))
+        .header(CF_CONNECTING_IP, MOCK_CIDR_IP_UNKNOWN)
+        .header("Encryption", "salt=abc")
+        .header("Crypto-Key", "dh=xyz")
+        .send(&oversized);
     assert_eq!(status_of(resp), StatusCode::PAYLOAD_TOO_LARGE, "an oversized POST body should be rejected");
 
-    let resp = ureq::put(&worker_url(port, &format!("/{target}")))
-        .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
-        .timeout(REQUEST_TIMEOUT)
-        .send_bytes(&oversized);
+    let resp = with_test_config(ureq::put(&worker_url(port, &format!("/{target}"))))
+        .header(CF_CONNECTING_IP, MOCK_CIDR_IP_UNKNOWN)
+        .send(&oversized);
     assert_eq!(status_of(resp), StatusCode::PAYLOAD_TOO_LARGE, "an oversized PUT body should be rejected");
 
-    let resp = ureq::put(&worker_url(port, "/not-a-url"))
-        .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
-        .timeout(REQUEST_TIMEOUT)
-        .send_string("body");
+    let resp = with_test_config(ureq::put(&worker_url(port, "/not-a-url")))
+        .header(CF_CONNECTING_IP, MOCK_CIDR_IP_UNKNOWN)
+        .send("body");
     assert_eq!(status_of(resp), StatusCode::FORBIDDEN, "a PUT with an invalid endpoint should be rejected");
 
-    let resp = ureq::post(&worker_url(port, &format!("/aesgcm?e={target}")))
-        .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
-        .timeout(REQUEST_TIMEOUT)
-        .send_string("ciphertext");
+    let resp = with_test_config(ureq::post(&worker_url(port, &format!("/aesgcm?e={target}"))))
+        .header(CF_CONNECTING_IP, MOCK_CIDR_IP_UNKNOWN)
+        .send("ciphertext");
     assert_eq!(status_of(resp), StatusCode::BAD_REQUEST, "a POST without the aesgcm headers should be rejected");
 
-    let resp = ureq::put(&worker_url(port, &format!("/{target}")))
-        .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
-        .timeout(REQUEST_TIMEOUT)
-        .send(std::io::Cursor::new(oversized.clone()));
+    let mut cursor = std::io::Cursor::new(oversized.clone());
+    let resp = with_test_config(ureq::put(&worker_url(port, &format!("/{target}"))))
+        .header(CF_CONNECTING_IP, MOCK_CIDR_IP_UNKNOWN)
+        .send(ureq::SendBody::from_reader(&mut cursor));
     assert_eq!(
         status_of(resp),
         StatusCode::PAYLOAD_TOO_LARGE,
@@ -936,7 +936,7 @@ fn invalid_requests_from_unrecognized_ip_do_not_fetch(port: u16, dev: &mut Wrang
     // Under `wrangler dev`, answering a chunked upload before it finishes can
     // leave the local proxy's connection to the Worker dead, failing whatever
     // request comes next. Spend one request on absorbing that.
-    let _ = ureq::get(&worker_url(port, "/")).timeout(REQUEST_TIMEOUT).call();
+    let _ = with_test_config(ureq::get(&worker_url(port, "/"))).call();
 
     assert_eq!(cidr_server.request_count(), fetches_before, "none of those should have triggered a fetch");
 
@@ -1065,10 +1065,12 @@ fn silent_telegram_holds_up_the_request_only_for_the_budget(
 
     let started = Instant::now();
     let status = status_of(
-        ureq::put(&worker_url(port, &format!("/{}", encode(&MockDistributor::start(None).url()))))
-            .set("CF-Connecting-IP", MOCK_CIDR_IP_UNKNOWN)
-            .timeout(CLIENT_PATIENCE)
-            .send_string("body"),
+        with_timeout(
+            ureq::put(&worker_url(port, &format!("/{}", encode(&MockDistributor::start(None).url())))),
+            CLIENT_PATIENCE,
+        )
+        .header(CF_CONNECTING_IP, MOCK_CIDR_IP_UNKNOWN)
+        .send("body"),
     );
     let elapsed = started.elapsed();
     cidr_server.set_silent(false);
@@ -1189,19 +1191,17 @@ fn seeding_does_not_overwrite_newer_cache(dev: &WranglerDev, cidr_server: &MockC
 
 /// A PUT from an IP that isn't Telegram's is rejected.
 fn rejects_non_telegram_ip(port: u16) {
-    let resp = ureq::put(&worker_url(port, &format!("/{}", encode("http://example.com/"))))
-        .set("CF-Connecting-IP", "8.8.8.8")
-        .timeout(REQUEST_TIMEOUT)
-        .send_string("body");
+    let resp = with_test_config(ureq::put(&worker_url(port, &format!("/{}", encode("http://example.com/")))))
+        .header(CF_CONNECTING_IP, "8.8.8.8")
+        .send("body");
     assert_eq!(status_of(resp), StatusCode::FORBIDDEN, "PUT from a non-Telegram IP should be rejected");
 }
 
 /// A target that is a literal private IP is rejected.
 fn rejects_literal_private_ip_target(port: u16) {
-    let resp = ureq::put(&worker_url(port, &format!("/{}", encode("http://127.0.0.1:9/"))))
-        .set("CF-Connecting-IP", TELEGRAM_IP)
-        .timeout(REQUEST_TIMEOUT)
-        .send_string("body");
+    let resp = with_test_config(ureq::put(&worker_url(port, &format!("/{}", encode("http://127.0.0.1:9/")))))
+        .header(CF_CONNECTING_IP, TELEGRAM_IP)
+        .send("body");
     assert_eq!(
         content_type_of(&resp).as_deref(),
         Some("text/plain; charset=utf-8"),
@@ -1214,10 +1214,9 @@ fn rejects_literal_private_ip_target(port: u16) {
 fn forwards_put_to_valid_target(port: u16) {
     let distributor = MockDistributor::start(None);
 
-    let resp = ureq::put(&worker_url(port, &format!("/{}", encode(&distributor.url()))))
-        .set("CF-Connecting-IP", TELEGRAM_IP)
-        .timeout(REQUEST_TIMEOUT)
-        .send_string("wake-up-body");
+    let resp = with_test_config(ureq::put(&worker_url(port, &format!("/{}", encode(&distributor.url())))))
+        .header(CF_CONNECTING_IP, TELEGRAM_IP)
+        .send("wake-up-body");
 
     assert_eq!(
         content_type_of(&resp),
@@ -1233,10 +1232,9 @@ fn forwards_put_to_valid_target(port: u16) {
 fn rejects_redirecting_distributor(port: u16) {
     let distributor = MockDistributor::start(Some("http://127.0.0.1:1/somewhere-unvalidated"));
 
-    let resp = ureq::put(&worker_url(port, &format!("/{}", encode(&distributor.url()))))
-        .set("CF-Connecting-IP", TELEGRAM_IP)
-        .timeout(REQUEST_TIMEOUT)
-        .send_string("body");
+    let resp = with_test_config(ureq::put(&worker_url(port, &format!("/{}", encode(&distributor.url())))))
+        .header(CF_CONNECTING_IP, TELEGRAM_IP)
+        .send("body");
 
     assert_eq!(
         status_of(resp),
@@ -1255,18 +1253,16 @@ fn post_suppresses_following_put(port: u16) {
     let distributor = MockDistributor::start(None);
     let target = encode(&distributor.url());
 
-    let post_resp = ureq::post(&worker_url(port, &format!("/aesgcm?e={target}")))
-        .set("CF-Connecting-IP", TELEGRAM_IP)
-        .set("Encryption", "salt=abc")
-        .set("Crypto-Key", "dh=xyz")
-        .timeout(REQUEST_TIMEOUT)
-        .send_string("ciphertext");
+    let post_resp = with_test_config(ureq::post(&worker_url(port, &format!("/aesgcm?e={target}"))))
+        .header(CF_CONNECTING_IP, TELEGRAM_IP)
+        .header("Encryption", "salt=abc")
+        .header("Crypto-Key", "dh=xyz")
+        .send("ciphertext");
     assert_eq!(status_of(post_resp), StatusCode::CREATED, "the POST leg should forward successfully");
 
-    let put_resp = ureq::put(&worker_url(port, &format!("/{target}")))
-        .set("CF-Connecting-IP", TELEGRAM_IP)
-        .timeout(REQUEST_TIMEOUT)
-        .send_string("wake-up-body");
+    let put_resp = with_test_config(ureq::put(&worker_url(port, &format!("/{target}"))))
+        .header(CF_CONNECTING_IP, TELEGRAM_IP)
+        .send("wake-up-body");
     assert_eq!(status_of(put_resp), StatusCode::OK, "the PUT leg should be suppressed as a duplicate of the POST");
 
     assert_eq!(
@@ -1290,21 +1286,19 @@ fn post_then_put_while_post_in_flight(port: u16, target: &str) -> (StatusCode, S
         let target_for_post = target.to_string();
         std::thread::spawn(move || {
             status_of(
-                ureq::post(&worker_url(port, &format!("/aesgcm?e={target_for_post}")))
-                    .set("CF-Connecting-IP", TELEGRAM_IP)
-                    .set("Encryption", "salt=abc")
-                    .set("Crypto-Key", "dh=xyz")
-                    .timeout(REQUEST_TIMEOUT)
-                    .send_string("ciphertext"),
+                with_test_config(ureq::post(&worker_url(port, &format!("/aesgcm?e={target_for_post}"))))
+                    .header(CF_CONNECTING_IP, TELEGRAM_IP)
+                    .header("Encryption", "salt=abc")
+                    .header("Crypto-Key", "dh=xyz")
+                    .send("ciphertext"),
             )
         })
     };
     std::thread::sleep(PUT_SENT_AFTER_POST);
     let put_status = status_of(
-        ureq::put(&worker_url(port, &format!("/{target}")))
-            .set("CF-Connecting-IP", TELEGRAM_IP)
-            .timeout(REQUEST_TIMEOUT)
-            .send_string("wake-up-body"),
+        with_test_config(ureq::put(&worker_url(port, &format!("/{target}"))))
+            .header(CF_CONNECTING_IP, TELEGRAM_IP)
+            .send("wake-up-body"),
     );
     (put_status, post_thread.join().expect("POST thread panicked"))
 }
@@ -1346,15 +1340,21 @@ fn refusal_passes_on_only_status_and_retry_after(port: u16) {
         Reply { body: "details only the push server should see", retry_after: Some(RETRY_AFTER_SECONDS) },
     );
 
-    let resp = ureq::put(&worker_url(port, &format!("/{}", encode(&distributor.url()))))
-        .set("CF-Connecting-IP", TELEGRAM_IP)
-        .timeout(REQUEST_TIMEOUT)
-        .send_string("wake-up-body");
+    let resp = with_test_config(ureq::put(&worker_url(port, &format!("/{}", encode(&distributor.url())))))
+        .header(CF_CONNECTING_IP, TELEGRAM_IP)
+        .send("wake-up-body");
 
-    let Err(ureq::Error::Status(status, resp)) = resp else { panic!("expected the refusal to be passed on") };
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS.as_u16());
-    assert_eq!(resp.header(http::header::RETRY_AFTER.as_str()), Some(RETRY_AFTER_SECONDS));
-    assert_eq!(resp.into_string().expect("the response body is readable"), "", "the push server's body isn't relayed");
+    let mut resp = resp.unwrap_or_else(|e| panic!("request failed: {e}"));
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        resp.headers().get(http::header::RETRY_AFTER.as_str()).and_then(|v| v.to_str().ok()),
+        Some(RETRY_AFTER_SECONDS)
+    );
+    assert_eq!(
+        resp.body_mut().read_to_string().expect("the response body is readable"),
+        "",
+        "the push server's body isn't relayed"
+    );
 }
 
 /// A distributor that fails once with a transient-looking status is retried
@@ -1362,10 +1362,9 @@ fn refusal_passes_on_only_status_and_retry_after(port: u16) {
 fn retries_a_transient_failure_and_succeeds(port: u16) {
     let distributor = MockDistributor::start_failing_once(StatusCode::SERVICE_UNAVAILABLE);
 
-    let resp = ureq::put(&worker_url(port, &format!("/{}", encode(&distributor.url()))))
-        .set("CF-Connecting-IP", TELEGRAM_IP)
-        .timeout(REQUEST_TIMEOUT)
-        .send_string("wake-up-body");
+    let resp = with_test_config(ureq::put(&worker_url(port, &format!("/{}", encode(&distributor.url())))))
+        .header(CF_CONNECTING_IP, TELEGRAM_IP)
+        .send("wake-up-body");
 
     assert_eq!(status_of(resp), StatusCode::CREATED, "the retried attempt should have succeeded");
     assert_eq!(distributor.request_count(), 2, "the first, failing attempt and the retry should both have landed");
@@ -1375,10 +1374,9 @@ fn retries_a_transient_failure_and_succeeds(port: u16) {
 /// `timeout` is how long the test client itself waits.
 fn put_to_endpoint(port: u16, endpoint: &str, timeout: Duration) -> StatusCode {
     status_of(
-        ureq::put(&worker_url(port, &format!("/{}", encode(endpoint))))
-            .set("CF-Connecting-IP", TELEGRAM_IP)
-            .timeout(timeout)
-            .send_string("wake-up-body"),
+        with_timeout(ureq::put(&worker_url(port, &format!("/{}", encode(endpoint)))), timeout)
+            .header(CF_CONNECTING_IP, TELEGRAM_IP)
+            .send("wake-up-body"),
     )
 }
 
